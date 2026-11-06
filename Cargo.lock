@@ -245,10 +245,12 @@ dependencies = [
  "alvr_client_core",
  "alvr_common",
  "alvr_filesystem",
+ "alvr_gui_common",
  "alvr_packets",
  "alvr_session",
  "alvr_system_info",
  "bytemuck",
+ "dirs",
  "easy-gltf",
  "eframe",
  "egui",
@@ -256,13 +258,16 @@ dependencies = [
  "env_logger",
  "ffmpeg-next",
  "gltf",
+ "ico",
  "image",
  "pollster",
  "rand 0.10.1",
  "serde",
  "serde_json",
  "tiny_http",
+ "tungstenite",
  "wgpu 29.0.1",
+ "winres",
 ]
 
 [[package]]
@@ -327,6 +332,7 @@ dependencies = [
  "alvr_sockets",
  "chrono",
  "cros-libva",
+ "dirs",
  "eframe",
  "env_logger",
  "ico",
@@ -340,6 +346,7 @@ dependencies = [
  "tungstenite",
  "ureq",
  "wgpu 25.0.2",
+ "windows-sys 0.61.2",
  "winres",
 ]
 

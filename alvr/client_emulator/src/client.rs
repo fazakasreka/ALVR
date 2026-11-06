@@ -3,23 +3,27 @@
 //!
 //! The decoder is created when the server announces the codec, and registering its input callback
 //! is also what asks the server for the first keyframe.
+//!
+//! With the alpha stream passthrough mode the server sends a second, monochrome stream carrying
+//! the application's alpha. It gets a decoder of its own, and its frames are paired with the color
+//! frames by timestamp when they are displayed.
 
 use crate::{
     camera::{Camera, IPD},
     decoder::{self, DecodedFrame, DecoderKind, VideoDecoder},
     hands::JOINT_COUNT,
+    server_settings::{self, ServerSettingsWatch},
 };
 use alvr_client_core::{ClientCapabilities, ClientCoreContext, ClientCoreEvent};
 use alvr_common::{
     BUTTON_INFO, ButtonType, DeviceMotion, HAND_LEFT_ID, HAND_RIGHT_ID, HEAD_ID, Pose,
-    RelaxedAtomic, ViewParams,
-    error,
+    RelaxedAtomic, ViewParams, error,
     glam::{Quat, UVec2, Vec3},
     info,
     parking_lot::{Mutex, RwLock},
 };
-use alvr_packets::{ButtonEntry, ButtonValue, FaceData, TrackingData};
-use alvr_session::CodecType;
+use alvr_packets::{ButtonEntry, ButtonValue, FaceData, TrackingData, VideoStreamKind};
+use alvr_session::{CodecType, PassthroughMode};
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -63,6 +67,17 @@ pub struct ClientStatus {
     pub view_resolution: UVec2,
     pub refresh_rate: f32,
     pub codec: Option<CodecType>,
+    /// How the video is to be blended over the real world, as the headset would. `None` is an
+    /// opaque stream.
+    ///
+    /// The alpha stream mode is only reported once the server has agreed to send that stream: a
+    /// server that falls back sends no alpha, and the headset then shows the color opaque.
+    pub passthrough: Option<PassthroughMode>,
+    /// Whether the server turns hand gestures into controller input (its "Hand tracking
+    /// interaction" setting): reported when the stream starts, then followed live while the
+    /// server is on this machine. `None` while not streaming. Without it a pinch moves the hand
+    /// but never clicks.
+    pub hand_interaction: Option<bool>,
 }
 
 impl Default for ClientStatus {
@@ -73,9 +88,15 @@ impl Default for ClientStatus {
             view_resolution: UVec2::ZERO,
             refresh_rate: 0.0,
             codec: None,
+            passthrough: None,
+            hand_interaction: None,
         }
     }
 }
+
+/// Most decoded alpha frames held while waiting for their color frame. Alpha normally trails or
+/// leads color by a frame or two; anything beyond this is a stream that stopped pairing up.
+const MAX_PENDING_ALPHA_FRAMES: usize = 8;
 
 /// The pose the tracking thread reads. Written by the UI thread every frame.
 #[derive(Clone, Copy)]
@@ -269,7 +290,8 @@ const TIMING_WINDOW: usize = 150;
 impl Samples {
     fn push(&mut self, sample: f32) {
         // A non-finite sample would poison the mean for the whole window.
-        self.0.push_back(if sample.is_finite() { sample } else { 0.0 });
+        self.0
+            .push_back(if sample.is_finite() { sample } else { 0.0 });
 
         if self.0.len() > TIMING_WINDOW {
             self.0.pop_front();
@@ -283,7 +305,11 @@ impl Samples {
 
         let inverse_count = 1.0 / self.0.len() as f32;
         let mean = self.0.iter().sum::<f32>() * inverse_count;
-        let deviation = self.0.iter().map(|sample| (sample - mean).abs()).sum::<f32>();
+        let deviation = self
+            .0
+            .iter()
+            .map(|sample| (sample - mean).abs())
+            .sum::<f32>();
 
         Stat {
             mean,
@@ -406,6 +432,10 @@ pub struct HapticsEvent {
 pub struct EmulatedClient {
     context: Arc<ClientCoreContext>,
     status: ClientStatus,
+    /// Follows real-time server settings between stream starts.
+    server_settings: ServerSettingsWatch,
+    /// The hand tracking interaction setting the current stream started with.
+    stream_hand_interaction: Option<bool>,
     /// Shared with the tracking thread.
     tracking: Arc<RwLock<TrackingWindow>>,
     streaming: Arc<RelaxedAtomic>,
@@ -423,6 +453,14 @@ pub struct EmulatedClient {
     /// Created once the codec is known. Shared because the client core pushes NAL units from its
     /// own thread while the render thread drains decoded frames.
     decoder: Arc<Mutex<Option<Box<dyn VideoDecoder>>>>,
+    /// Decoder for the monochrome alpha stream, created when the server announces it.
+    alpha_decoder: Arc<Mutex<Option<Box<dyn VideoDecoder>>>>,
+    /// Decoded alpha frames not yet matched to a displayed color frame, oldest first.
+    pending_alpha: VecDeque<DecodedFrame>,
+    /// Whether the server agreed to send the alpha stream for the current connection.
+    alpha_stream_negotiated: bool,
+    /// Passthrough mode from the settings, before checking it against what was negotiated.
+    configured_passthrough: Option<PassthroughMode>,
     /// Button values as last sent, so only changes go on the wire, as the real client does.
     sent_buttons: HashMap<u64, ButtonValue>,
     /// Input id set last announced via the active interaction profile packet.
@@ -453,6 +491,8 @@ impl EmulatedClient {
         Self {
             context,
             status: ClientStatus::default(),
+            server_settings: ServerSettingsWatch::start(),
+            stream_hand_interaction: None,
             tracking: Arc::new(RwLock::new(TrackingWindow::default())),
             streaming: Arc::new(RelaxedAtomic::new(false)),
             tracking_thread: None,
@@ -462,6 +502,10 @@ impl EmulatedClient {
             frame_timing: FrameTimingTracker::default(),
             send_timing: Arc::new(Mutex::new(SendTracker::default())),
             decoder: Arc::new(Mutex::new(None)),
+            alpha_decoder: Arc::new(Mutex::new(None)),
+            pending_alpha: VecDeque::new(),
+            alpha_stream_negotiated: false,
+            configured_passthrough: None,
             sent_buttons: HashMap::new(),
             announced_inputs: None,
             haptics: [None; 2],
@@ -567,6 +611,16 @@ impl EmulatedClient {
 
     /// Drains client core events and keeps [`ClientStatus`] in step. Call once per frame.
     pub fn poll_events(&mut self) {
+        self.drain_events();
+
+        // The setting is real-time on the server, so a change made mid-stream applies at once;
+        // the watcher's view of it wins over the one the stream started with.
+        self.status.hand_interaction = self
+            .stream_hand_interaction
+            .map(|at_start| self.server_settings.hand_interaction().unwrap_or(at_start));
+    }
+
+    fn drain_events(&mut self) {
         while let Some(event) = self.context.poll_event() {
             match event {
                 ClientCoreEvent::UpdateHudMessage(message) => {
@@ -578,6 +632,20 @@ impl EmulatedClient {
                     self.status.streaming = true;
                     self.status.view_resolution = config.negotiated_config.view_resolution;
                     self.status.refresh_rate = config.negotiated_config.refresh_rate_hint;
+
+                    self.alpha_stream_negotiated = config
+                        .negotiated_config
+                        .ext()
+                        .is_ok_and(|ext| ext.enable_alpha_stream);
+                    self.configured_passthrough =
+                        config.settings.video.passthrough.clone().into_option();
+                    self.update_passthrough();
+
+                    // What the stream starts with; `server_settings` follows later changes.
+                    self.stream_hand_interaction =
+                        Some(server_settings::hand_interaction_enabled(&config.settings));
+                    self.server_settings
+                        .set_port(config.settings.connection.web_server_port);
 
                     // A new stream starts from a clean slate on the server, so the full button
                     // state and the interaction profile must go out again.
@@ -593,6 +661,13 @@ impl EmulatedClient {
                     self.status.view_resolution = UVec2::ZERO;
                     self.status.refresh_rate = 0.0;
                     self.status.codec = None;
+                    self.stream_hand_interaction = None;
+
+                    self.alpha_stream_negotiated = false;
+                    self.configured_passthrough = None;
+                    self.update_passthrough();
+                    // Paired by timestamp, so frames of the old stream must not meet the new one.
+                    self.pending_alpha.clear();
 
                     self.sent_buttons.clear();
                     self.announced_inputs = None;
@@ -602,24 +677,41 @@ impl EmulatedClient {
 
                     self.stop_tracking();
                 }
-                ClientCoreEvent::DecoderConfig { codec, config_nal } => {
+                ClientCoreEvent::DecoderConfig {
+                    codec,
+                    config_nal,
+                    stream,
+                } => {
+                    let slot = match stream {
+                        VideoStreamKind::Color => &self.decoder,
+                        VideoStreamKind::Alpha => &self.alpha_decoder,
+                    };
+
                     // The decoder is created once, but the parameter sets are refreshed every time.
                     // The server repeats them whenever it is asked for a recovery keyframe, and that
                     // keyframe cannot be decoded without them: dropping the repeat is what makes
                     // corruption look permanent rather than clearing on the next keyframe.
-                    if let Some(decoder) = self.decoder.lock().as_mut() {
+                    if let Some(decoder) = slot.lock().as_mut() {
                         decoder.set_config_nal(&config_nal);
                         continue;
                     }
 
-                    self.status.codec = Some(codec);
+                    // Only the color stream is reported to the statistics. It defines the frame
+                    // pacing, and reporting the alpha frames too would count every frame twice.
+                    let on_frame_decoded: decoder::FrameDecodedCallback = match stream {
+                        VideoStreamKind::Color => {
+                            self.status.codec = Some(codec);
 
-                    // Reported straight through from the decoder, so decode timing is measured
-                    // where it actually happens rather than when a frame reaches the screen.
-                    let stats_context = Arc::clone(&self.context);
-                    let on_frame_decoded = Box::new(move |timestamp| {
-                        stats_context.report_frame_decoded(timestamp);
-                    });
+                            // Reported straight through from the decoder, so decode timing is
+                            // measured where it actually happens rather than when a frame reaches
+                            // the screen.
+                            let stats_context = Arc::clone(&self.context);
+                            Box::new(move |timestamp| {
+                                stats_context.report_frame_decoded(timestamp);
+                            })
+                        }
+                        VideoStreamKind::Alpha => Box::new(|_| ()),
+                    };
 
                     match decoder::create(
                         DecoderKind::preferred(),
@@ -628,23 +720,34 @@ impl EmulatedClient {
                         on_frame_decoded,
                     ) {
                         Ok(decoder) => {
-                            *self.decoder.lock() = Some(decoder);
+                            *slot.lock() = Some(decoder);
 
-                            // Registering the callback also asks the server for an IDR frame, which
-                            // is required: without a keyframe the decoder has nothing to start from
-                            // and the stream silently stays black.
-                            let decoder_slot = Arc::clone(&self.decoder);
-                            self.context
-                                .set_decoder_input_callback(Box::new(move |timestamp, nal| {
-                                    let mut lock = decoder_slot.lock();
+                            let decoder_slot = Arc::clone(slot);
+                            let callback = Box::new(move |timestamp, nal: &[u8]| {
+                                let mut lock = decoder_slot.lock();
 
-                                    // Returning false tells the client core the frame was not
-                                    // queued, so it can account for the drop.
-                                    lock.as_mut()
-                                        .is_some_and(|decoder| decoder.push_nal(timestamp, nal))
-                                }));
+                                // Returning false tells the client core the frame was not
+                                // queued, so it can account for the drop.
+                                lock.as_mut()
+                                    .is_some_and(|decoder| decoder.push_nal(timestamp, nal))
+                            });
+
+                            // Registering either callback also asks the server for an IDR frame,
+                            // which is required: without a keyframe the decoder has nothing to
+                            // start from and the stream silently stays black. The alpha encoder
+                            // starts after the color one and misses the first keyframe, so the
+                            // alpha stream needs its own request.
+                            match stream {
+                                VideoStreamKind::Color => {
+                                    self.context.set_decoder_input_callback(callback)
+                                }
+                                VideoStreamKind::Alpha => {
+                                    info!("Alpha stream decoder created");
+                                    self.context.set_alpha_decoder_input_callback(callback)
+                                }
+                            }
                         }
-                        Err(e) => error!("Cannot create video decoder: {e}"),
+                        Err(e) => error!("Cannot create {stream:?} video decoder: {e}"),
                     }
                 }
                 ClientCoreEvent::Haptics {
@@ -663,9 +766,23 @@ impl EmulatedClient {
                         amplitude,
                     });
                 }
-                ClientCoreEvent::RealTimeConfig(_) => (),
+                // The passthrough parameters are real-time settings: the chroma key colours, the
+                // blend threshold and the premultiplied flags can all change mid-stream.
+                ClientCoreEvent::RealTimeConfig(config) => {
+                    self.configured_passthrough = config.passthrough;
+                    self.update_passthrough();
+                }
             }
         }
+    }
+
+    /// Resolves the configured passthrough mode against what the server agreed to send.
+    fn update_passthrough(&mut self) {
+        self.status.passthrough = match &self.configured_passthrough {
+            // Without the alpha stream the headset has no alpha to apply and shows color opaque.
+            Some(PassthroughMode::AlphaStream(_)) if !self.alpha_stream_negotiated => None,
+            mode => mode.clone(),
+        };
     }
 
     /// Takes the most recent decoded frame, discarding any older ones still queued.
@@ -685,6 +802,36 @@ impl EmulatedClient {
         }
 
         latest
+    }
+
+    /// Takes the alpha frame to show with the color frame stamped `color_timestamp`.
+    ///
+    /// The two streams are decoded independently, so either may be ahead. This returns the newest
+    /// alpha frame no newer than the color frame and drops the older ones, which can never be
+    /// matched again; newer ones are kept for a later color frame. `None` means nothing new
+    /// applies, and the caller keeps the alpha it already has: holding the previous mask for a
+    /// frame looks far better than flashing opaque or transparent.
+    pub fn take_alpha_frame(&mut self, color_timestamp: Duration) -> Option<DecodedFrame> {
+        if let Some(decoder) = self.alpha_decoder.lock().as_mut() {
+            while let Some(frame) = decoder.poll_frame() {
+                self.pending_alpha.push_back(frame);
+            }
+        }
+
+        while self.pending_alpha.len() > MAX_PENDING_ALPHA_FRAMES {
+            self.pending_alpha.pop_front();
+        }
+
+        let mut matched = None;
+        while self
+            .pending_alpha
+            .front()
+            .is_some_and(|frame| frame.timestamp() <= color_timestamp)
+        {
+            matched = self.pending_alpha.pop_front();
+        }
+
+        matched
     }
 
     /// Reports which frame is being presented this repaint, and returns the world-space eye poses

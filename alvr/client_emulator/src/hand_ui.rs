@@ -11,12 +11,13 @@
 use crate::{
     controllers::{ControllerState, Hand},
     hands::{self, Finger, HandPose, HandSettings, HandState},
+    icons::{self, Icon},
     interaction::HandInteraction,
-    overlay::{hand_color, input_tooltip},
+    overlay::{hand_color, input_tooltip, usable_rect},
 };
 use alvr_common::glam::Vec3;
 use eframe::egui::{
-    self, Align2, Color32, Context, CornerRadius, FontId, Id, Order, Rect, Sense, Stroke, StrokeKind, Ui,
+    Align2, Color32, Context, CornerRadius, FontId, Id, Order, Rect, Sense, Stroke, StrokeKind, Ui,
     Vec2, pos2, vec2,
 };
 use std::time::Instant;
@@ -45,18 +46,17 @@ pub fn toolbar_row(
     settings: &HandSettings,
     gizmo: &mut Option<HandInteraction>,
 ) {
-    ui.label("Hand:");
+    icons::label(ui, Icon::Hand, "Hand tracking");
+    icons::title_divider(ui);
 
     for hand in Hand::BOTH {
         let index = hand.index();
-        let label = match hand {
-            Hand::Left => "L",
-            Hand::Right => "R",
+        let (label, tooltip) = match hand {
+            Hand::Left => ("L", "Emulate the left hand"),
+            Hand::Right => ("R", "Emulate the right hand"),
         };
 
-        if ui
-            .toggle_value(&mut hands[index].enabled, label)
-            .changed()
+        if icons::text_toggle(ui, &mut hands[index].enabled, label, tooltip).changed()
             && hands[index].enabled
         {
             controllers[index].enabled = false;
@@ -64,7 +64,14 @@ pub fn toolbar_row(
     }
 
     let mut visible = hands.iter().all(|state| state.model_visible);
-    if ui.toggle_value(&mut visible, "Display").changed() {
+    if icons::toggle(
+        ui,
+        &mut visible,
+        Icon::Show,
+        "Show the hand models in the view",
+    )
+    .changed()
+    {
         for state in hands.iter_mut() {
             state.model_visible = visible;
         }
@@ -72,7 +79,7 @@ pub fn toolbar_row(
 
     pose_gizmo_selector(ui, gizmo);
 
-    if ui.button("Reset").clicked() {
+    if icons::button(ui, Icon::Reset, "Reset both hands' poses and gestures").clicked() {
         for hand in Hand::BOTH {
             hands[hand.index()].reset(settings, hand);
         }
@@ -85,12 +92,17 @@ pub fn toolbar_row(
 /// derivations from one to the other are where this project's bugs have lived. One selection drives
 /// both hands, so the two are always shown together and a sign error that mirrors is obvious.
 fn pose_gizmo_selector(ui: &mut Ui, gizmo: &mut Option<HandInteraction>) {
-    let label = gizmo.map_or("Pose: off", |pose| pose.label());
-
-    egui::ComboBox::from_id_salt("hand pose gizmo")
-        .selected_text(label)
-        .width(84.0)
-        .show_ui(ui, |ui| {
+    icons::dropdown(
+        ui,
+        "hand pose gizmo",
+        Icon::Axes,
+        gizmo.map_or("off", |pose| pose.label()),
+        HandInteraction::ALL
+            .iter()
+            .map(|pose| pose.label())
+            .chain(["off"]),
+        "Draw an OpenXR interaction pose as RGB axes on both hands: X red, Y green, Z blue.",
+        |ui| {
             ui.selectable_value(gizmo, None, "off")
                 .on_hover_text("Draw no pose axes.");
 
@@ -98,11 +110,8 @@ fn pose_gizmo_selector(ui: &mut Ui, gizmo: &mut Option<HandInteraction>) {
                 ui.selectable_value(gizmo, Some(pose), pose.label())
                     .on_hover_text(pose.describe());
             }
-        })
-        .response
-        .on_hover_text(
-            "Draw an OpenXR interaction pose as RGB axes on both hands: X red, Y green, Z blue.",
-        );
+        },
+    );
 }
 
 /// Draws each enabled hand's panel in its bottom corner and applies any selection.
@@ -140,7 +149,7 @@ pub fn hand_panels(
 
         // Positioned explicitly, for the same reason the controller panels are: anchoring places
         // an area by its remembered size, which is wrong on the first frame.
-        let screen = ctx.content_rect();
+        let screen = usable_rect(ctx);
         let position = match hand {
             Hand::Left => pos2(screen.left() + 10.0, screen.bottom() - size.y - 10.0),
             Hand::Right => pos2(
@@ -480,7 +489,8 @@ fn draw_pose_icon(
     let horizontal = Vec3::NEG_Z.cross(view).normalize();
     let vertical = view.cross(horizontal).normalize();
 
-    let anchor = (joints[hands::WRIST].position + joints[Finger::Middle.joints()[1]].position) / 2.0;
+    let anchor =
+        (joints[hands::WRIST].position + joints[Finger::Middle.joints()[1]].position) / 2.0;
 
     // Projected into the hand's own units first, so the drawing can then be fitted to the cell.
     let flatten = |position: Vec3| {

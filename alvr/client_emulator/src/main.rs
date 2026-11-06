@@ -19,10 +19,13 @@ mod controllers;
 mod decoder;
 mod hand_ui;
 mod hands;
+mod icons;
 mod interaction;
 mod overlay;
+mod paths;
 mod render;
 mod scene;
+mod server_settings;
 mod skinned;
 mod video;
 
@@ -30,7 +33,7 @@ use crate::{
     api::{
         Articulation, CaptureRequestKind, ControllerCommand, ControllerSnapshot,
         ControllersResponse, HandCommand, HandSnapshot, HandsResponse, NamedSummary,
-        ProfileSummary, SharedState, StateResponse,
+        ProfileSummary, SharedState, StateResponse, ViewSource,
     },
     camera::{Camera, CameraInput, Eye},
     client::{
@@ -40,6 +43,7 @@ use crate::{
     controller_ui::ControllerUi,
     controllers::{ControllerInteraction, ControllerSettings, ControllerState, Hand},
     hands::{HandSettings, HandState},
+    icons::Icon,
     interaction::HandInteraction,
     overlay::{PoseOverlay, PoseTarget, Slot},
     render::{
@@ -57,6 +61,7 @@ use alvr_common::{
     parking_lot::Mutex,
 };
 use alvr_packets::ButtonValue;
+use alvr_session::PassthroughMode;
 use eframe::{
     App, CreationContext, Frame, NativeOptions,
     egui::{self, Color32, Key, PointerButton, RichText, Sense, Ui, ViewportBuilder},
@@ -64,7 +69,7 @@ use eframe::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -76,6 +81,12 @@ enum ViewMode {
     Right,
     Stereo,
 }
+
+/// How much larger than egui's default the toolbar is drawn, text and controls alike.
+const TOOLBAR_SCALE: f32 = 1.5;
+
+/// Margin around the contents of the title bar, the toolbar and the status bar, in points.
+const BAR_MARGIN: f32 = 8.0 * TOOLBAR_SCALE;
 
 /// Resolution of one eye in the capture endpoints, used when no stream has been negotiated yet.
 const FALLBACK_CAPTURE_RESOLUTION: (u32, u32) = (960, 916);
@@ -99,15 +110,16 @@ struct EmulatorApp {
     scene_error: Option<String>,
     environment_path: PathBuf,
     view_mode: ViewMode,
-    /// Show the streamed video rather than the local scene, when a stream is available.
-    ///
-    /// The stream is the *virtual* source: it is the VR content the server renders. The local
-    /// glTF scene stands in for what the headset's cameras would see, so it is the *real* one.
-    prefer_video: bool,
+    /// What to draw. The video sources fall back to the scene until a stream is available.
+    source: ViewSource,
     /// Show the frame pacing overlay over the view.
     show_stats: bool,
     /// Decoded frame count and layout, mirrored out of the video renderer for the stats overlay.
     video_frames: u64,
+    /// Alpha stream frames uploaded, for the stats overlay.
+    alpha_frames: u64,
+    /// How much older the alpha on screen is than the color frame it is shown with.
+    alpha_lag: Option<Duration>,
     video_layout: FrameLayout,
     /// Pixel aspect ratio of one eye of the video, mirrored out for the letterboxed display.
     video_eye_aspect: Option<f32>,
@@ -147,8 +159,9 @@ struct EmulatorApp {
 
 impl EmulatorApp {
     fn new(context: &CreationContext<'_>, shared: Arc<SharedState>) -> Self {
-        let environment_path = scene::default_environment_path()
-            .unwrap_or_else(|_| PathBuf::from(scene::ENVIRONMENT_FILE_NAME));
+        icons::install_theme(&context.egui_ctx);
+
+        let environment_path = scene::default_environment_path();
 
         let mut scene = None;
         let mut scene_error = None;
@@ -203,15 +216,20 @@ impl EmulatorApp {
             camera.position = Vec3::new(centre.x, min.y + 1.6, centre.z);
         }
 
-        let directory = environment_path.parent().unwrap_or_else(|| Path::new("."));
+        // Settings live in the per-user folder; relative model paths in them name the models the
+        // build bundles next to the executable.
+        let settings_dir = paths::user_dir();
+        let models_dir = paths::executable_dir();
+        paths::adopt_settings_file(controllers::SETTINGS_FILE_NAME);
+        paths::adopt_settings_file(hands::SETTINGS_FILE_NAME);
 
-        let controller_settings = ControllerSettings::load_or_create(directory);
+        let controller_settings = ControllerSettings::load_or_create(&settings_dir, &models_dir);
         let controllers = [
             ControllerState::new(&controller_settings, Hand::Left),
             ControllerState::new(&controller_settings, Hand::Right),
         ];
 
-        let hand_settings = HandSettings::load_or_create(directory);
+        let hand_settings = HandSettings::load_or_create(&settings_dir, &models_dir);
         let hands = [
             HandState::new(&hand_settings, Hand::Left),
             HandState::new(&hand_settings, Hand::Right),
@@ -223,10 +241,12 @@ impl EmulatorApp {
             scene,
             scene_error,
             environment_path,
-            view_mode: ViewMode::Stereo,
-            prefer_video: true,
-            show_stats: true,
+            view_mode: ViewMode::Left,
+            source: ViewSource::Mixed,
+            show_stats: false,
             video_frames: 0,
+            alpha_frames: 0,
+            alpha_lag: None,
             video_layout: FrameLayout::Single,
             video_eye_aspect: None,
             look_latched: false,
@@ -284,10 +304,10 @@ impl EmulatorApp {
             if held(Key::Q) {
                 input.roll -= 1.0;
             }
-            if held(Key::PageUp) {
+            if held(Key::R) || held(Key::PageUp) {
                 input.height += 1.0;
             }
-            if held(Key::PageDown) {
+            if held(Key::F) || held(Key::PageDown) {
                 input.height -= 1.0;
             }
 
@@ -328,6 +348,13 @@ impl EmulatorApp {
     }
 
     /// Applies pose changes queued by `POST /api/move`.
+    /// Applies a view source change requested through the API.
+    fn apply_pending_source(&mut self) {
+        if let Some(source) = self.shared.source.lock().take() {
+            self.source = source;
+        }
+    }
+
     fn apply_pending_moves(&mut self) {
         while let Some(pending) = self.shared.moves.lock().pop_front() {
             if let Some(position) = pending.position {
@@ -484,7 +511,9 @@ impl EmulatorApp {
                                 None => state.pose,
                             };
                             let duration = transition
-                                .or_else(|| index.and_then(|index| settings.poses[index].transition))
+                                .or_else(|| {
+                                    index.and_then(|index| settings.poses[index].transition)
+                                })
                                 .unwrap_or(settings.transition);
 
                             state.set_articulation(articulation.apply(base), duration);
@@ -511,7 +540,8 @@ impl EmulatorApp {
         for release in releases {
             if now >= release.at {
                 // Resting values are removed by `set_input` whatever the input's type.
-                self.controllers[release.hand].set_input(release.suffix, ButtonValue::Binary(false));
+                self.controllers[release.hand]
+                    .set_input(release.suffix, ButtonValue::Binary(false));
             } else {
                 self.timed_releases.push(release);
             }
@@ -710,7 +740,10 @@ impl EmulatorApp {
                 continue;
             }
 
-            let Some(profile) = self.controller_settings.profiles.get(controller.profile_index)
+            let Some(profile) = self
+                .controller_settings
+                .profiles
+                .get(controller.profile_index)
             else {
                 continue;
             };
@@ -804,9 +837,8 @@ impl EmulatorApp {
                     head_position + head_orientation * state.position,
                 );
 
-                transforms[GizmoRenderer::slot(GizmoDevice::Hand, index)] = Some(
-                    palm * Mat4::from_rotation_translation(pose.orientation, pose.position),
-                );
+                transforms[GizmoRenderer::slot(GizmoDevice::Hand, index)] =
+                    Some(palm * Mat4::from_rotation_translation(pose.orientation, pose.position));
             }
         }
 
@@ -1042,6 +1074,7 @@ impl EmulatorApp {
             None => {
                 let created = Arc::new(Mutex::new(VideoRenderer::new(
                     &state.device,
+                    &state.queue,
                     state.target_format,
                 )));
 
@@ -1061,11 +1094,41 @@ impl EmulatorApp {
             renderer.upload(&state.device, &state.queue, decoded);
         }
 
+        // Matched against the color frame on screen rather than only the one just uploaded: the
+        // alpha for a frame can finish decoding a repaint later, and must still be shown with it.
+        if self.client.status().streaming {
+            if renderer.has_frame()
+                && let Some(alpha) = self.client.take_alpha_frame(renderer.current_timestamp())
+            {
+                renderer.upload_alpha(&state.device, &state.queue, &alpha);
+                self.alpha_frames += 1;
+            }
+        } else {
+            renderer.clear_alpha();
+            self.alpha_frames = 0;
+        }
+
+        renderer.set_passthrough(self.passthrough().as_ref());
+
+        // Zero when every color frame finds its own alpha; a steady positive value means the alpha
+        // is consistently late and the mask trails the image.
+        self.alpha_lag = renderer
+            .alpha_timestamp()
+            .map(|alpha| renderer.current_timestamp().saturating_sub(alpha));
+
         self.video_frames = renderer.frames_shown();
         self.video_layout = renderer.layout();
         self.video_eye_aspect = renderer.eye_aspect_ratio();
 
         renderer.has_frame().then(|| renderer.current_timestamp())
+    }
+
+    /// The passthrough mode the video is drawn with: the stream's in the mixed view, none otherwise.
+    fn passthrough(&self) -> Option<PassthroughMode> {
+        match self.source {
+            ViewSource::Mixed => self.client.status().passthrough.clone(),
+            ViewSource::Virtual | ViewSource::Real => None,
+        }
     }
 
     /// Renders and answers any queued capture requests.
@@ -1095,9 +1158,7 @@ impl EmulatorApp {
 
         let Some(renderer) = renderer else {
             for request in pending {
-                request
-                    .result
-                    .fulfill(Err("Environment not loaded".into()));
+                request.result.fulfill(Err("Environment not loaded".into()));
             }
             return;
         };
@@ -1125,8 +1186,7 @@ impl EmulatorApp {
         // Captures render the scene live, so the live camera is the right head pose here.
         let controller_models =
             self.controller_model_matrices(self.camera.position, self.camera.orientation());
-        let hand_poses =
-            self.hand_joint_matrices(self.camera.position, self.camera.orientation());
+        let hand_poses = self.hand_joint_matrices(self.camera.position, self.camera.orientation());
         let gizmos = self.gizmo_transforms(self.camera.position, self.camera.orientation());
 
         // Capture at the negotiated stream resolution when streaming, so captures are deterministic
@@ -1154,9 +1214,7 @@ impl EmulatorApp {
                 hands: hand_lock.as_ref().map(|renderer| {
                     (
                         &**renderer,
-                        std::array::from_fn(|hand| {
-                            hand_poses[hand].as_deref()
-                        }),
+                        std::array::from_fn(|hand| hand_poses[hand].as_deref()),
                     )
                 }),
                 gizmos: gizmo_renderer
@@ -1175,12 +1233,9 @@ impl EmulatorApp {
                 kind,
             );
 
-            request.result.fulfill(encode_png(
-                &pixels,
-                eye_width * 2,
-                eye_height,
-                request.kind,
-            ));
+            request
+                .result
+                .fulfill(encode_png(&pixels, eye_width * 2, eye_height, request.kind));
         }
     }
 
@@ -1205,6 +1260,12 @@ impl EmulatorApp {
             refresh_rate: status.refresh_rate,
             codec: status.codec.map(|codec| format!("{codec:?}")),
             frame_timing: timing,
+            source: self.source,
+            passthrough: status
+                .passthrough
+                .as_ref()
+                .map(|mode| passthrough_name(mode).into()),
+            alpha_frames: self.alpha_frames,
         };
     }
 
@@ -1216,8 +1277,25 @@ impl EmulatorApp {
     /// divided it by the frame interval yourself. The deviation carries over unchanged, and it is
     /// the number that matters — under steady motion the speed should be constant, so whatever it
     /// varies by is scene movement with nothing behind it.
+    ///
+    /// The camera position comes first and is there with or without a stream; everything after it
+    /// describes the stream and is left out until one is up.
     fn stats_entries(&mut self) -> Vec<(String, String)> {
-        let refresh_rate = self.status().refresh_rate;
+        let position = self.camera.position;
+        let mut entries = vec![(
+            "position".into(),
+            format!("{:.2} {:.2} {:.2} m", position.x, position.y, position.z),
+        )];
+
+        let status = self.client.status();
+        if !status.streaming {
+            return entries;
+        }
+
+        let stream = format!(
+            "{}x{} {:.0} Hz",
+            status.view_resolution.x, status.view_resolution.y, status.refresh_rate
+        );
         let timing = self.client.frame_timing();
 
         let frames_per_second = if timing.world_ms.mean > 0.0 {
@@ -1226,8 +1304,8 @@ impl EmulatorApp {
             0.0
         };
 
-        vec![
-            ("refresh".into(), format!("{refresh_rate:.0} Hz")),
+        entries.extend([
+            ("stream".into(), stream),
             (
                 "world".into(),
                 format!(
@@ -1257,121 +1335,351 @@ impl EmulatorApp {
                 "frames".into(),
                 format!("{} {:?}", self.video_frames, self.video_layout),
             ),
-        ]
+            (
+                "passthrough".into(),
+                match &self.client.status().passthrough {
+                    None => "off".into(),
+                    Some(PassthroughMode::AlphaStream(_)) => {
+                        let lag = self.alpha_lag.map_or("-".into(), |lag| {
+                            format!("{:.1} ms", lag.as_secs_f32() * 1000.0)
+                        });
+
+                        format!("alpha stream, {} frames, lag {lag}", self.alpha_frames)
+                    }
+                    Some(mode) => passthrough_name(mode).into(),
+                },
+            ),
+        ]);
+
+        entries
+    }
+
+    /// The window's title bar, drawn by the app in place of the system's so it matches the toolbar
+    /// under it: the app name and the connection status on the left, and the window buttons on the
+    /// right. Dragging it moves the window and double-clicking it maximises.
+    fn draw_title_bar(&self, ui: &mut Ui) {
+        let margin = BAR_MARGIN as i8;
+        let frame = egui::Frame::new()
+            .fill(ui.visuals().panel_fill)
+            .inner_margin(egui::Margin {
+                left: margin,
+                right: margin / 2,
+                top: margin,
+                bottom: margin / 2,
+            });
+
+        egui::Panel::top(egui::Id::new("title bar"))
+            .frame(frame)
+            .show_separator_line(false)
+            .resizable(false)
+            .show(ui, |ui| {
+                icons::toolbar_style(ui.style_mut(), TOOLBAR_SCALE);
+
+                // Registered before the contents, so the buttons on top of it take the pointer
+                // first and only the empty parts of the bar move the window.
+                let bar = egui::Rect::from_min_size(
+                    ui.max_rect().min,
+                    egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+                );
+                let drag = ui.interact(
+                    bar,
+                    egui::Id::new("title bar drag"),
+                    Sense::click_and_drag(),
+                );
+                let maximized = ui.input(|input| input.viewport().maximized.unwrap_or(false));
+
+                if drag.double_clicked() {
+                    ui.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                } else if drag.drag_started_by(PointerButton::Primary) {
+                    ui.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+
+                ui.horizontal(|ui| {
+                    // Indented like the controls inside the groups below, so the title lines up
+                    // with them rather than with the groups' rounded edges.
+                    ui.add_space(icons::group_margin(ui));
+                    ui.label(icons::normal_text(ui, "ALVR Client Emulator").strong());
+                    let status = self.status();
+                    connection_status(ui, &status);
+
+                    // Only worth the space while a hand is emulated: controllers click on their
+                    // own, whatever this setting says.
+                    if status.hand_interaction == Some(false)
+                        && self.hands.iter().any(|state| state.enabled)
+                    {
+                        hand_interaction_warning(ui);
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if icons::button(ui, Icon::Close, "Close").clicked() {
+                            ui.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+
+                        let (icon, tooltip) = if maximized {
+                            (Icon::Restore, "Restore")
+                        } else {
+                            (Icon::Maximize, "Maximise")
+                        };
+                        if icons::button(ui, icon, tooltip).clicked() {
+                            ui.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                        }
+
+                        if icons::button(ui, Icon::Minimize, "Minimise").clicked() {
+                            ui.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        }
+                    });
+                });
+            });
     }
 
     fn draw_toolbar(&mut self, ui: &mut Ui) {
-        egui::Panel::top(egui::Id::new("toolbar")).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("View:");
-                ui.selectable_value(&mut self.view_mode, ViewMode::Left, "Left");
-                ui.selectable_value(&mut self.view_mode, ViewMode::Right, "Right");
-                ui.selectable_value(&mut self.view_mode, ViewMode::Stereo, "Stereo");
+        let margin = BAR_MARGIN as i8;
+        let frame = egui::Frame::new()
+            .fill(ui.visuals().panel_fill)
+            .inner_margin(egui::Margin::symmetric(margin, margin / 2));
 
-                ui.separator();
+        let toolbar = egui::Panel::top(egui::Id::new("toolbar"))
+            .frame(frame)
+            .show_separator_line(false)
+            .resizable(false)
+            .show(ui, |ui| {
+                icons::toolbar_style(ui.style_mut(), TOOLBAR_SCALE);
 
-                // The stream is the virtual content, the local scene stands in for what the
-                // headset's cameras would see. Switching to the latter while streaming is also how
-                // to tell a decode problem apart from a rendering one.
-                ui.label("Source:");
-                ui.selectable_value(&mut self.prefer_video, true, "Virtual");
-                ui.selectable_value(&mut self.prefer_video, false, "Real");
-
-                ui.separator();
-
-                let status = self.status();
-                if status.streaming {
-                    ui.label(
-                        RichText::new(format!(
-                            "Streaming  {}x{}",
-                            status.view_resolution.x, status.view_resolution.y
-                        ))
-                        .color(Color32::LIGHT_GREEN),
-                    );
-
-                    // The numbers themselves go in an overlay over the view, where there is room
-                    // to label them; see [`draw_stats_overlay`].
-                    ui.toggle_value(&mut self.show_stats, "Stats");
-                } else {
-                    ui.label(
-                        RichText::new("Not connected to ALVR server").color(Color32::LIGHT_RED),
-                    );
-                }
-
-                ui.separator();
-
-                ui.label("Position:");
-                ui.label(format!(
-                    "x {:.2}  y {:.2}  z {:.2}",
-                    self.camera.position.x, self.camera.position.y, self.camera.position.z
-                ));
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.look_latched {
-                        ui.label(RichText::new("Esc to release mouse").weak());
-                    } else if self.look_held {
-                        ui.label(RichText::new("Release to stop looking").weak());
-                    } else {
-                        ui.label(
-                            RichText::new("Click to look, or hold right button").weak(),
+                // Every group in one row, wrapping group by group onto further lines when the
+                // window is too narrow. Groups are told apart by space; options that exclude each
+                // other share one segmented control, so the grouping is visible without a caption.
+                ui.spacing_mut().item_spacing.y = 6.0 * icons::size_factor(ui);
+                ui.horizontal_wrapped(|ui| {
+                    icons::flex_item(ui, "view mode", |ui| {
+                        icons::segmented(
+                            ui,
+                            "view mode",
+                            &mut self.view_mode,
+                            &[
+                                (ViewMode::Left, Icon::LeftEye, "Left eye"),
+                                (ViewMode::Right, Icon::RightEye, "Right eye"),
+                                (ViewMode::Stereo, Icon::BothEyes, "Both eyes, side by side"),
+                            ],
                         );
-                    }
+                    });
+
+                    // The stream is the virtual content, the local scene stands in for what the
+                    // headset's cameras would see. Switching to the latter while streaming is also
+                    // how to tell a decode problem apart from a rendering one.
+                    icons::flex_item(ui, "view source", |ui| {
+                        icons::segmented(
+                            ui,
+                            "view source",
+                            &mut self.source,
+                            &[
+                                (
+                                    ViewSource::Mixed,
+                                    Icon::Mixed,
+                                    "Mixed: what the headset shows. The streamed video over the \
+                                     local scene, blended by the stream's passthrough mode; plain \
+                                     video when passthrough is off.",
+                                ),
+                                (
+                                    ViewSource::Virtual,
+                                    Icon::Virtual,
+                                    "Virtual: the streamed video alone, opaque.",
+                                ),
+                                (
+                                    ViewSource::Real,
+                                    Icon::Real,
+                                    "Real: the local scene alone, standing in for the \
+                                     headset's cameras.",
+                                ),
+                            ],
+                        );
+                    });
+
+                    // A group of one, so the toggle matches the segmented controls beside it. The
+                    // numbers go in an overlay over the view, where there is room to label them;
+                    // see [`draw_stats_overlay`].
+                    icons::flex_item(ui, "stats", |ui| {
+                        icons::group(ui, |ui| {
+                            icons::toggle(
+                                ui,
+                                &mut self.show_stats,
+                                Icon::Stats,
+                                "Statistics: camera position, and the stream and its frame \
+                                 pacing while streaming",
+                            );
+                        });
+                    });
+
+                    self.draw_input_groups(ui);
                 });
             });
 
-            self.draw_inputs_row(ui);
+        // A hairline and a soft shadow along the bottom edge, so the toolbar reads as a bar resting
+        // over the view rather than a block of controls stacked on top of it. Painted on a layer
+        // above the view, which would otherwise cover anything drawn below the panel.
+        let bar = toolbar.response.rect;
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(
+            egui::Order::Middle,
+            egui::Id::new("toolbar shadow"),
+        ));
+        let shadow_steps = 6;
+        for step in 0..shadow_steps {
+            let fade = 1.0 - step as f32 / shadow_steps as f32;
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(bar.left(), bar.bottom() + step as f32),
+                    egui::pos2(bar.right(), bar.bottom() + step as f32 + 1.0),
+                ),
+                0.0,
+                Color32::from_black_alpha((22.0 * fade * fade) as u8),
+            );
+        }
+        painter.hline(
+            bar.x_range(),
+            bar.bottom(),
+            egui::Stroke::new(1.0, icons::line_color(ui.visuals())),
+        );
+    }
+
+    /// A thin bar along the bottom of the window with the hints on how to look around and drive
+    /// the devices, in one line cut short rather than wrapped when the window is narrow. Styled
+    /// like the dashboard's bottom bar showing an ordinary message, and indented to line up with
+    /// the title.
+    fn draw_status_bar(&self, ui: &mut Ui) {
+        let hints = [Some(self.look_hint()), self.device_hint()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("    ·    ");
+
+        let (fill, text_color) = icons::status_bar_colors(ui.visuals());
+
+        // The title's indent: the bars' margin, and the group margin it adds to that.
+        let indent = (BAR_MARGIN + icons::GROUP_MARGIN * TOOLBAR_SCALE) as i8;
+        let frame = egui::Frame::new()
+            .fill(fill)
+            .inner_margin(egui::Margin::symmetric(indent, 5));
+
+        let bar = egui::Panel::bottom(egui::Id::new("status bar"))
+            .frame(frame)
+            .show_separator_line(false)
+            .resizable(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let text = RichText::new(hints).color(text_color).size(12.0);
+                    ui.add(egui::Label::new(text).truncate());
+                });
+            })
+            .response
+            .rect;
+
+        ui.painter().hline(
+            bar.x_range(),
+            bar.top(),
+            egui::Stroke::new(1.0, icons::line_color(ui.visuals())),
+        );
+
+        overlay::set_bottom_inset(ui.ctx(), bar.height());
+    }
+
+    /// The controller section and the hand section, side by side, since a side can be emulated as
+    /// one or the other and the two toggles belong next to each other.
+    fn draw_input_groups(&mut self, ui: &mut Ui) {
+        let mut hands_enabled = [self.hands[0].enabled, self.hands[1].enabled];
+        icons::flex_item(ui, "controllers", |ui| {
+            icons::group(ui, |ui| {
+                controller_ui::toolbar_row(
+                    ui,
+                    &mut self.controllers,
+                    &mut hands_enabled,
+                    &self.controller_settings,
+                    &mut self.controller_gizmo,
+                )
+            });
+        });
+        for (state, enabled) in self.hands.iter_mut().zip(hands_enabled) {
+            state.enabled = enabled;
+        }
+
+        icons::flex_item(ui, "hands", |ui| {
+            icons::group(ui, |ui| {
+                hand_ui::toolbar_row(
+                    ui,
+                    &mut self.hands,
+                    &mut self.controllers,
+                    &self.hand_settings,
+                    &mut self.hand_gizmo,
+                )
+            });
         });
     }
 
-    /// The inputs row: the controller section and the hand section side by side, since a side can
-    /// be emulated as one or the other and the two toggles belong next to each other.
-    fn draw_inputs_row(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            ui.label("Inputs:");
-            ui.separator();
+    /// How to look around, or how to stop.
+    fn look_hint(&self) -> &'static str {
+        if self.look_latched {
+            "Esc to release mouse"
+        } else if self.look_held {
+            "Release to stop looking"
+        } else {
+            "Click to look, or hold right button"
+        }
+    }
 
-            let mut hands_enabled = [self.hands[0].enabled, self.hands[1].enabled];
-            controller_ui::toolbar_row(
-                ui,
-                &mut self.controllers,
-                &mut hands_enabled,
-                &self.controller_settings,
-                &mut self.controller_gizmo,
-            );
-            for (state, enabled) in self.hands.iter_mut().zip(hands_enabled) {
-                state.enabled = enabled;
+    /// How to drive the enabled devices, if any are.
+    fn device_hint(&self) -> Option<&'static str> {
+        let controllers = self.controllers.iter().any(|state| state.enabled);
+        let hands = self.hands.iter().any(|state| state.enabled);
+
+        match (controllers, hands) {
+            (true, true) => Some("Hover an icon to move a device; the corner panels drive it"),
+            (true, false) => {
+                Some("Hover a controller icon to move it; use the corner panels for buttons")
             }
-
-            ui.separator();
-
-            hand_ui::toolbar_row(
-                ui,
-                &mut self.hands,
-                &mut self.controllers,
-                &self.hand_settings,
-                &mut self.hand_gizmo,
-            );
-
-            let controllers = self.controllers.iter().any(|state| state.enabled);
-            let hands = self.hands.iter().any(|state| state.enabled);
-
-            let hint = match (controllers, hands) {
-                (true, true) => Some("Hover an icon to move a device; the corner panels drive it"),
-                (true, false) => {
-                    Some("Hover a controller icon to move it; use the corner panels for buttons")
-                }
-                (false, true) => {
-                    Some("Hover a hand icon to move it; pick a gesture in the corner panels")
-                }
-                (false, false) => None,
-            };
-
-            if let Some(hint) = hint {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(hint).weak());
-                });
+            (false, true) => {
+                Some("Hover a hand icon to move it; pick a gesture in the corner panels")
             }
-        });
+            (false, false) => None,
+        }
+    }
+}
+
+/// Resizes the window from its edges and corners. Drawing our own title bar means doing without
+/// the system frame, and with it the borders the system resizes from.
+fn handle_window_edges(ctx: &egui::Context) {
+    use egui::{CursorIcon, ResizeDirection};
+
+    /// How far in from the window's edge a resize can start, in points.
+    const EDGE: f32 = 5.0;
+
+    if ctx.input(|input| input.viewport().maximized.unwrap_or(false)) {
+        return;
+    }
+
+    let Some(pointer) = ctx.input(|input| input.pointer.hover_pos()) else {
+        return;
+    };
+
+    let window = ctx.content_rect();
+    let west = pointer.x <= window.left() + EDGE;
+    let east = pointer.x >= window.right() - EDGE;
+    let north = pointer.y <= window.top() + EDGE;
+    let south = pointer.y >= window.bottom() - EDGE;
+
+    let (direction, cursor) = match (north, south, west, east) {
+        (true, _, true, _) => (ResizeDirection::NorthWest, CursorIcon::ResizeNwSe),
+        (true, _, _, true) => (ResizeDirection::NorthEast, CursorIcon::ResizeNeSw),
+        (_, true, true, _) => (ResizeDirection::SouthWest, CursorIcon::ResizeNeSw),
+        (_, true, _, true) => (ResizeDirection::SouthEast, CursorIcon::ResizeNwSe),
+        (true, ..) => (ResizeDirection::North, CursorIcon::ResizeVertical),
+        (_, true, ..) => (ResizeDirection::South, CursorIcon::ResizeVertical),
+        (.., true, _) => (ResizeDirection::West, CursorIcon::ResizeHorizontal),
+        (.., true) => (ResizeDirection::East, CursorIcon::ResizeHorizontal),
+        _ => return,
+    };
+
+    ctx.set_cursor_icon(cursor);
+
+    if ctx.input(|input| input.pointer.primary_pressed()) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
     }
 }
 
@@ -1388,6 +1696,7 @@ impl App for EmulatorApp {
         self.controller_ui.apply_haptics(haptics);
 
         self.apply_pending_moves();
+        self.apply_pending_source();
         self.apply_controller_commands();
         self.apply_hand_commands();
         self.apply_timed_releases();
@@ -1409,11 +1718,15 @@ impl App for EmulatorApp {
         // compositor start for the frame pacing statistics.
         let video_views = self.client.displayed_frame_views(displayed_frame);
 
+        self.draw_title_bar(ui);
         self.draw_toolbar(ui);
+        self.draw_status_bar(ui);
 
         // Falls back to the scene until the first frame arrives, so the window is never blank while
         // the stream is negotiating.
-        let show_video = self.prefer_video && displayed_frame.is_some();
+        let show_video = self.source != ViewSource::Real && displayed_frame.is_some();
+        // With passthrough the video is see-through, and the scene is what shows through it.
+        let scene_under_video = show_video && self.passthrough().is_some();
         // The video displays letterboxed at its own aspect ratio; the scene adapts to the window.
         let video_eye_aspect = show_video.then_some(self.video_eye_aspect).flatten();
 
@@ -1432,7 +1745,10 @@ impl App for EmulatorApp {
                 _ => (
                     camera.position,
                     camera.orientation(),
-                    [camera.view_matrix(Eye::Left), camera.view_matrix(Eye::Right)],
+                    [
+                        camera.view_matrix(Eye::Left),
+                        camera.view_matrix(Eye::Right),
+                    ],
                 ),
             };
 
@@ -1457,8 +1773,9 @@ impl App for EmulatorApp {
                     ui.centered_and_justified(|ui| {
                         ui.label(
                             RichText::new(format!(
-                                "Could not load environment\n\n{message}\n\nRebuild to restore the bundled test room, or place your own {} next to the executable.",
-                                scene::ENVIRONMENT_FILE_NAME
+                                "Could not load environment\n\n{message}\n\nRebuild to restore the bundled test room, or place your own {} in {}.",
+                                scene::ENVIRONMENT_FILE_NAME,
+                                paths::user_dir().display()
                             ))
                             .color(Color32::LIGHT_RED),
                         );
@@ -1486,6 +1803,7 @@ impl App for EmulatorApp {
                         view_mode,
                         viewport: response.rect,
                         show_video,
+                        scene_under_video,
                         video_eye_aspect,
                         controller_models,
                         hand_poses,
@@ -1513,7 +1831,6 @@ impl App for EmulatorApp {
 
         if let Some(view_rect) = view_rect
             && self.show_stats
-            && self.status().streaming
         {
             let entries = self.stats_entries();
             draw_stats_overlay(&ui_context, view_rect, &entries);
@@ -1599,6 +1916,11 @@ impl App for EmulatorApp {
             ui_context.send_viewport_cmd(egui::ViewportCommand::CursorVisible(!look_active));
         }
 
+        // Last, so its resize cursor wins over whatever is under the window's edge.
+        if !look_active {
+            handle_window_edges(&ui_context);
+        }
+
         self.service_captures(frame);
         self.publish_state();
         self.publish_controllers();
@@ -1646,6 +1968,10 @@ struct ViewportCallback {
     viewport: egui::Rect,
     /// Draw the streamed video rather than the local scene.
     show_video: bool,
+    /// Draw the local scene behind the video, for the video to blend over. It is drawn from the
+    /// displayed frame's eye poses and the stream's projection, so the two line up exactly as the
+    /// headset's reprojected layer lines up with its passthrough.
+    scene_under_video: bool,
     /// Pixel aspect ratio of one eye of the video, when the video is shown. The video is displayed
     /// inner-fit at this ratio rather than stretched to the viewport.
     video_eye_aspect: Option<f32>,
@@ -1678,9 +2004,7 @@ impl ViewportCallback {
             hands: hands.map(|renderer| {
                 (
                     renderer,
-                    std::array::from_fn(|hand| {
-                        self.hand_poses[hand].as_deref()
-                    }),
+                    std::array::from_fn(|hand| self.hand_poses[hand].as_deref()),
                 )
             }),
             gizmos: gizmos.map(|renderer| (renderer, self.gizmos)),
@@ -1734,8 +2058,23 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             aspect_ratio
         };
 
-        let controllers = resources.get::<Arc<Mutex<ControllerRenderer>>>().map(|r| r.lock());
-        let hands = resources.get::<Arc<Mutex<HandRenderer>>>().map(|r| r.lock());
+        // Under the video the scene follows the same rule as the device models, for the same
+        // reason: anything else drifts against the video content.
+        if self.scene_under_video
+            && let Some(renderer) = resources.get::<Arc<SceneRenderer>>()
+        {
+            let projection = Camera::projection_matrix(device_aspect);
+
+            renderer.set_view_projection(queue, Eye::Left, projection * self.device_eye_views[0]);
+            renderer.set_view_projection(queue, Eye::Right, projection * self.device_eye_views[1]);
+        }
+
+        let controllers = resources
+            .get::<Arc<Mutex<ControllerRenderer>>>()
+            .map(|r| r.lock());
+        let hands = resources
+            .get::<Arc<Mutex<HandRenderer>>>()
+            .map(|r| r.lock());
         let gizmos = resources.get::<Arc<GizmoRenderer>>();
 
         self.devices(
@@ -1773,8 +2112,12 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             .then(|| resources.get::<Arc<Mutex<VideoRenderer>>>())
             .flatten();
         let scene = resources.get::<Arc<SceneRenderer>>();
-        let controllers = resources.get::<Arc<Mutex<ControllerRenderer>>>().map(|r| r.lock());
-        let hands = resources.get::<Arc<Mutex<HandRenderer>>>().map(|r| r.lock());
+        let controllers = resources
+            .get::<Arc<Mutex<ControllerRenderer>>>()
+            .map(|r| r.lock());
+        let hands = resources
+            .get::<Arc<Mutex<HandRenderer>>>()
+            .map(|r| r.lock());
         let gizmos = resources.get::<Arc<GizmoRenderer>>();
         let devices = self.devices(
             controllers.as_deref(),
@@ -1788,7 +2131,15 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
 
         let draw_eye = |pass: &mut wgpu::RenderPass<'static>, eye: Eye| {
             match &video {
-                Some(video) => video.lock().draw(pass, eye),
+                Some(video) => {
+                    if self.scene_under_video
+                        && let Some(scene) = scene
+                    {
+                        scene.draw(pass, eye);
+                    }
+
+                    video.lock().draw(pass, eye);
+                }
                 None => {
                     if let Some(scene) = scene {
                         scene.draw(pass, eye);
@@ -1806,11 +2157,11 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
         // viewport; stretching it also mismatched the controller overlays. The scene has no fixed
         // aspect and fills the viewport.
         let draw_view = |pass: &mut wgpu::RenderPass<'static>,
-                             eye: Eye,
-                             left: f32,
-                             top: f32,
-                             width: f32,
-                             height: f32| {
+                         eye: Eye,
+                         left: f32,
+                         top: f32,
+                         width: f32,
+                         height: f32| {
             let (left, top, width, height) = match self.video_eye_aspect {
                 Some(aspect) => fit_viewport(left, top, width, height, aspect),
                 None => (left, top, width, height),
@@ -1845,6 +2196,96 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
     }
 }
 
+/// A pill saying whether a stream is up, on a faint wash of its own colour, with the client core's
+/// full status message, which carries the server address and any error, on hover. The stream's
+/// resolution and refresh rate are in the stats overlay.
+fn connection_status(ui: &mut Ui, status: &ClientStatus) {
+    let (color, text) = if status.streaming {
+        (icons::ok_color(ui.visuals()), "Streaming")
+    } else {
+        (icons::error_color(ui.visuals()), "Not connected")
+    };
+
+    let tooltip = if status.hud_message.is_empty() {
+        "Connection to the ALVR server".to_owned()
+    } else {
+        status.hud_message.clone()
+    };
+
+    status_pill(ui, None, color, text, tooltip);
+}
+
+/// Shown beside the connection status when the server ignores hand gestures, which otherwise
+/// looks like a broken pinch: the hand closes on screen and SteamVR never sees a click.
+fn hand_interaction_warning(ui: &mut Ui) {
+    status_pill(
+        ui,
+        Some(Icon::NoHand),
+        icons::error_color(ui.visuals()),
+        "Hand clicks off",
+        "Turn on ALVR Dashboard / Settings / Headset / Controllers / Hand tracking interaction"
+            .to_owned(),
+    );
+}
+
+/// A rounded label led by a dot, or by `icon` when given, on a faint wash of its own colour,
+/// explained on hover.
+fn status_pill(ui: &mut Ui, icon: Option<Icon>, color: Color32, text: &str, tooltip: String) {
+    let size = icons::size_factor(ui);
+    let galley = egui::WidgetText::from(RichText::new(text).color(color).small()).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Extend),
+        f32::INFINITY,
+        egui::TextStyle::Small,
+    );
+
+    let padding = egui::vec2(9.0, 3.0) * size;
+    // An icon needs more room than the dot to stay legible; both are centred in the same slot.
+    let dot_radius = if icon.is_some() { 6.0 } else { 3.5 } * size;
+    let gap = 6.0 * size;
+    let pill_size = egui::vec2(
+        padding.x * 2.0 + dot_radius * 2.0 + gap + galley.size().x,
+        ui.spacing().interact_size.y - 4.0 * size,
+    );
+
+    let (pill, response) = ui.allocate_exact_size(pill_size, Sense::hover());
+    let painter = ui.painter();
+
+    painter.rect_filled(pill, pill.height() / 2.0, color.gamma_multiply(0.14));
+    let marker = egui::pos2(pill.left() + padding.x + dot_radius, pill.center().y);
+    match icon {
+        Some(icon) => icons::paint_into(
+            painter,
+            egui::Rect::from_center_size(marker, egui::Vec2::splat(dot_radius * 2.0)),
+            icon,
+            color,
+        ),
+        None => {
+            painter.circle_filled(marker, dot_radius, color);
+        }
+    }
+    painter.galley(
+        egui::pos2(
+            pill.left() + padding.x + dot_radius * 2.0 + gap,
+            pill.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        color,
+    );
+
+    response.on_hover_text(tooltip);
+}
+
+/// Short name of a passthrough mode, for the stats overlay and the API.
+fn passthrough_name(mode: &PassthroughMode) -> &'static str {
+    match mode {
+        PassthroughMode::Blend { .. } => "blend",
+        PassthroughMode::RgbChromaKey(_) => "RGB chroma key",
+        PassthroughMode::HsvChromaKey(_) => "HSV chroma key",
+        PassthroughMode::AlphaStream(_) => "alpha stream",
+    }
+}
+
 /// The inner-fit rectangle of the given aspect ratio, centred in a viewport.
 fn fit_viewport(left: f32, top: f32, width: f32, height: f32, aspect: f32) -> (f32, f32, f32, f32) {
     let fitted_width = width.min(height * aspect);
@@ -1861,6 +2302,8 @@ fn fit_viewport(left: f32, top: f32, width: f32, height: f32, aspect: f32) -> (f
 /// Gap between a stat's label and its value, and between one stat and the next.
 const STATS_LABEL_GAP: f32 = 5.0;
 const STATS_ENTRY_GAP: f32 = 18.0;
+/// Vertical gap between lines, when the stats wrap.
+const STATS_LINE_GAP: f32 = 4.0;
 
 /// Frame pacing readout, drawn as a rounded strip over the top of the view.
 ///
@@ -1896,17 +2339,52 @@ fn draw_stats_overlay(ctx: &egui::Context, view_rect: egui::Rect, entries: &[(St
         })
         .collect::<Vec<_>>();
 
-    let content_width = galleys
+    // Each value gets a slot as wide as the widest it has been, rather than its current width.
+    // The values change length from frame to frame ("4.5" against "10.2", a growing frame count),
+    // and sizing the centred strip to the current text made the whole strip resize and every entry
+    // slide sideways each frame. Slots only grow, so the layout settles within a moment and stays.
+    let widths_id = egui::Id::new("stats overlay value widths");
+    let mut value_widths: Vec<f32> = ctx
+        .data(|data| data.get_temp(widths_id))
+        .unwrap_or_default();
+    // A different set of entries is a different layout; start it afresh.
+    value_widths.resize(galleys.len(), 0.0);
+    for (width, (_, value)) in value_widths.iter_mut().zip(&galleys) {
+        *width = width.max(value.size().x);
+    }
+    ctx.data_mut(|data| data.insert_temp(widths_id, value_widths.clone()));
+
+    let entry_widths = galleys
         .iter()
-        .map(|(label, value)| label.size().x + STATS_LABEL_GAP + value.size().x)
-        .sum::<f32>()
-        + STATS_ENTRY_GAP * (galleys.len() - 1) as f32;
-    let content_height = galleys
+        .zip(&value_widths)
+        .map(|((label, _), value_width)| label.size().x + STATS_LABEL_GAP + value_width)
+        .collect::<Vec<_>>();
+    let line_height = galleys
         .iter()
         .map(|(label, value)| label.size().y.max(value.size().y))
         .fold(0.0, f32::max);
 
     let margin = egui::vec2(12.0, 6.0);
+
+    // Entries wrap onto further lines rather than running off the sides of a narrow view. Packed
+    // greedily in order; an entry wider than the view still gets a line of its own. The slot
+    // widths only grow, so once they settle the breaks stop moving too.
+    let max_width = (view_rect.width() - 20.0 - margin.x * 2.0).max(0.0);
+    let mut lines: Vec<(Vec<usize>, f32)> = vec![];
+    for (index, &width) in entry_widths.iter().enumerate() {
+        match lines.last_mut() {
+            Some((entries, line_width)) if *line_width + STATS_ENTRY_GAP + width <= max_width => {
+                entries.push(index);
+                *line_width += STATS_ENTRY_GAP + width;
+            }
+            _ => lines.push((vec![index], width)),
+        }
+    }
+
+    let content_width = lines.iter().map(|(_, width)| *width).fold(0.0, f32::max);
+    let content_height =
+        line_height * lines.len() as f32 + STATS_LINE_GAP * (lines.len() - 1) as f32;
+
     let strip = egui::Rect::from_center_size(
         egui::pos2(
             view_rect.center().x,
@@ -1921,19 +2399,27 @@ fn draw_stats_overlay(ctx: &egui::Context, view_rect: egui::Rect, entries: &[(St
         Color32::from_black_alpha(170),
     );
 
-    let mut cursor = strip.left_top() + margin;
-    for (label, value) in galleys {
-        let label_width = label.size().x;
-        let value_width = value.size().x;
+    let mut galleys = galleys.into_iter().map(Some).collect::<Vec<_>>();
+    for (line, (entries, _)) in lines.iter().enumerate() {
+        let mut cursor = strip.left_top()
+            + margin
+            + egui::vec2(0.0, line as f32 * (line_height + STATS_LINE_GAP));
 
-        painter.galley(cursor, label, label_color);
-        painter.galley(
-            cursor + egui::vec2(label_width + STATS_LABEL_GAP, 0.0),
-            value,
-            Color32::WHITE,
-        );
+        for &index in entries {
+            let Some((label, value)) = galleys[index].take() else {
+                continue;
+            };
+            let label_width = label.size().x;
 
-        cursor.x += label_width + STATS_LABEL_GAP + value_width + STATS_ENTRY_GAP;
+            painter.galley(cursor, label, label_color);
+            painter.galley(
+                cursor + egui::vec2(label_width + STATS_LABEL_GAP, 0.0),
+                value,
+                Color32::WHITE,
+            );
+
+            cursor.x += entry_widths[index] + STATS_ENTRY_GAP;
+        }
     }
 }
 
@@ -1960,7 +2446,10 @@ fn view_sub_rects(
         ViewMode::Stereo => {
             let half = rect.width() / 2.0;
             vec![
-                (Eye::Left, egui::Rect::from_min_size(rect.min, egui::vec2(half, rect.height()))),
+                (
+                    Eye::Left,
+                    egui::Rect::from_min_size(rect.min, egui::vec2(half, rect.height())),
+                ),
                 (
                     Eye::Right,
                     egui::Rect::from_min_size(
@@ -1986,10 +2475,7 @@ fn view_sub_rects(
                         fit_viewport(rect.left(), rect.top(), rect.width(), rect.height(), aspect);
 
                     (
-                        egui::Rect::from_min_size(
-                            egui::pos2(left, top),
-                            egui::vec2(width, height),
-                        ),
+                        egui::Rect::from_min_size(egui::pos2(left, top), egui::vec2(width, height)),
                         Camera::fov_aspect_ratio(),
                         view,
                     )
@@ -2075,6 +2561,31 @@ fn preferred_wgpu_setup() -> egui_wgpu::WgpuSetup {
     egui_wgpu::WgpuSetup::CreateNew(create_new)
 }
 
+/// The emulator icon for the taskbar and Alt-Tab, the same file `build.rs` embeds in the executable.
+fn window_icon() -> egui::IconData {
+    let icon = ico::IconDir::read(std::io::Cursor::new(include_bytes!(
+        "../resources/emulator.ico"
+    )))
+    .ok()
+    .and_then(|dir| {
+        // The largest entry, so Windows scales down rather than up.
+        let entry = dir.entries().iter().max_by_key(|entry| entry.width())?;
+        entry.decode().ok()
+    });
+
+    match icon {
+        Some(image) => egui::IconData {
+            rgba: image.rgba_data().to_owned(),
+            width: image.width(),
+            height: image.height(),
+        },
+        None => {
+            alvr_common::warn!("Cannot decode the window icon");
+            egui::IconData::default()
+        }
+    }
+}
+
 fn main() {
     env_logger::init();
 
@@ -2097,6 +2608,9 @@ fn main() {
         refresh_rate: 0.0,
         codec: None,
         frame_timing: FrameTiming::default(),
+        source: ViewSource::Mixed,
+        passthrough: None,
+        alpha_frames: 0,
     }));
 
     if let Err(e) = api::spawn(Arc::clone(&shared), port) {
@@ -2108,7 +2622,13 @@ fn main() {
     let result = eframe::run_native(
         "ALVR Client Emulator",
         NativeOptions {
-            viewport: ViewportBuilder::default().with_inner_size((1280.0, 720.0)),
+            // Wide enough for every toolbar group on one line. Undecorated: the app draws its
+            // own title bar; see `draw_title_bar`.
+            viewport: ViewportBuilder::default()
+                .with_inner_size((1440.0, 810.0))
+                .with_min_inner_size((640.0, 400.0))
+                .with_decorations(false)
+                .with_icon(window_icon()),
             renderer: eframe::Renderer::Wgpu,
             wgpu_options: egui_wgpu::WgpuConfiguration {
                 wgpu_setup: preferred_wgpu_setup(),

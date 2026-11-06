@@ -13,12 +13,11 @@ use alvr_common::{glam::Mat4, warn};
 use bytemuck::{Pod, Zeroable};
 use std::num::NonZeroU32;
 use wgpu::{
-    AddressMode, BindGroup, BindGroupDescriptor, BindGroupEntry,
-    BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingResource, BindingType, BlendState,
-    Buffer, BufferBindingType, BufferDescriptor, BufferUsages, Color, ColorTargetState, ColorWrites,
-    CommandEncoderDescriptor, CompareFunction, DepthStencilState, Device, Extent3d, FilterMode,
-    FragmentState, FrontFace, IndexFormat, LoadOp, MipmapFilterMode, MultisampleState, Operations,
-    Origin3d,
+    AddressMode, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
+    BindGroupLayoutEntry, BindingResource, BindingType, BlendState, Buffer, BufferBindingType,
+    BufferDescriptor, BufferUsages, Color, ColorTargetState, ColorWrites, CommandEncoderDescriptor,
+    CompareFunction, DepthStencilState, Device, Extent3d, FilterMode, FragmentState, FrontFace,
+    IndexFormat, LoadOp, MipmapFilterMode, MultisampleState, Operations, Origin3d,
     PipelineLayoutDescriptor, PolygonMode, PrimitiveState, PrimitiveTopology, Queue,
     RenderPassColorAttachment, RenderPassDepthStencilAttachment, RenderPassDescriptor,
     RenderPipeline, RenderPipelineDescriptor, SamplerBindingType, SamplerDescriptor, ShaderStages,
@@ -314,7 +313,12 @@ pub struct SceneRenderer {
 }
 
 impl SceneRenderer {
-    pub fn new(device: &Device, queue: &Queue, scene: &Scene, output_format: TextureFormat) -> Self {
+    pub fn new(
+        device: &Device,
+        queue: &Queue,
+        scene: &Scene,
+        output_format: TextureFormat,
+    ) -> Self {
         let pipeline = MeshPipeline::new(device, queue, output_format);
         let mesh = Mesh::new(device, queue, &pipeline, scene);
 
@@ -341,6 +345,12 @@ impl SceneRenderer {
     /// Uploads the view-projection matrix into the given eye's uniform slot.
     pub fn set_view(&self, queue: &Queue, camera: &Camera, eye: Eye, aspect_ratio: f32) {
         let view_proj = Camera::projection_matrix(aspect_ratio) * camera.view_matrix(eye);
+        self.mesh.set_view(queue, eye, view_proj);
+    }
+
+    /// Uploads a view-projection matrix built elsewhere, for drawing the scene from a pose other
+    /// than the live camera's.
+    pub fn set_view_projection(&self, queue: &Queue, eye: Eye, view_proj: Mat4) {
         self.mesh.set_view(queue, eye, view_proj);
     }
 }
@@ -408,7 +418,9 @@ impl HandTint {
         let bare = bare.clamp(0.0, 1.0);
         let alpha = bare * bare * (3.0 - 2.0 * bare);
 
-        std::array::from_fn(|channel| glove[channel] + (self.skin[channel] - glove[channel]) * alpha)
+        std::array::from_fn(|channel| {
+            glove[channel] + (self.skin[channel] - glove[channel]) * alpha
+        })
     }
 }
 
@@ -832,7 +844,7 @@ fn create_placeholder_texture(device: &Device, queue: &Queue) -> TextureView {
         mip_level_count: 1,
         sample_count: 1,
         dimension: TextureDimension::D2,
-        format: TextureFormat::Rgba8UnormSrgb,
+        format: TextureFormat::Rgba8Unorm,
         usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
         view_formats: &[],
     });
@@ -873,8 +885,13 @@ fn upload_texture(device: &Device, queue: &Queue, texture: &crate::scene::Textur
         mip_level_count: 1,
         sample_count: 1,
         dimension: TextureDimension::D2,
-        // glTF base colour textures are sRGB encoded.
-        format: TextureFormat::Rgba8UnormSrgb,
+        // glTF base colour textures are sRGB encoded, and are uploaded as plain Unorm on purpose:
+        // the render target is not an sRGB one (egui draws in display values throughout), so
+        // decoding them to linear on sampling, with nothing encoding the result back, rendered
+        // every texture roughly as if gamma were applied twice, much too dark. Undecoded, a
+        // texture comes out as it was authored, and in step with the material colours, which are
+        // passed through as they are.
+        format: TextureFormat::Rgba8Unorm,
         usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
         view_formats: &[],
     });
@@ -1356,7 +1373,10 @@ pub fn capture_stereo(
 
     devices.upload(
         queue,
-        [camera.view_matrix(Eye::Left), camera.view_matrix(Eye::Right)],
+        [
+            camera.view_matrix(Eye::Left),
+            camera.view_matrix(Eye::Right),
+        ],
         Camera::projection_matrix(aspect_ratio),
     );
 

@@ -359,10 +359,8 @@ const THUMB_ALONG: [Vec3; 2] = [
 /// finger's; curling it straight into the palm carries it out of the hand instead of round the
 /// fist. The values are derived from where a real thumb's joints sit in a fist, against this
 /// hand's own knuckles.
-const THUMB_CURL_TOWARDS: [Vec3; 2] = [
-    Vec3::new(-0.90, -0.40, 0.0),
-    Vec3::new(-0.85, -0.45, -0.25),
-];
+const THUMB_CURL_TOWARDS: [Vec3; 2] =
+    [Vec3::new(-0.90, -0.40, 0.0), Vec3::new(-0.85, -0.45, -0.25)];
 
 fn degrees(value: f32) -> f32 {
     value * PI / 180.0
@@ -460,10 +458,7 @@ pub fn skeleton(pose: &HandPose, hand: Hand, length: f32) -> [Pose; JOINT_COUNT]
         Vec3::new(blended.x * side, blended.y, blended.z)
     };
 
-    let mut orientation = frame_facing(
-        direction(THUMB_ALONG),
-        direction(THUMB_CURL_TOWARDS),
-    );
+    let mut orientation = frame_facing(direction(THUMB_ALONG), direction(THUMB_CURL_TOWARDS));
     let mut position = mirrored(THUMB_BASE);
 
     let chain = Finger::Thumb.joints();
@@ -543,9 +538,8 @@ pub fn fist_centre(joints: &[Pose; JOINT_COUNT]) -> Vec3 {
     }
     let centre = Vec3::new(0.0, y / (3.0 * area), z / (3.0 * area)) - fist[PALM].position;
 
-    let metacarpal = |joints: &[Pose; JOINT_COUNT]| {
-        joints[PALM].position.distance(joints[chain[1]].position)
-    };
+    let metacarpal =
+        |joints: &[Pose; JOINT_COUNT]| joints[PALM].position.distance(joints[chain[1]].position);
 
     joints[PALM].position + centre * (metacarpal(joints) / metacarpal(&fist))
 }
@@ -906,10 +900,12 @@ pub struct HandSettings {
 }
 
 impl HandSettings {
-    /// Loads the settings file next to the executable, writing the default one first if none
+    /// Loads the settings file in `directory`, writing the default one first if none
     /// exists. A file that cannot be parsed falls back to the defaults without being overwritten,
     /// so a user's editing mistake never destroys their file.
-    pub fn load_or_create(directory: &Path) -> Self {
+    ///
+    /// Relative model paths in it are resolved against `models_dir`.
+    pub fn load_or_create(directory: &Path, models_dir: &Path) -> Self {
         let path = directory.join(SETTINGS_FILE_NAME);
 
         if !path.exists() {
@@ -942,21 +938,25 @@ impl HandSettings {
                 if std::fs::rename(&path, &stale).is_ok()
                     && let Ok(json) = serde_json::to_string_pretty(&default_file())
                 {
-                    std::fs::write(&path, json + "
-").ok();
+                    std::fs::write(
+                        &path,
+                        json + "
+",
+                    )
+                    .ok();
                 }
 
                 default_file()
             }
         };
 
-        let mut settings = resolve(file, directory);
+        let mut settings = resolve(file, models_dir);
 
         // The pose list indexes state, so it must never be empty.
         if settings.poses.is_empty() {
             warn!("Hand settings contain no poses; using the built-in ones");
 
-            let built_in = resolve(default_file(), directory);
+            let built_in = resolve(default_file(), models_dir);
             settings.poses = built_in.poses;
             settings.gestures = built_in.gestures;
         }
@@ -1288,7 +1288,8 @@ fn resolve(file: SettingsFile, directory: &Path) -> HandSettings {
 
     // The palms roll inwards by the same angle in opposite directions, so the pair is symmetric.
     let pitch = Quat::from_rotation_x(degrees(file.start_pitch_degrees));
-    let orientation = |side: f32| pitch * Quat::from_rotation_z(side * degrees(file.start_roll_degrees));
+    let orientation =
+        |side: f32| pitch * Quat::from_rotation_z(side * degrees(file.start_roll_degrees));
 
     HandSettings {
         rotation_sensitivity: file.rotation_sensitivity,
@@ -1605,7 +1606,11 @@ mod tests {
             assert!(!beyond_glove_cuff(chain[1]), "proximals are covered");
 
             for joint in chain.iter().skip(2) {
-                assert!(beyond_glove_cuff(*joint), "{} should be bare", JOINT_NAMES[*joint]);
+                assert!(
+                    beyond_glove_cuff(*joint),
+                    "{} should be bare",
+                    JOINT_NAMES[*joint]
+                );
             }
         }
     }
@@ -1682,8 +1687,3 @@ mod tests {
         assert_eq!(joint_from_name("Bone.004", &overrides), Some(10));
     }
 }
-
-
-
-
-

@@ -42,6 +42,34 @@ pub struct StateResponse {
     pub codec: Option<String>,
     /// How evenly the streamed world has been advancing; see [`FrameTiming`].
     pub frame_timing: FrameTiming,
+    /// What the window draws.
+    pub source: ViewSource,
+    /// The stream's passthrough mode, `None` when the video is opaque.
+    pub passthrough: Option<String>,
+    /// Frames of the alpha stream shown so far, for the alpha stream passthrough mode.
+    pub alpha_frames: u64,
+}
+
+/// What the on-screen view draws.
+///
+/// The stream is the *virtual* source: it is the VR content the server renders. The local glTF
+/// scene stands in for what the headset's cameras would see, so it is the *real* one.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum ViewSource {
+    /// What the headset shows: the video blended over the real one by the stream's passthrough
+    /// mode. The same as [`ViewSource::Virtual`] when passthrough is off.
+    Mixed,
+    /// The video alone, opaque, whatever the passthrough mode.
+    Virtual,
+    /// The local scene alone.
+    Real,
+}
+
+/// Body of `POST /api/source`.
+#[derive(Deserialize)]
+pub struct SourceRequest {
+    pub source: ViewSource,
 }
 
 /// Body of `POST /api/move`. Every field is optional so a caller can change only what it cares
@@ -330,7 +358,10 @@ pub enum HandCommand {
         transition: Option<Duration>,
     },
     /// Play a timed gesture from the settings, from its beginning.
-    PlayGesture { hand: Hand, gesture: String },
+    PlayGesture {
+        hand: Hand,
+        gesture: String,
+    },
     Reset {
         hand: Hand,
     },
@@ -427,6 +458,8 @@ pub struct SharedState {
     pub hand_commands: Mutex<VecDeque<HandCommand>>,
     /// Capture requests queued by the view endpoints.
     pub captures: Mutex<VecDeque<CaptureRequest>>,
+    /// View source change requested by `/api/source`, applied on the next frame.
+    pub source: Mutex<Option<ViewSource>>,
 }
 
 impl SharedState {
@@ -440,6 +473,7 @@ impl SharedState {
             controller_commands: Mutex::new(VecDeque::new()),
             hand_commands: Mutex::new(VecDeque::new()),
             captures: Mutex::new(VecDeque::new()),
+            source: Mutex::new(None),
         }
     }
 }
@@ -449,8 +483,9 @@ impl SharedState {
 /// Binds to localhost only: this is a debugging interface with no authentication, and it should not
 /// be reachable from the network.
 pub fn spawn(shared: Arc<SharedState>, port: u16) -> alvr_common::anyhow::Result<()> {
-    let server = tiny_http::Server::http(("127.0.0.1", port))
-        .map_err(|e| alvr_common::anyhow::anyhow!("Cannot start HTTP server on port {port}: {e}"))?;
+    let server = tiny_http::Server::http(("127.0.0.1", port)).map_err(|e| {
+        alvr_common::anyhow::anyhow!("Cannot start HTTP server on port {port}: {e}")
+    })?;
 
     info!("Control API listening on http://127.0.0.1:{port}");
 
@@ -479,10 +514,12 @@ fn route(shared: &SharedState, request: &mut tiny_http::Request) -> Reply {
     let url = request.url().split('?').next().unwrap_or("").to_owned();
 
     match (&method, url.as_str()) {
-        (tiny_http::Method::Get, "/api/state") => match serde_json::to_string_pretty(&*shared.state.lock()) {
-            Ok(json) => Reply::Json(json),
-            Err(e) => Reply::Error(500, format!("Cannot serialise state: {e}")),
-        },
+        (tiny_http::Method::Get, "/api/state") => {
+            match serde_json::to_string_pretty(&*shared.state.lock()) {
+                Ok(json) => Reply::Json(json),
+                Err(e) => Reply::Error(500, format!("Cannot serialise state: {e}")),
+            }
+        }
 
         (tiny_http::Method::Get, "/api/controllers") => {
             match serde_json::to_string_pretty(&*shared.controllers.lock()) {
@@ -542,11 +579,28 @@ fn route(shared: &SharedState, request: &mut tiny_http::Request) -> Reply {
             }
         }
 
-        (tiny_http::Method::Get, "/api/drive") => match serde_json::to_string(&*shared.drive.lock())
-        {
-            Ok(body) => Reply::Json(body),
-            Err(e) => Reply::Error(500, format!("Cannot serialise drive state: {e}")),
-        },
+        (tiny_http::Method::Post, "/api/source") => {
+            let mut body = String::new();
+            if let Err(e) = request.as_reader().read_to_string(&mut body) {
+                return Reply::Error(400, format!("Cannot read request body: {e}"));
+            }
+
+            match serde_json::from_str::<SourceRequest>(&body) {
+                Ok(parsed) => {
+                    *shared.source.lock() = Some(parsed.source);
+
+                    Reply::Json("{\"ok\":true}".into())
+                }
+                Err(e) => Reply::Error(400, format!("Invalid JSON: {e}")),
+            }
+        }
+
+        (tiny_http::Method::Get, "/api/drive") => {
+            match serde_json::to_string(&*shared.drive.lock()) {
+                Ok(body) => Reply::Json(body),
+                Err(e) => Reply::Error(500, format!("Cannot serialise drive state: {e}")),
+            }
+        }
 
         (tiny_http::Method::Post, "/api/drive") => {
             let mut body = String::new();
@@ -580,7 +634,10 @@ fn controller_route(shared: &SharedState, rest: &str, body: &str) -> Reply {
     };
 
     let Some(hand) = Hand::from_side(side) else {
-        return Reply::Error(404, format!("No such controller: {side} (use left or right)"));
+        return Reply::Error(
+            404,
+            format!("No such controller: {side} (use left or right)"),
+        );
     };
 
     // An empty body means "change nothing", which keeps `curl -X POST` without a payload usable.
@@ -731,7 +788,10 @@ fn known_name(shared: &SharedState, name: &str, gesture: bool) -> Result<(), Str
         &snapshot.poses
     };
 
-    if list.iter().any(|known| known.name.eq_ignore_ascii_case(name)) {
+    if list
+        .iter()
+        .any(|known| known.name.eq_ignore_ascii_case(name))
+    {
         return Ok(());
     }
 
@@ -745,14 +805,19 @@ fn known_name(shared: &SharedState, name: &str, gesture: bool) -> Result<(), Str
     Err(format!("Unknown {kind} '{name}'. Available: {names}"))
 }
 
-fn parse_configure(shared: &SharedState, hand: Hand, body: &str) -> Result<ControllerCommand, String> {
+fn parse_configure(
+    shared: &SharedState,
+    hand: Hand,
+    body: &str,
+) -> Result<ControllerCommand, String> {
     let parsed: ControllerConfigRequest =
         serde_json::from_str(body).map_err(|e| format!("Invalid JSON: {e}"))?;
 
     if let Some(profile) = &parsed.profile {
-        let known = shared.controllers.lock().profiles.iter().any(|summary| {
-            summary.name.eq_ignore_ascii_case(profile) || summary.path == *profile
-        });
+        let known =
+            shared.controllers.lock().profiles.iter().any(|summary| {
+                summary.name.eq_ignore_ascii_case(profile) || summary.path == *profile
+            });
 
         if !known {
             let names = shared
@@ -885,16 +950,22 @@ fn capture(shared: &SharedState, kind: CaptureRequestKind) -> Reply {
 fn respond(request: tiny_http::Request, reply: Reply) -> std::io::Result<()> {
     match reply {
         Reply::Json(body) => {
-            let header = "Content-Type: application/json".parse::<tiny_http::Header>().unwrap();
+            let header = "Content-Type: application/json"
+                .parse::<tiny_http::Header>()
+                .unwrap();
             request.respond(tiny_http::Response::from_string(body).with_header(header))
         }
         Reply::Png(bytes) => {
-            let header = "Content-Type: image/png".parse::<tiny_http::Header>().unwrap();
+            let header = "Content-Type: image/png"
+                .parse::<tiny_http::Header>()
+                .unwrap();
             request.respond(tiny_http::Response::from_data(bytes).with_header(header))
         }
         Reply::Error(code, message) => {
             let body = serde_json::json!({ "error": message }).to_string();
-            let header = "Content-Type: application/json".parse::<tiny_http::Header>().unwrap();
+            let header = "Content-Type: application/json"
+                .parse::<tiny_http::Header>()
+                .unwrap();
             request.respond(
                 tiny_http::Response::from_string(body)
                     .with_status_code(code)
