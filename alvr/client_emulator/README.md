@@ -587,6 +587,41 @@ Hand tracking reaches SteamVR through settings that are on by default, but worth
 | `headset.controllers.hand_tracking_interaction` | **Off by default.** Turn it on to have the server derive controller buttons from the gestures — pinches, curls, a joystick from the index finger. The gesture poses here are built to land inside its default thresholds |
 | `left_hand_tracking_position_offset` / `rotation_offset` | The server offsets the SteamVR device pose from the palm by these (default `[0.04, -0.02, -0.13]` and `[0, -45, -90]`, mirrored for the right hand), so the device pose sits where a controller grip would. Real hand tracking gets the same treatment; the emulator does not compensate for it |
 
+## Markers
+
+The emulated headset reports QR codes in the room to the server, which shows each to SteamVR as a
+Vive tracker, so OpenXR applications can find it through `XR_HTCX_vive_tracker_interaction`.
+
+The codes come from `markers.json` in the user folder, read at startup. The default is one 50 cm
+code lying face up on the centre of the rug:
+
+```json
+{
+  "markers": [
+    {
+      "id": "ALVR-QR-1",
+      "position": [0.0, 0.003, 0.0],
+      "rotation_degrees": [0.0, -90.0, 0.0],
+      "size": 0.5
+    }
+  ]
+}
+```
+
+`rotation_degrees` is yaw, pitch and roll; all zero is an upright code facing +Z. `size` excludes
+the quiet zone. The drawn pattern looks like a QR code but does not decode. All codes are reported
+once a second while streaming, as if always in view.
+
+The driver has two marker slots, with the `camera` and `keyboard` tracker roles, taken in the order
+markers are first seen; further markers are not tracked. The open-xr test app
+(`OpenXR.Test.Desktop`) draws a cube on each.
+
+- **SteamVR reads tracker roles only when it starts.** The driver writes them on load, so on the
+  very first start they apply only after restarting SteamVR once.
+- **OpenXR applications get tracker poses only while focused.** The SteamVR dashboard takes focus
+  when SteamVR starts; close it with the left menu button
+  (`POST /api/controllers/left/inputs/click` with `{"input": "menu/click"}`).
+
 ## HTTP API
 
 Listens on `127.0.0.1:8080` by default. Override with `ALVR_EMULATOR_API_PORT`.
@@ -923,6 +958,7 @@ enabled.
 | `src/overlay.rs` | Device icons over the view and the 6DoF movement panel, shared by both kinds |
 | `src/controller_ui.rs` | Controller toolbar section and the corner input panels |
 | `src/hand_ui.rs` | Hand toolbar section and the corner gesture panels |
+| `src/markers.rs` | QR codes in the room: the settings file, their drawing and what is reported |
 | `src/icons.rs` | Painted toolbar icons and the icon buttons that show them |
 | `src/api.rs` | HTTP server and shared state |
 | `src/shader.wgsl` | Unlit vertex/fragment shader |
@@ -962,3 +998,8 @@ That is a new enum variant rather than a field on the existing `StreamReady`, be
 are bincode encoded by variant index: appending leaves existing indices untouched, while changing
 `StreamReady` itself would reinterpret every old client's packet. Old clients keep sending
 `StreamReady` and are handled exactly as before.
+
+**Markers** — `packets`, `client_core`, `server_core`, `server_openvr`. A new
+`ClientControlPacket::Markers`, appended last like `StreamReadyOnPort`. The server recenters the
+markers like any other pose and the driver shows them as fake Vive trackers; see
+[Markers](#markers).

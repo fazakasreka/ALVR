@@ -22,7 +22,7 @@ use alvr_common::{
     info,
     parking_lot::{Mutex, RwLock},
 };
-use alvr_packets::{ButtonEntry, ButtonValue, FaceData, TrackingData, VideoStreamKind};
+use alvr_packets::{ButtonEntry, ButtonValue, FaceData, MarkerData, TrackingData, VideoStreamKind};
 use alvr_session::{CodecType, PassthroughMode};
 use serde::Serialize;
 use std::{
@@ -97,6 +97,8 @@ impl Default for ClientStatus {
 /// Most decoded alpha frames held while waiting for their color frame. Alpha normally trails or
 /// leads color by a frame or two; anything beyond this is a stream that stopped pairing up.
 const MAX_PENDING_ALPHA_FRAMES: usize = 8;
+
+const MARKERS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The pose the tracking thread reads. Written by the UI thread every frame.
 #[derive(Clone, Copy)]
@@ -467,6 +469,7 @@ pub struct EmulatedClient {
     announced_inputs: Option<HashSet<u64>>,
     /// Latest haptics pulse per hand, held until the UI takes it. Left is index 0.
     haptics: [Option<HapticsEvent>; 2],
+    markers_sent_at: Option<Instant>,
 }
 
 impl EmulatedClient {
@@ -510,6 +513,7 @@ impl EmulatedClient {
             sent_buttons: HashMap::new(),
             announced_inputs: None,
             haptics: [None; 2],
+            markers_sent_at: None,
         }
     }
 
@@ -610,6 +614,24 @@ impl EmulatedClient {
         self.announced_inputs = Some(input_ids);
     }
 
+    /// Reports the markers once per [`MARKERS_INTERVAL`] while streaming, as a headset would.
+    pub fn sync_markers(&mut self, markers: &[MarkerData]) {
+        if !self.status.streaming {
+            return;
+        }
+
+        let now = Instant::now();
+        if self
+            .markers_sent_at
+            .is_some_and(|sent| now.saturating_duration_since(sent) < MARKERS_INTERVAL)
+        {
+            return;
+        }
+
+        self.context.send_markers(markers.to_vec());
+        self.markers_sent_at = Some(now);
+    }
+
     /// Drains client core events and keeps [`ClientStatus`] in step. Call once per frame.
     pub fn poll_events(&mut self) {
         self.drain_events();
@@ -652,6 +674,7 @@ impl EmulatedClient {
                     // state and the interaction profile must go out again.
                     self.sent_buttons.clear();
                     self.announced_inputs = None;
+                    self.markers_sent_at = None;
 
                     self.start_tracking(config.negotiated_config.refresh_rate_hint);
                 }

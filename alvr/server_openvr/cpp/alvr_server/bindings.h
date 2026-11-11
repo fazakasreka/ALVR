@@ -26,6 +26,12 @@ struct FfiDeviceMotion {
     float angularVelocity[3];
 };
 
+struct FfiMarker {
+    unsigned long long deviceID;
+    unsigned int slot;
+    FfiPose pose;
+};
+
 struct FfiViewParams {
     FfiPose pose;
     FfiFov fov;
@@ -257,6 +263,7 @@ extern "C" void SetLocalViewParams(const FfiViewParams params[2]);
 extern "C" void SetBattery(unsigned long long deviceID, float gauge_value, bool is_plugged);
 extern "C" void SetButton(unsigned long long buttonID, FfiButtonValue value);
 extern "C" void SetProximityState(bool headset_is_worn);
+extern "C" void SetMarkers(const FfiMarker* markers, int count);
 
 extern "C" void InitOpenvrClient();
 extern "C" void ShutdownOpenvrClient();

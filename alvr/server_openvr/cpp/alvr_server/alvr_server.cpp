@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <iterator>
 #include <map>
 #include <optional>
 
@@ -76,6 +77,29 @@ static void load_debug_privilege(void) {
 #endif
 }
 
+namespace {
+// One per marker slot; MARKER_SLOTS in props.rs must match. OpenXR applications find trackers by
+// role, and these two are not used by the body trackers.
+struct MarkerRole {
+    const char* trackerRole;
+    const char* controllerType;
+};
+const MarkerRole MARKER_ROLES[] = {
+    { "TrackerRole_Camera", "vive_tracker_camera" },
+    { "TrackerRole_Keyboard", "vive_tracker_keyboard" },
+};
+
+std::string MarkerDeviceType(unsigned int slot) { return "ALVR/marker/" + std::to_string(slot); }
+
+// SteamVR reads tracker roles only when it starts, so these take effect from the next start.
+void AssignMarkerRoles() {
+    for (unsigned int slot = 0; slot < std::size(MARKER_ROLES); slot++) {
+        auto devicePath = "/devices/" + MarkerDeviceType(slot);
+        vr::VRSettings()->SetString("trackers", devicePath.c_str(), MARKER_ROLES[slot].trackerRole);
+    }
+}
+}
+
 class DriverProvider : public vr::IServerTrackedDeviceProvider {
 public:
     bool early_hmd_initialization = false;
@@ -84,6 +108,7 @@ public:
     std::unique_ptr<Controller> left_controller, right_controller;
     std::unique_ptr<Controller> left_hand_tracker, right_hand_tracker;
     std::vector<std::unique_ptr<FakeViveTracker>> generic_trackers;
+    std::map<uint64_t, std::unique_ptr<FakeViveTracker>> marker_trackers;
     bool devices_initialized = false;
     bool shutdown_called = false;
 
@@ -95,6 +120,8 @@ public:
 
         VR_INIT_SERVER_DRIVER_CONTEXT(pContext);
         InitDriverLog(vr::VRDriverLog());
+
+        AssignMarkerRoles();
 
         if (this->early_hmd_initialization) {
             auto hmd = new Hmd();
@@ -498,6 +525,49 @@ void SetButton(unsigned long long buttonID, FfiButtonValue value) {
 void SetProximityState(bool headset_is_worn) {
     if (g_driver_provider.hmd) {
         g_driver_provider.hmd->SetProximityState(headset_is_worn);
+    }
+}
+
+namespace {
+void CreateMarkerTracker(uint64_t deviceID, unsigned int slot) {
+    if (slot >= std::size(MARKER_ROLES)) {
+        return;
+    }
+
+    auto tracker = std::make_unique<FakeViveTracker>(
+        deviceID, MarkerDeviceType(slot), MARKER_ROLES[slot].controllerType
+    );
+    if (tracker->register_device(true)) {
+        g_driver_provider.tracked_devices.insert({ deviceID, tracker.get() });
+        g_driver_provider.marker_trackers.insert({ deviceID, std::move(tracker) });
+    }
+}
+}
+
+void SetMarkers(const FfiMarker* markers, int count) {
+    std::map<uint64_t, const FfiMarker*> seen;
+    for (int i = 0; i < count; i++) {
+        seen.insert({ markers[i].deviceID, &markers[i] });
+    }
+
+    if (g_driver_provider.hmd) {
+        for (auto& [deviceID, marker] : seen) {
+            if (g_driver_provider.marker_trackers.count(deviceID) == 0) {
+                CreateMarkerTracker(deviceID, marker->slot);
+            }
+        }
+    }
+
+    for (auto& [deviceID, tracker] : g_driver_provider.marker_trackers) {
+        auto it = seen.find(deviceID);
+        if (it != seen.end()) {
+            auto motion = FfiDeviceMotion {};
+            motion.deviceID = deviceID;
+            motion.pose = it->second->pose;
+            tracker->OnPoseUpdated(0, &motion);
+        } else {
+            tracker->OnPoseUpdated(0, nullptr);
+        }
     }
 }
 

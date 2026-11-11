@@ -27,7 +27,7 @@ use alvr_events::{EventType, HapticsEvent};
 use alvr_filesystem as afs;
 use alvr_packets::{
     BatteryInfo, ButtonEntry, ClientConnectionsAction, DecoderInitializationConfig, Haptics,
-    VideoPacketHeader, VideoStreamKind,
+    MarkerData, VideoPacketHeader, VideoStreamKind,
 };
 use alvr_server_io::ServerSessionManager;
 use alvr_session::{CodecType, H264Profile, OpenvrProperty, Settings, SteamvrHmdInitConfig};
@@ -102,6 +102,7 @@ pub enum ServerCoreEvent {
     ShutdownPending,
     RestartPending,
     ProximityState(bool),
+    Markers(Vec<MarkerData>), // Recentered
 }
 
 pub struct ConnectionContext {

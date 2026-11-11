@@ -18,7 +18,7 @@ use alvr_common::{
     inputs as inp,
 };
 use alvr_events::{EventType, TrackingEvent};
-use alvr_packets::TrackingData;
+use alvr_packets::{MarkerData, TrackingData};
 use alvr_session::{
     BodyTrackingConfig, HeadsetConfig, RecenteringMode, Settings, VMCConfig,
     settings_schema::Switch,
@@ -54,6 +54,7 @@ pub struct TrackingManager {
     device_motions_history: HashMap<u64, VecDeque<(Duration, DeviceMotion)>>,
     hand_skeletons_history: [VecDeque<(Duration, [Pose; 26])>; 2],
     max_history_size: usize,
+    markers: Vec<MarkerData>, // client's reference space
 }
 
 impl TrackingManager {
@@ -64,7 +65,22 @@ impl TrackingManager {
             device_motions_history: HashMap::new(),
             hand_skeletons_history: [VecDeque::new(), VecDeque::new()],
             max_history_size,
+            markers: Vec::new(),
         }
+    }
+
+    pub fn set_markers(&mut self, markers: Vec<MarkerData>) {
+        self.markers = markers;
+    }
+
+    pub fn recentered_markers(&self) -> Vec<MarkerData> {
+        self.markers
+            .iter()
+            .map(|marker| MarkerData {
+                pose: self.recenter_pose(marker.pose),
+                ..marker.clone()
+            })
+            .collect()
     }
 
     pub fn recenter(&mut self, recentering_mode: &RecenteringMode) {
