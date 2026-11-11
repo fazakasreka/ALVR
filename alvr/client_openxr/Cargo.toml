@@ -67,6 +67,14 @@ name = "android.permission.CHANGE_WIFI_MULTICAST_STATE"
 name = "android.permission.INTERNET"
 [[package.metadata.android.uses_permission]]
 name = "android.permission.RECORD_AUDIO"
+[[package.metadata.android.uses_permission]]
+name = "com.oculus.permission.USE_SCENE"
+[[package.metadata.android.uses_permission]]
+name = "horizonos.permission.USE_ANCHOR_API"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.SCENE_UNDERSTANDING_COARSE"
+[[package.metadata.android.uses_permission]]
+name = "com.picovr.permission.SPATIAL_DATA"
 # WAKE_LOCK is needed for proper wifi locking
 # https://developer.android.com/reference/android/net/wifi/WifiManager.WifiLock
 [[package.metadata.android.uses_permission]]

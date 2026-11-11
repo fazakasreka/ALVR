@@ -287,9 +287,11 @@ fn connection_pipeline(
     // configured port would win the race and leave the server unable to bind at all.
     //
     // Across machines this is moot — both sides can hold the same number — so ordinary clients keep
-    // using the configured port and send the original `StreamReady`.
-    let share_machine_with_server =
-        server_ip.is_loopback() || alvr_system_info::local_ip() == server_ip;
+    // using the configured port and send the original `StreamReady`. A headset never shares the
+    // server's machine, even though a wired connection (an ADB forward of the configured port)
+    // makes the server appear on loopback.
+    let share_machine_with_server = !cfg!(target_os = "android")
+        && (server_ip.is_loopback() || alvr_system_info::local_ip() == server_ip);
     let requested_stream_port = if share_machine_with_server {
         info!("Server is on this machine; binding an OS-assigned stream port");
         0
