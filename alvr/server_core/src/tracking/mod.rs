@@ -15,7 +15,7 @@ use crate::{
 use alvr_common::{
     ConnectionError, DEVICE_ID_TO_PATH, DeviceMotion, Pose, ViewParams,
     glam::{Quat, Vec3},
-    inputs as inp,
+    info, inputs as inp,
 };
 use alvr_events::{EventType, TrackingEvent};
 use alvr_packets::{MarkerData, TrackingData};
@@ -39,6 +39,26 @@ pub enum HandType {
     Right = 1,
 }
 
+const MARKER_RELOCK_DISTANCE: f32 = 0.03; // m
+const MARKER_RELOCK_ANGLE: f32 = 2.0 * PI / 180.0;
+
+// Floor point under the code, yaw only. Forward (-Z) is the code's top edge if it lies flat, or
+// into the wall if it hangs on one.
+fn floor_origin_from_marker(marker: Pose) -> Option<Pose> {
+    let normal = marker.orientation * Vec3::Z;
+    let forward = if normal.y.abs() > 0.7 {
+        marker.orientation * Vec3::Y
+    } else {
+        -normal
+    };
+    let forward = Vec3::new(forward.x, 0.0, forward.z).try_normalize()?;
+
+    Some(Pose {
+        position: Vec3::new(marker.position.x, 0.0, marker.position.z),
+        orientation: Quat::from_rotation_y(f32::atan2(-forward.x, -forward.z)),
+    })
+}
+
 // todo: Move this struct to Settings and use it for every tracked device
 #[derive(Default)]
 struct MotionConfig {
@@ -54,7 +74,10 @@ pub struct TrackingManager {
     device_motions_history: HashMap<u64, VecDeque<(Duration, DeviceMotion)>>,
     hand_skeletons_history: [VecDeque<(Duration, [Pose; 26])>; 2],
     max_history_size: usize,
-    markers: Vec<MarkerData>, // client's reference space
+    markers: Vec<MarkerData>,    // client's reference space
+    marker_origin: Option<Pose>, // client's reference space, last origin taken from a QR code
+    // With no code text configured: the text of the first code that set the origin
+    first_code_text: Option<String>,
 }
 
 impl TrackingManager {
@@ -66,6 +89,8 @@ impl TrackingManager {
             hand_skeletons_history: [VecDeque::new(), VecDeque::new()],
             max_history_size,
             markers: Vec::new(),
+            marker_origin: None,
+            first_code_text: None,
         }
     }
 
@@ -83,7 +108,60 @@ impl TrackingManager {
             .collect()
     }
 
+    // In Marker mode, moves the origin to the QR code when it moved noticeably (jitter is ignored,
+    // a recenter of the client's space is followed). Returns true if the origin changed.
+    pub fn update_marker_origin(&mut self, recentering_mode: &RecenteringMode) -> bool {
+        let RecenteringMode::Marker { code_text } = recentering_mode else {
+            self.first_code_text = None;
+            return false;
+        };
+        if !code_text.is_empty() {
+            self.first_code_text = None;
+        }
+        // Configured text, else the first code used, else any code
+        let wanted = (!code_text.is_empty())
+            .then_some(code_text)
+            .or(self.first_code_text.as_ref());
+
+        let Some((id, origin)) = self
+            .markers
+            .iter()
+            .find(|m| wanted.is_none_or(|text| m.id == *text))
+            .and_then(|m| Some((m.id.clone(), floor_origin_from_marker(m.pose)?)))
+        else {
+            return false;
+        };
+        if code_text.is_empty() && self.first_code_text.is_none() {
+            info!("Using QR code \"{id}\" as origin");
+            self.first_code_text = Some(id);
+        }
+
+        if let Some(current) = self.marker_origin
+            && current.position.distance(origin.position) < MARKER_RELOCK_DISTANCE
+            && current.orientation.angle_between(origin.orientation) < MARKER_RELOCK_ANGLE
+        {
+            return false;
+        }
+
+        self.marker_origin = Some(origin);
+        self.inverse_recentering_origin = origin.inverse();
+
+        true
+    }
+
     pub fn recenter(&mut self, recentering_mode: &RecenteringMode) {
+        let recentering_mode = match recentering_mode {
+            RecenteringMode::Marker { .. } => {
+                self.update_marker_origin(recentering_mode);
+                if let Some(origin) = self.marker_origin {
+                    self.inverse_recentering_origin = origin.inverse();
+                    return;
+                }
+                &RecenteringMode::LocalFloor
+            }
+            mode => mode,
+        };
+
         let position = match recentering_mode {
             RecenteringMode::Stage => Vec3::ZERO,
             RecenteringMode::LocalFloor => {
@@ -95,6 +173,7 @@ impl TrackingManager {
             RecenteringMode::Local { view_height } | RecenteringMode::Tilted { view_height } => {
                 self.last_head_pose.position - Vec3::new(0.0, *view_height, 0.0)
             }
+            RecenteringMode::Marker { .. } => unreachable!(),
         };
 
         let orientation = match recentering_mode {
@@ -109,6 +188,7 @@ impl TrackingManager {
                 rot
             }
             RecenteringMode::Tilted { .. } => self.last_head_pose.orientation,
+            RecenteringMode::Marker { .. } => unreachable!(),
         };
 
         self.inverse_recentering_origin = Pose {
@@ -523,5 +603,65 @@ pub fn tracking_loop(
                 .collect::<Vec<_>>();
             sink.send_tracking(&device_motions);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_origin(marker: Pose, position: Vec3, forward: Vec3) {
+        let origin = floor_origin_from_marker(marker).unwrap();
+        assert!(origin.position.distance(position) < 1e-5);
+        assert!((origin.orientation * -Vec3::Z).distance(forward) < 1e-5);
+    }
+
+    #[test]
+    fn marker_origin() {
+        // Flat on the floor, face up, top edge towards +X
+        let flat = Pose {
+            position: Vec3::new(1.0, 0.01, 2.0),
+            orientation: Quat::from_rotation_y(-PI / 2.0) * Quat::from_rotation_x(-PI / 2.0),
+        };
+        assert_origin(flat, Vec3::new(1.0, 0.0, 2.0), Vec3::X);
+
+        // On a wall at z = -3, facing the room (+Z)
+        let wall = Pose {
+            position: Vec3::new(0.5, 1.4, -3.0),
+            orientation: Quat::IDENTITY,
+        };
+        assert_origin(wall, Vec3::new(0.5, 0.0, -3.0), -Vec3::Z);
+    }
+
+    fn code(id: &str, x: f32) -> MarkerData {
+        MarkerData {
+            id: id.into(),
+            pose: Pose {
+                position: Vec3::new(x, 1.0, -2.0),
+                orientation: Quat::IDENTITY,
+            },
+            size: 0.1,
+        }
+    }
+
+    #[test]
+    fn first_code_keeps_origin() {
+        let mode = RecenteringMode::Marker {
+            code_text: String::new(),
+        };
+        let mut manager = TrackingManager::new(10);
+
+        manager.set_markers(vec![code("dog", 0.0)]);
+        assert!(manager.update_marker_origin(&mode));
+
+        // A different code, alone or next to the first one, is ignored
+        manager.set_markers(vec![code("cat", 1.0)]);
+        assert!(!manager.update_marker_origin(&mode));
+        manager.set_markers(vec![code("cat", 1.0), code("dog", 0.0)]);
+        assert!(!manager.update_marker_origin(&mode));
+
+        // The first code moving still moves the origin
+        manager.set_markers(vec![code("dog", 0.5)]);
+        assert!(manager.update_marker_origin(&mode));
     }
 }

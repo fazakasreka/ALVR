@@ -25,7 +25,20 @@ const SPATIAL_DATA_PERMISSIONS: [&str; 3] = [
     "com.picovr.permission.SPATIAL_DATA",
 ];
 
+const PERMISSION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+// Android drops a permission request while another dialog (e.g. the microphone one) is open, so
+// the request is repeated until answered
+const PERMISSION_REQUEST_INTERVAL: Duration = Duration::from_secs(5);
+const PERMISSION_REQUEST_COUNT: u32 = 12;
+
+struct PermissionWait {
+    last_check: Instant,
+    last_request: Instant,
+    requests: u32,
+}
+
 enum ContextState {
+    WaitingForPermission(PermissionWait),
     Creating(sys::FutureEXT),
     Ready(sys::SpatialContextEXT),
     Failed,
@@ -82,15 +95,38 @@ impl MarkerTracker {
             return None;
         }
 
-        #[cfg(target_os = "android")]
-        for permission in SPATIAL_DATA_PERMISSIONS {
-            alvr_system_info::try_get_permission(permission);
-        }
-
         let space = session
             .create_reference_space(xr::ReferenceSpaceType::STAGE, xr::Posef::IDENTITY)
             .ok()?;
 
+        let mut this = Self {
+            instance,
+            session: session.clone(),
+            entity_fns,
+            future_fns,
+            space,
+            context: ContextState::Failed,
+            snapshot: None,
+            last_discovery: None,
+            seen: HashMap::new(),
+        };
+
+        this.context = if has_spatial_data_permission() {
+            this.create_context()
+        } else {
+            request_spatial_data_permission();
+            info!("Waiting for the spatial data permission");
+            ContextState::WaitingForPermission(PermissionWait {
+                last_check: Instant::now(),
+                last_request: Instant::now(),
+                requests: 1,
+            })
+        };
+
+        Some(this)
+    }
+
+    fn create_context(&self) -> ContextState {
         let static_markers = sys::SpatialMarkerStaticOptimizationEXT {
             ty: sys::SpatialMarkerStaticOptimizationEXT::TYPE,
             next: ptr::null(),
@@ -114,29 +150,42 @@ impl MarkerTracker {
 
         let mut future = sys::FutureEXT::default();
         let result = unsafe {
-            (entity_fns.create_spatial_context_async)(session.as_raw(), &create_info, &mut future)
+            (self.entity_fns.create_spatial_context_async)(
+                self.session.as_raw(),
+                &create_info,
+                &mut future,
+            )
         };
         if result != sys::Result::SUCCESS {
             error!("Cannot start QR code tracking: {result:?}");
-            return None;
+            return ContextState::Failed;
         }
 
-        Some(Self {
-            instance,
-            session: session.clone(),
-            entity_fns,
-            future_fns,
-            space,
-            context: ContextState::Creating(future),
-            snapshot: None,
-            last_discovery: None,
-            seen: HashMap::new(),
-        })
+        ContextState::Creating(future)
     }
 
     /// Returns the QR codes currently tracked whenever a new discovery completes.
     pub fn update(&mut self, time: xr::Time) -> Option<Vec<MarkerData>> {
         match self.context {
+            ContextState::WaitingForPermission(ref mut wait) => {
+                if wait.last_check.elapsed() < PERMISSION_CHECK_INTERVAL {
+                    return None;
+                }
+                wait.last_check = Instant::now();
+
+                if has_spatial_data_permission() {
+                    info!("Spatial data permission granted");
+                    self.context = self.create_context();
+                } else if wait.requests < PERMISSION_REQUEST_COUNT
+                    && wait.last_request.elapsed() >= PERMISSION_REQUEST_INTERVAL
+                    && !spatial_data_permission_denied()
+                {
+                    request_spatial_data_permission();
+                    wait.last_request = Instant::now();
+                    wait.requests += 1;
+                }
+                None
+            }
             ContextState::Creating(future) => {
                 if self.is_ready(future) {
                     self.context = self.complete_context(future);
@@ -417,4 +466,29 @@ impl Drop for MarkerTracker {
             unsafe { (self.entity_fns.destroy_spatial_context)(context) };
         }
     }
+}
+
+fn request_spatial_data_permission() {
+    #[cfg(target_os = "android")]
+    alvr_system_info::try_get_permissions(&SPATIAL_DATA_PERMISSIONS);
+}
+
+fn spatial_data_permission_denied() -> bool {
+    #[cfg(target_os = "android")]
+    return SPATIAL_DATA_PERMISSIONS
+        .iter()
+        .any(|p| alvr_system_info::was_permission_denied(p));
+
+    #[cfg(not(target_os = "android"))]
+    false
+}
+
+fn has_spatial_data_permission() -> bool {
+    #[cfg(target_os = "android")]
+    return SPATIAL_DATA_PERMISSIONS
+        .iter()
+        .any(|p| alvr_system_info::has_permission(p));
+
+    #[cfg(not(target_os = "android"))]
+    true
 }

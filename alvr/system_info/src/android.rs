@@ -35,31 +35,73 @@ fn get_api_level() -> i32 {
     .unwrap()
 }
 
-pub fn try_get_permission(permission: &str) {
+pub fn has_permission(permission: &str) -> bool {
     vm().attach_current_thread(|env| {
-        let mic_perm_jstring = env.new_string(permission)?;
+        let permission = env.new_string(permission)?;
 
-        let permission_status = env
+        let status = env
             .call_method(
                 unsafe { JObject::global_kind_from_raw(context()) },
                 jni_str!("checkSelfPermission"),
                 jni_sig!("(Ljava/lang/String;)I"),
-                &[(&mic_perm_jstring).into()],
+                &[(&permission).into()],
             )?
             .i()?;
 
-        if permission_status != 0 {
-            let perm_array =
-                env.new_object_array(1, jni_str!("java/lang/String"), mic_perm_jstring)?;
+        JniResult::Ok(status == 0) // PERMISSION_GRANTED
+    })
+    .unwrap()
+}
 
-            env.call_method(
-                unsafe { JObject::global_kind_from_raw(context()) },
-                jni_str!("requestPermissions"),
-                jni_sig!("([Ljava/lang/String;I)V"),
-                &[(&perm_array).into(), 0.into()],
-            )?;
-            // todo: handle case where permission is rejected
+// True after the user denied the permission once (and may still be asked again)
+pub fn was_permission_denied(permission: &str) -> bool {
+    vm().attach_current_thread(|env| {
+        let permission = env.new_string(permission)?;
+
+        env.call_method(
+            unsafe { JObject::global_kind_from_raw(context()) },
+            jni_str!("shouldShowRequestPermissionRationale"),
+            jni_sig!("(Ljava/lang/String;)Z"),
+            &[(&permission).into()],
+        )?
+        .z()
+    })
+    .unwrap()
+}
+
+pub fn try_get_permission(permission: &str) {
+    try_get_permissions(&[permission]);
+}
+
+// Asks for all missing permissions in one dialog. Separate requests in a row would replace each
+// other's dialog. Names unknown to the system are skipped by it without a prompt.
+pub fn try_get_permissions(permissions: &[&str]) {
+    let missing = permissions
+        .iter()
+        .filter(|p| !has_permission(p))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return;
+    }
+
+    vm().attach_current_thread(|env| {
+        let array = env.new_object_array(
+            missing.len() as i32,
+            jni_str!("java/lang/String"),
+            JObject::null(),
+        )?;
+        for (i, permission) in missing.iter().enumerate() {
+            let permission = env.new_string(permission)?;
+            array.set_element(env, i, permission)?;
         }
+
+        env.call_method(
+            unsafe { JObject::global_kind_from_raw(context()) },
+            jni_str!("requestPermissions"),
+            jni_sig!("([Ljava/lang/String;I)V"),
+            &[(&array).into(), 0.into()],
+        )?;
+        // todo: handle case where permission is rejected
 
         JniResult::Ok(())
     })

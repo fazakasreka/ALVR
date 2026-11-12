@@ -1372,6 +1372,11 @@ fn connection_pipeline(
                     ClientControlPacket::Markers(markers) => {
                         let mut tracking_manager = ctx.tracking_manager.write();
                         tracking_manager.set_markers(markers);
+                        if tracking_manager.update_marker_origin(
+                            &SESSION_MANAGER.read().settings().headset.recentering_mode,
+                        ) {
+                            info!("Origin moved to the QR code");
+                        }
                         ctx.events_sender
                             .send(ServerCoreEvent::Markers(
                                 tracking_manager.recentered_markers(),

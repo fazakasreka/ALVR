@@ -1289,6 +1289,17 @@ pub enum RecenteringMode {
         #[schema(gui(slider(min = 0.0, max = 3.0)), suffix = "m")]
         view_height: f32,
     },
+    #[schema(strings(
+        display_name = "QR code",
+        help = "Origin on the floor under a QR code seen by the headset. Flat code: forward is its top edge; wall code: forward faces the wall. Acts like Local Floor until the code is seen."
+    ))]
+    Marker {
+        #[schema(strings(
+            display_name = "QR code text",
+            help = "Only a QR code with exactly this text sets the origin. Leave empty to use the first QR code seen."
+        ))]
+        code_text: String,
+    },
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone, Copy)]
@@ -2172,6 +2183,9 @@ pub fn session_settings_default() -> SettingsDefault {
             recentering_mode: RecenteringModeDefault {
                 Local: RecenteringModeLocalDefault { view_height: 1.5 },
                 Tilted: RecenteringModeTiltedDefault { view_height: 1.5 },
+                Marker: RecenteringModeMarkerDefault {
+                    code_text: "".into(),
+                },
                 variant: RecenteringModeDefaultVariant::LocalFloor,
             },
             max_prediction_ms: 100,
