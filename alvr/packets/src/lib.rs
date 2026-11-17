@@ -212,6 +212,13 @@ pub struct ButtonEntry {
     pub value: ButtonValue,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct MarkerData {
+    pub id: String, // QR code text
+    pub pose: Pose, // Centre of the marker; +Y towards its top edge, +Z out of its face
+    pub size: f32,  // Edge length in metres
+}
+
 #[derive(Serialize, Deserialize)]
 pub enum ClientControlPacket {
     PlayspaceSync(Option<Vec2>),
@@ -241,6 +248,7 @@ pub enum ClientControlPacket {
     /// changing `StreamReady` itself would reinterpret every old client's packet. Old clients keep
     /// sending `StreamReady` and old servers never see this variant.
     StreamReadyOnPort(u16),
+    Markers(Vec<MarkerData>), // All markers currently seen, replacing the previous list
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

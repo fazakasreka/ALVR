@@ -1247,6 +1247,10 @@ fn connection_pipeline(
                             ctx.tracking_manager
                                 .write()
                                 .recenter(&config.recentering_mode);
+                            let markers = ctx.tracking_manager.read().recentered_markers();
+                            ctx.events_sender
+                                .send(ServerCoreEvent::Markers(markers))
+                                .ok();
 
                             let area = packet.unwrap_or(Vec2::new(2.0, 2.0));
                             let wh = area.x * area.y;
@@ -1363,6 +1367,20 @@ fn connection_pipeline(
                     ClientControlPacket::ProximityState(headset_is_worn) => {
                         ctx.events_sender
                             .send(ServerCoreEvent::ProximityState(headset_is_worn))
+                            .ok();
+                    }
+                    ClientControlPacket::Markers(markers) => {
+                        let mut tracking_manager = ctx.tracking_manager.write();
+                        tracking_manager.set_markers(markers);
+                        if tracking_manager.update_marker_origin(
+                            &SESSION_MANAGER.read().settings().headset.recentering_mode,
+                        ) {
+                            info!("Origin moved to the QR code");
+                        }
+                        ctx.events_sender
+                            .send(ServerCoreEvent::Markers(
+                                tracking_manager.recentered_markers(),
+                            ))
                             .ok();
                     }
                     ClientControlPacket::Reserved(_) | ClientControlPacket::ReservedBuffer(_) => (),
@@ -1507,6 +1525,9 @@ fn connection_pipeline(
     keepalive_thread.join().ok();
     lifecycle_check_thread.join().ok();
 
+    ctx.events_sender
+        .send(ServerCoreEvent::Markers(Vec::new()))
+        .ok();
     ctx.events_sender
         .send(ServerCoreEvent::ClientDisconnected)
         .ok();

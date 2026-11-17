@@ -3,6 +3,7 @@ mod extra_extensions;
 mod graphics;
 mod interaction;
 mod lobby;
+mod markers;
 mod passthrough;
 mod stream;
 
@@ -200,9 +201,12 @@ pub fn entry_point() {
     selected_exts.bd_controller_interaction = true;
     selected_exts.bd_facial_simulation = true;
     selected_exts.ext_eye_gaze_interaction = true;
+    selected_exts.ext_future = true;
     selected_exts.ext_hand_tracking = true;
     selected_exts.ext_local_floor = true;
     selected_exts.ext_performance_settings = true;
+    selected_exts.ext_spatial_entity = true;
+    selected_exts.ext_spatial_marker_tracking = true;
     selected_exts.ext_user_presence = true;
     selected_exts.fb_body_tracking = true;
     selected_exts.fb_color_space = true;
@@ -379,6 +383,8 @@ pub fn entry_point() {
         interaction_context
             .write()
             .select_sources(&lobby_interaction_sources);
+
+        let mut marker_tracker = markers::MarkerTracker::new(&xr_session, xr_system);
 
         let mut session_running = false;
         let mut stream_context = None::<StreamContext>;
@@ -568,6 +574,14 @@ pub fn entry_point() {
                 Duration::from_nanos(frame_state.predicted_display_period.as_nanos() as _);
             let vsync_time =
                 Duration::from_nanos(frame_state.predicted_display_time.as_nanos() as _);
+
+            if let Some(markers) = marker_tracker
+                .as_mut()
+                .and_then(|tracker| tracker.update(frame_state.predicted_display_time))
+                && stream_context.is_some()
+            {
+                core_context.send_markers(markers);
+            }
 
             xr_frame_stream.begin().unwrap();
 

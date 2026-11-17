@@ -544,6 +544,22 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                 ServerCoreEvent::ProximityState(headset_is_worn) => unsafe {
                     SetProximityState(headset_is_worn)
                 },
+                ServerCoreEvent::Markers(markers) => {
+                    let ffi_markers = markers
+                        .iter()
+                        .filter_map(|marker| {
+                            let slot = props::marker_slot(&marker.id)?;
+
+                            Some(FfiMarker {
+                                deviceID: props::marker_slot_device_id(slot),
+                                slot: slot as u32,
+                                pose: tracking::to_ffi_pose(marker.pose),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+
+                    unsafe { SetMarkers(ffi_markers.as_ptr(), ffi_markers.len() as i32) };
+                }
             }
         }
 

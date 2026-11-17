@@ -27,7 +27,7 @@ use alvr_common::{
     warn,
 };
 use alvr_packets::{
-    BatteryInfo, ButtonEntry, ClientControlPacket, ClientStreamConfig, RealTimeConfig,
+    BatteryInfo, ButtonEntry, ClientControlPacket, ClientStreamConfig, MarkerData, RealTimeConfig,
     TrackingData, VideoStreamKind,
 };
 use alvr_session::CodecType;
@@ -208,6 +208,14 @@ impl ClientCoreContext {
 
         if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
             sender.send(&ClientControlPacket::Buttons(entries)).ok();
+        }
+    }
+
+    pub fn send_markers(&self, markers: Vec<MarkerData>) {
+        dbg_client_core!("send_markers");
+
+        if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
+            sender.send(&ClientControlPacket::Markers(markers)).ok();
         }
     }
 

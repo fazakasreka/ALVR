@@ -9,6 +9,13 @@
 FakeViveTracker::FakeViveTracker(uint64_t deviceID)
     : TrackedDevice(deviceID, vr::TrackedDeviceClass_GenericTracker) { }
 
+FakeViveTracker::FakeViveTracker(
+    uint64_t deviceID, std::string registeredDeviceType, std::string controllerType
+)
+    : TrackedDevice(deviceID, vr::TrackedDeviceClass_GenericTracker)
+    , registered_device_type(std::move(registeredDeviceType))
+    , controller_type(std::move(controllerType)) { }
+
 bool FakeViveTracker::activate() {
     Debug("FakeViveTracker::Activate");
 
@@ -111,7 +118,9 @@ bool FakeViveTracker::activate() {
     vr_properties->SetStringProperty(this->prop_container, vr::Prop_ResourceRoot_String, "htc");
 
     const char* name;
-    if (this->device_id == BODY_CHEST_ID) {
+    if (!this->registered_device_type.empty()) {
+        name = this->registered_device_type.c_str();
+    } else if (this->device_id == BODY_CHEST_ID) {
         name = "ALVR/tracker/chest";
     } else if (this->device_id == BODY_HIPS_ID) {
         name = "ALVR/tracker/waist";
@@ -146,7 +155,7 @@ bool FakeViveTracker::activate() {
         this->prop_container, vr::Prop_ControllerRoleHint_Int32, vr::TrackedControllerRole_Invalid
     );
     vr_properties->SetStringProperty(
-        this->prop_container, vr::Prop_ControllerType_String, "vive_tracker_waist"
+        this->prop_container, vr::Prop_ControllerType_String, this->controller_type.c_str()
     );
     vr_properties->SetInt32Property(
         this->prop_container, vr::Prop_ControllerHandSelectionPriority_Int32, -1

@@ -10,8 +10,8 @@ use crate::{
 use alvr_common::{
     BODY_CHEST_ID, BODY_HIPS_ID, BODY_LEFT_ELBOW_ID, BODY_LEFT_FOOT_ID, BODY_LEFT_KNEE_ID,
     BODY_RIGHT_ELBOW_ID, BODY_RIGHT_FOOT_ID, BODY_RIGHT_KNEE_ID, DEVICE_ID_TO_PATH, HAND_LEFT_ID,
-    HAND_RIGHT_ID, HAND_TRACKER_LEFT_ID, HAND_TRACKER_RIGHT_ID, HEAD_ID, debug,
-    settings_schema::Switch, warn,
+    HAND_RIGHT_ID, HAND_TRACKER_LEFT_ID, HAND_TRACKER_RIGHT_ID, HEAD_ID, debug, hash_string,
+    parking_lot::Mutex, settings_schema::Switch, warn,
 };
 use alvr_session::{
     ControllersEmulationMode, HeadsetEmulationMode, OpenvrPropKey, OpenvrPropType, OpenvrProperty,
@@ -20,6 +20,31 @@ use std::{
     ffi::{CString, c_char, c_void},
     ptr,
 };
+
+// Must match MARKER_ROLES in alvr_server.cpp
+const MARKER_SLOTS: usize = 2;
+
+// Marker ids in slot order. A marker keeps its slot while SteamVR runs.
+static MARKER_SLOT_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+pub fn marker_slot(marker_id: &str) -> Option<usize> {
+    let mut slots = MARKER_SLOT_IDS.lock();
+
+    if let Some(slot) = slots.iter().position(|id| id == marker_id) {
+        return Some(slot);
+    }
+
+    if slots.len() < MARKER_SLOTS {
+        slots.push(marker_id.to_owned());
+        Some(slots.len() - 1)
+    } else {
+        None
+    }
+}
+
+pub fn marker_slot_device_id(slot: usize) -> u64 {
+    hash_string(&format!("/alvr/marker/{slot}"))
+}
 
 pub fn set_openvr_prop(instance_ptr: Option<*mut c_void>, device_id: u64, prop: OpenvrProperty) {
     let key = prop.key as u32;
@@ -172,6 +197,10 @@ fn serial_number(device_id: u64) -> String {
         "ALVR Tracker (left foot)".into()
     } else if device_id == *BODY_RIGHT_FOOT_ID {
         "ALVR Tracker (right foot)".into()
+    } else if let Some(slot) =
+        (0..MARKER_SLOTS).find(|&slot| marker_slot_device_id(slot) == device_id)
+    {
+        format!("ALVR Marker {}", slot + 1)
     } else {
         "Unknown".into()
     }
