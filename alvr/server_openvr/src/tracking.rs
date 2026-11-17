@@ -47,7 +47,7 @@ pub fn to_ffi_quat(quat: Quat) -> FfiQuat {
     }
 }
 
-pub fn to_ffi_pose(pose: Pose) -> FfiPose {
+fn to_ffi_pose(pose: Pose) -> FfiPose {
     FfiPose {
         orientation: to_ffi_quat(pose.orientation),
         position: pose.position.to_array(),

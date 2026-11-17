@@ -589,8 +589,9 @@ Hand tracking reaches SteamVR through settings that are on by default, but worth
 
 ## Markers
 
-The emulated headset reports QR codes in the room to the server, which shows each to SteamVR as a
-Vive tracker, so OpenXR applications can find it through `XR_HTCX_vive_tracker_interaction`.
+The emulated headset reports QR codes in the room to the server, which gives them to OpenXR
+applications through `XR_EXT_spatial_marker_tracking`, provided by ALVR's OpenXR API layer (see
+[`alvr/openxr_layer`](../openxr_layer/README.md)).
 
 The codes come from `markers.json` in the user folder, read at startup. The default is one 50 cm
 code lying face up on the centre of the rug:
@@ -612,15 +613,6 @@ code lying face up on the centre of the rug:
 the quiet zone. The drawn pattern looks like a QR code but does not decode. All codes are reported
 once a second while streaming, as if always in view.
 
-The driver has two marker slots, with the `camera` and `keyboard` tracker roles, taken in the order
-markers are first seen; further markers are not tracked. The open-xr test app
-(`OpenXR.Test.Desktop`) draws a cube on each.
-
-- **SteamVR reads tracker roles only when it starts.** The driver writes them on load, so on the
-  very first start they apply only after restarting SteamVR once.
-- **OpenXR applications get tracker poses only while focused.** The SteamVR dashboard takes focus
-  when SteamVR starts; close it with the left menu button
-  (`POST /api/controllers/left/inputs/click` with `{"input": "menu/click"}`).
 
 ## HTTP API
 
