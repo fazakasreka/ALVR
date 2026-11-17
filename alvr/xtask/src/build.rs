@@ -206,6 +206,27 @@ pub fn build_streamer(
             build_layout.openvr_driver_lib_dir(),
         )
         .unwrap();
+
+        // build the OpenXR layer, which the driver registers when SteamVR starts
+        {
+            let _push_guard = sh.push_dir(afs::crate_dir("openxr_layer"));
+            cmd!(sh, "cargo build {common_flags_ref...}").run().unwrap();
+
+            let layer_dir = build_layout.openxr_layer_dir();
+            sh.create_dir(&layer_dir).unwrap();
+            sh.copy_file(
+                artifacts_dir.join(afs::dynlib_fname("alvr_openxr_layer")),
+                build_layout.openxr_layer_lib(),
+            )
+            .unwrap();
+            sh.copy_file(artifacts_dir.join("alvr_openxr_layer.pdb"), &layer_dir)
+                .unwrap();
+            sh.copy_file(
+                afs::crate_dir("openxr_layer").join("alvr_openxr_layer.json"),
+                build_layout.openxr_layer_manifest(),
+            )
+            .unwrap();
+        }
     } else if cfg!(target_os = "linux") {
         // build compositor wrapper
         let _push_guard = sh.push_dir(afs::crate_dir("vrcompositor_wrapper"));

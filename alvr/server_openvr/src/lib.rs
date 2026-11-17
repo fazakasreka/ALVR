@@ -1,4 +1,5 @@
 mod graphics;
+mod openxr_markers;
 mod props;
 mod tracking;
 
@@ -282,6 +283,7 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                 ServerCoreEvent::ClientConnected(config) => unsafe {
                     if InitializeStreaming(make_settings(Some(&config))) {
                         RequestDriverResync();
+                        openxr_markers::set_client_connected(true);
                     } else {
                         SERVER_CORE_CONTEXT.write().take();
 
@@ -289,7 +291,10 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                     }
                 },
 
-                ServerCoreEvent::ClientDisconnected => unsafe { DeinitializeStreaming() },
+                ServerCoreEvent::ClientDisconnected => {
+                    openxr_markers::set_client_connected(false);
+                    unsafe { DeinitializeStreaming() }
+                }
                 ServerCoreEvent::Battery(info) => unsafe {
                     SetBattery(info.device_id, info.gauge_value, info.is_plugged)
                 },
@@ -545,6 +550,8 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                     SetProximityState(headset_is_worn)
                 },
                 ServerCoreEvent::Markers(markers) => {
+                    openxr_markers::set_markers(markers.clone());
+
                     let ffi_markers = markers
                         .iter()
                         .filter_map(|marker| {
@@ -769,6 +776,7 @@ extern "C" fn wait_for_vsync() {
 #[unsafe(export_name = "ShutdownRuntime")]
 pub extern "C" fn shutdown_driver() {
     SERVER_CORE_CONTEXT.write().take();
+    openxr_markers::stop();
 
     // join driver threads so the dll isn't unloaded while they're still running
     if let Some(handle) = EVENT_LOOP_HANDLE.lock().take() {
@@ -874,6 +882,11 @@ pub extern "C" fn initialize_runtime() {
         alvr_server_core::init_logging(
             log_to_disk.then(|| filesystem_layout.session_log()),
             Some(filesystem_layout.crash_log()),
+        );
+
+        openxr_markers::start(
+            &filesystem_layout,
+            alvr_server_core::settings().headset.openxr_marker_tracking,
         );
 
         unsafe {

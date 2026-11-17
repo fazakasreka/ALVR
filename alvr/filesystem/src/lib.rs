@@ -260,6 +260,21 @@ impl Layout {
         self.openvr_driver_root_dir.join("driver.vrdrivermanifest")
     }
 
+    // (windows only) folder of the OpenXR API layer that gives applications the markers the
+    // headset sees. A folder of its own, as packaged applications must be granted access to it.
+    pub fn openxr_layer_dir(&self) -> PathBuf {
+        self.libraries_dir.join("openxr_layer")
+    }
+
+    pub fn openxr_layer_lib(&self) -> PathBuf {
+        self.openxr_layer_dir()
+            .join(format!("alvr_openxr_layer.{DLL_EXTENSION}"))
+    }
+
+    pub fn openxr_layer_manifest(&self) -> PathBuf {
+        self.openxr_layer_dir().join("alvr_openxr_layer.json")
+    }
+
     pub fn vrcompositor_wrapper(&self) -> PathBuf {
         self.vrcompositor_wrapper_dir.join("vrcompositor-wrapper")
     }

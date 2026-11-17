@@ -1326,6 +1326,14 @@ Tilted: the world gets tilted when long pressing the recentering button. This is
     #[schema(flag = "real-time")]
     pub recentering_mode: RecenteringMode,
 
+    #[schema(strings(
+        display_name = "OpenXR marker tracking",
+        help = r"Gives OpenXR applications the QR codes the headset sees, through the XR_EXT_spatial_entity and XR_EXT_spatial_marker_tracking extensions. When SteamVR starts, ALVR registers an OpenXR API layer for the current user that provides them; it only affects applications that enable these extensions.
+Setting the DISABLE_XR_APILAYER_ALVR_MARKER_TRACKING environment variable turns the layer off for one application."
+    ))]
+    #[schema(flag = "steamvr-restart")]
+    pub openxr_marker_tracking: bool,
+
     #[schema(flag = "steamvr-restart")]
     pub controllers: Switch<ControllersConfig>,
 
@@ -2188,6 +2196,7 @@ pub fn session_settings_default() -> SettingsDefault {
                 },
                 variant: RecenteringModeDefaultVariant::LocalFloor,
             },
+            openxr_marker_tracking: true,
             max_prediction_ms: 100,
         },
         connection: ConnectionConfigDefault {

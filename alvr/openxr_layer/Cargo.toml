@@ -1,0 +1,28 @@
+[package]
+name = "alvr_openxr_layer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# An OpenXR API layer loaded into every OpenXR application, so it depends on as little as possible.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+alvr_marker_shm = { path = "../marker_shm" }
+openxr-sys = "0.13"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Diagnostics_Debug"] }
+
+[dev-dependencies]
+openxr = "0.21"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+] }
