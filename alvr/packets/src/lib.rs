@@ -191,6 +191,9 @@ pub enum ServerControlPacket {
     RealTimeConfig(RealTimeConfig),
     Reserved(String),
     ReservedBuffer(Vec<u8>),
+    /// The marker trackers the headset should run, replacing the previous list. Each is
+    /// supported by the headset as reported in [`ClientControlPacket::MarkerCapabilities`].
+    MarkerTrackingConfigs(Vec<MarkerTrackingConfig>),
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -217,6 +220,43 @@ pub struct MarkerData {
     pub id: String, // QR code text
     pub pose: Pose, // Centre of the marker; +Y towards its top edge, +Z out of its face
     pub size: f32,  // Edge length in metres
+}
+
+/// How the headset tracks QR codes for the applications that asked for it this way: the marker
+/// options of an OpenXR spatial context. The headset runs one tracker per configuration it is
+/// sent.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+pub struct MarkerTrackingConfig {
+    /// The codes do not move (XrSpatialMarkerStaticOptimizationEXT).
+    pub static_markers: bool,
+    /// Every code has this edge length in metres (XrSpatialMarkerSizeEXT).
+    pub marker_size: Option<f32>,
+}
+
+impl MarkerTrackingConfig {
+    /// The configuration the headset always tracks with, for marker recentering.
+    pub const BASE: Self = Self {
+        static_markers: true,
+        marker_size: None,
+    };
+
+    /// Without the options the headset does not support, which it would ignore.
+    pub fn supported_by(self, capabilities: &MarkerCapabilities) -> Self {
+        Self {
+            static_markers: self.static_markers && capabilities.static_markers,
+            marker_size: self.marker_size.filter(|_| capabilities.fixed_size_markers),
+        }
+    }
+}
+
+/// What the headset can do with markers.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+pub struct MarkerCapabilities {
+    pub qr_codes: bool,
+    /// Honours [`MarkerTrackingConfig::marker_size`].
+    pub fixed_size_markers: bool,
+    /// Honours [`MarkerTrackingConfig::static_markers`].
+    pub static_markers: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -248,7 +288,14 @@ pub enum ClientControlPacket {
     /// changing `StreamReady` itself would reinterpret every old client's packet. Old clients keep
     /// sending `StreamReady` and old servers never see this variant.
     StreamReadyOnPort(u16),
-    Markers(Vec<MarkerData>), // All markers currently seen, replacing the previous list
+    /// The markers a tracker currently sees, replacing its previous list. `timestamp` is the time
+    /// the poses are for, on the clock of the tracking's `poll_timestamp`.
+    Markers {
+        config: MarkerTrackingConfig,
+        timestamp: Duration,
+        markers: Vec<MarkerData>,
+    },
+    MarkerCapabilities(MarkerCapabilities),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

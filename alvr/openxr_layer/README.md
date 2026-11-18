@@ -9,34 +9,49 @@ extensions. So the layer, loaded by the OpenXR loader into each application, imp
 of the runtime:
 
 ```text
-headset ── QR codes (ClientControlPacket::Markers) ──▶ ALVR driver in vrserver.exe
-                                                            │ named pipe (alvr_marker_ipc)
+headset ── QR codes + time, per tracker ─────▶ ALVR driver in vrserver.exe
+        ◀─ trackers to run (marker options) ──     │ ▲
+                                    markers + time │ │ marker options of the
+                     (named pipe, alvr_marker_ipc) ▼ │ application's contexts
 app ─▶ OpenXR loader ─▶ this layer ─▶ SteamVR OpenXR runtime
 ```
 
-- **The driver owns the markers.** It recenters them like the headset pose and serves them on the
-  named pipe `\\.\pipe\ALVR_Markers` (see `alvr/marker_ipc`): each connected layer gets the
-  complete current state when it connects and whenever it changes. Poses are in the space the
-  driver submits the headset pose in, which SteamVR's OpenXR runtime calls `STAGE` (the driver keeps
-  the standing zero pose at identity).
-- **The layer is thin.** It reads whatever has arrived when the application asks for markers, without
-  waiting, and maps the latest state onto the extensions, locating its own `STAGE` space in the
-  application's base space. A broken pipe means the driver is gone.
+- **The headset tracks every frame.** It finds codes with a discovery every 500 ms and follows them
+  with an update snapshot every frame, at the frame's display time. It runs one tracker per marker
+  configuration (static or not, known size or not) that applications ask for, as far as it
+  supports the options, plus one for marker recentering.
+- **The driver owns the markers.** It recenters them like the headset pose, converts their time to
+  the PC's performance counter the way the headset pose's time is, and serves them on the named
+  pipe `\\.\pipe\ALVR_Markers` (see `alvr/marker_ipc`): each connected layer gets the complete
+  current state when it connects and whenever it changes. Poses are in the space the driver submits
+  the headset pose in, which SteamVR's OpenXR runtime calls `STAGE` (the driver keeps the standing
+  zero pose at identity). It collects the marker options of all layers and has the headset run them.
+- **The layer answers for any time.** It reads whatever has arrived when the application asks for
+  markers, without waiting, keeps a second of poses, and maps them onto the extensions: it converts
+  the requested time with `XR_KHR_win32_convert_performance_counter_time` (enabling it on the
+  runtime), and locates its own `STAGE` space in the application's base space at that time. A
+  broken pipe means the driver is gone.
 
 ## What is implemented
 
 | | |
 |---|---|
-| Capabilities | `XR_SPATIAL_CAPABILITY_MARKER_TRACKING_QR_CODE_EXT`, while the ALVR driver runs |
+| Capabilities | `XR_SPATIAL_CAPABILITY_MARKER_TRACKING_QR_CODE_EXT`, when the headset connected last tracks QR codes |
 | Components | `MARKER` (QR text as a string buffer), `BOUNDED_2D` (centre pose and size) |
-| Features | fixed size markers (`XrSpatialMarkerSizeEXT` overrides the detected size), static markers |
+| Features | fixed size markers, static markers; both always honoured, see below |
 | Snapshots | discovery and update snapshots, `XrSpatialFilterTrackingStateEXT` |
+| Poses | at the requested time: interpolated between the headset's poses, predicted up to 100 ms past the latest |
 | Entities | ids derived from the QR text, so stable across snapshots, contexts and SteamVR restarts |
-| Tracking states | `TRACKING` while the headset sees the code, `PAUSED` otherwise or while disconnected |
+| Tracking states | `TRACKING` while the headset sees the code; `PAUSED` otherwise, while disconnected, or when nothing came for 500 ms |
 | Events | `XrEventDataSpatialDiscoveryRecommendedEXT` when a context is created and when the set of codes changes |
 | `XR_EXT_future` | provided when the runtime lacks it; futures of the layer are ready immediately |
 
 ArUco, AprilTag and Micro QR are reported as unsupported: the headset only reports QR codes.
+
+**Marker options.** A context's `XrSpatialMarkerSizeEXT` and `XrSpatialMarkerStaticOptimizationEXT`
+go to the headset, which uses them for more precise poses when it supports them. The layer honours
+them either way, as the extension requires: a context with a size gets every code at that size, and
+a context for static codes gets their poses averaged over the last second instead of predicted.
 
 **Coexistence.** The layer first creates the instance with the extensions the application asked
 for. If the runtime accepts them, it implements them itself and the layer steps aside. An
@@ -74,8 +89,10 @@ Setting `DISABLE_XR_APILAYER_ALVR_MARKER_TRACKING` (any value) turns the layer o
 
 - Windows only; the pipe has no Linux implementation yet.
 - 64-bit applications only.
-- Applications cannot ask for marker types or dictionaries: there is no channel from the layer back
-  to the headset yet, and the headset only detects QR codes.
-- Marker timestamps are not carried: poses are the latest known, which suits static markers.
-- No `xrEnumerateSpatialCapabilities` result until the driver has started, so an application that
-  starts SteamVR itself may need to query again once the driver is up.
+- QR codes only: the headset detects no other marker type.
+- A runtime without `XR_KHR_win32_convert_performance_counter_time` gets the latest poses, whatever
+  the requested time. SteamVR has it.
+- No `xrEnumerateSpatialCapabilities` result until a headset has connected, so an application that
+  starts SteamVR itself may need to query again once the headset is up.
+- Reference space changes (`XrEventDataReferenceSpaceChangePending`) are not reported when ALVR
+  recenters.

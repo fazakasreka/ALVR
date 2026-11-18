@@ -1,8 +1,9 @@
-//! A message mode named pipe, one way from the server to its clients.
+//! A message mode named pipe between a server and its clients.
 //!
-//! The server keeps the latest message. Each connected client has a thread of its own which writes
-//! the latest message whenever it changes, so a client that stops reading only holds up its own
-//! thread, and a client that falls behind skips straight to the latest message. The server's
+//! The server keeps the latest message. Each connected client has a writer thread of its own,
+//! which writes the latest message whenever it changes, so a client that stops reading only holds
+//! up its own thread, and a client that falls behind skips straight to the latest message. A
+//! reader thread per client hands what the client sends to the server's callback. The server's
 //! waits are overlapped and end when it stops.
 //!
 //! Only the user running the server can open the pipe, from any process of theirs including
@@ -10,14 +11,17 @@
 
 use std::{
     io, mem, ptr,
-    sync::{Arc, Condvar, Mutex, MutexGuard},
+    sync::{
+        Arc, Condvar, LazyLock, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
     thread::{self, JoinHandle},
     time::Duration,
 };
 use windows_sys::Win32::{
     Foundation::{
         CloseHandle, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY,
-        ERROR_PIPE_CONNECTED, ERROR_SUCCESS, GENERIC_READ, GetLastError, HANDLE,
+        ERROR_PIPE_CONNECTED, ERROR_SUCCESS, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
         INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0,
     },
     Security::{
@@ -29,12 +33,12 @@ use windows_sys::Win32::{
         SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
     },
     Storage::FileSystem::{
-        CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_WRITE_ATTRIBUTES,
-        OPEN_EXISTING, PIPE_ACCESS_OUTBOUND, ReadFile, SECURITY_IDENTIFICATION,
-        SECURITY_SQOS_PRESENT, WriteFile,
+        CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
+        PIPE_ACCESS_DUPLEX, ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WriteFile,
     },
     System::{
         IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
+        Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
         Pipes::{
             ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_MESSAGE,
             PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
@@ -55,11 +59,33 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// on the application's frame loop, so they do not wait longer.
 const BUSY_PIPE_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// What a client asks for: reading, and setting its handle to message read mode.
-const CLIENT_ACCESS: u32 = GENERIC_READ | FILE_WRITE_ATTRIBUTES;
-/// FILE_GENERIC_READ | FILE_WRITE_ATTRIBUTES, granted to AppContainers on top of their user's
-/// access, as packaged OpenXR applications load the layer too.
-const APP_CONTAINER_ACCESS: &str = "0x120189";
+/// What a client asks for: reading, writing, and setting its handle to message read mode.
+const CLIENT_ACCESS: u32 = GENERIC_READ | GENERIC_WRITE;
+/// FILE_GENERIC_READ | FILE_GENERIC_WRITE, granted to AppContainers on top of their user's access,
+/// as packaged OpenXR applications load the layer too.
+const APP_CONTAINER_ACCESS: &str = "0x12019f";
+
+static PERFORMANCE_FREQUENCY: LazyLock<i64> = LazyLock::new(|| {
+    let mut frequency = 0;
+    unsafe { QueryPerformanceFrequency(&mut frequency) };
+    frequency.max(1)
+});
+
+/// Nanoseconds on the performance counter clock, which is what
+/// XR_KHR_win32_convert_performance_counter_time converts OpenXR times to.
+pub fn now_ns() -> i64 {
+    let mut counter = 0;
+    unsafe { QueryPerformanceCounter(&mut counter) };
+    performance_counter_to_ns(counter)
+}
+
+pub fn performance_counter_to_ns(counter: i64) -> i64 {
+    (counter as i128 * 1_000_000_000 / *PERFORMANCE_FREQUENCY as i128) as i64
+}
+
+pub fn ns_to_performance_counter(ns: i64) -> i64 {
+    (ns as i128 * *PERFORMANCE_FREQUENCY as i128 / 1_000_000_000) as i64
+}
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain([0]).collect()
@@ -238,7 +264,7 @@ impl UserSecurity {
         // The owner is set explicitly, as an elevated process would make the administrators
         // group the owner, which clients would not trust. An AppContainer is only granted what
         // both its user and the AppContainer entry allow, and runs at low integrity, so the low
-        // label lets it set its message read mode
+        // label lets it write, and set its message read mode
         let sddl =
             format!("O:{user}D:P(A;;GA;;;{user})(A;;{APP_CONTAINER_ACCESS};;;AC)S:(ML;;NW;;;LW)");
 
@@ -294,12 +320,18 @@ fn is_owned_by_current_user(handle: HANDLE) -> io::Result<bool> {
     result
 }
 
+/// Gets each message a client sends, and `None` when it disconnects.
+pub type MessageCallback = Box<dyn Fn(u64, Option<&[u8]>) + Send + Sync>;
+
 struct Shared {
     /// The latest message, and a version that increases with each one.
     latest: Mutex<(u64, Arc<Vec<u8>>)>,
     changed: Condvar,
     stop: ManualResetEvent,
-    writers: Mutex<Vec<JoinHandle<()>>>,
+    on_message: MessageCallback,
+    next_client: AtomicU64,
+    /// The writers and readers of the clients.
+    threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
 pub struct Server {
@@ -308,7 +340,7 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn start(name: &str, message: Vec<u8>) -> io::Result<Self> {
+    pub fn start(name: &str, message: Vec<u8>, on_message: MessageCallback) -> io::Result<Self> {
         let path = pipe_path(name);
         let security = UserSecurity::new()?;
 
@@ -319,7 +351,9 @@ impl Server {
             latest: Mutex::new((1, Arc::new(message))),
             changed: Condvar::new(),
             stop: ManualResetEvent::new()?,
-            writers: Mutex::new(Vec::new()),
+            on_message,
+            next_client: AtomicU64::new(0),
+            threads: Mutex::new(Vec::new()),
         });
 
         let listener = thread::spawn({
@@ -354,8 +388,8 @@ impl Drop for Server {
         if let Some(listener) = self.listener.take() {
             listener.join().ok();
         }
-        for writer in mem::take(&mut *lock(&self.shared.writers)) {
-            writer.join().ok();
+        for thread in mem::take(&mut *lock(&self.shared.threads)) {
+            thread.join().ok();
         }
     }
 }
@@ -375,7 +409,7 @@ fn create_instance(
     let handle = unsafe {
         CreateNamedPipeW(
             path.as_ptr(),
-            PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED | first_flag,
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | first_flag,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             PIPE_UNLIMITED_INSTANCES,
             PIPE_BUFFER_SIZE,
@@ -391,7 +425,7 @@ fn create_instance(
     Ok(OwnedHandle(handle))
 }
 
-/// Waits for clients, one pipe instance at a time, and starts a writer for each.
+/// Waits for clients, one pipe instance at a time, and starts a writer and a reader for each.
 fn accept_clients(
     shared: &Arc<Shared>,
     path: &[u16],
@@ -404,7 +438,7 @@ fn accept_clients(
     let mut waiting_instance = Some(first_instance);
 
     while !shared.stop.is_set() {
-        // Create the instance for the next client: the previous one went to its writer, or was
+        // Create the instance for the next client: the previous one went to its threads, or was
         // dropped after a failure
         let instance = match waiting_instance.take() {
             Some(instance) => instance,
@@ -427,21 +461,28 @@ fn accept_clients(
         // A client which connected before ConnectNamedPipe was called is reported as
         // ERROR_PIPE_CONNECTED
         if error == ERROR_SUCCESS || error == ERROR_PIPE_CONNECTED {
+            let pipe = Arc::new(instance);
+            let client = shared.next_client.fetch_add(1, Ordering::Relaxed);
             let writer = thread::spawn({
                 let shared = Arc::clone(shared);
-                move || send_messages(&shared, instance)
+                let pipe = Arc::clone(&pipe);
+                move || send_messages(&shared, &pipe)
+            });
+            let reader = thread::spawn({
+                let shared = Arc::clone(shared);
+                move || receive_messages(&shared, &pipe, client)
             });
 
-            let mut writers = lock(&shared.writers);
-            writers.retain(|writer| !writer.is_finished());
-            writers.push(writer);
+            let mut threads = lock(&shared.threads);
+            threads.retain(|thread| !thread.is_finished());
+            threads.extend([writer, reader]);
         }
     }
 }
 
 /// Sends the client the latest message, and then each new one, until it disconnects or the
 /// server stops.
-fn send_messages(shared: &Shared, pipe: OwnedHandle) {
+fn send_messages(shared: &Shared, pipe: &OwnedHandle) {
     let Ok(mut operation) = OverlappedOperation::new() else {
         return;
     };
@@ -479,6 +520,47 @@ fn send_messages(shared: &Shared, pipe: OwnedHandle) {
         }
     }
 
+    // Also ends the reader's wait
+    unsafe { DisconnectNamedPipe(pipe.0) };
+}
+
+/// Hands each message the client sends to the callback, until it disconnects or the server
+/// stops.
+fn receive_messages(shared: &Shared, pipe: &OwnedHandle, client: u64) {
+    let Ok(mut operation) = OverlappedOperation::new() else {
+        return;
+    };
+    let mut buffer = vec![0u8; PIPE_BUFFER_SIZE as usize];
+    let mut message = Vec::new();
+
+    loop {
+        let has_started = unsafe {
+            ReadFile(
+                pipe.0,
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                ptr::null_mut(),
+                operation.start(),
+            )
+        } != 0;
+        let (error, read) = operation.wait(pipe.0, has_started, &shared.stop);
+        if error != ERROR_SUCCESS && error != ERROR_MORE_DATA {
+            break;
+        }
+
+        // A message larger than the buffer arrives in parts, all but the last one with
+        // ERROR_MORE_DATA
+        message.extend_from_slice(&buffer[..read as usize]);
+        if error == ERROR_MORE_DATA {
+            continue;
+        }
+
+        (shared.on_message)(client, Some(&message));
+        message.clear();
+    }
+
+    (shared.on_message)(client, None);
+    // Also ends the writer's wait at its next message
     unsafe { DisconnectNamedPipe(pipe.0) };
 }
 
@@ -512,6 +594,20 @@ impl Connection {
         check(unsafe { SetNamedPipeHandleState(pipe.0, &mode, ptr::null(), ptr::null()) })?;
 
         Ok(Self(pipe))
+    }
+
+    /// Sends one message. Returns once the server has room for it, which it normally has.
+    pub fn write(&mut self, message: &[u8]) -> io::Result<()> {
+        let mut written = 0;
+        check(unsafe {
+            WriteFile(
+                self.0.0,
+                message.as_ptr(),
+                message.len() as u32,
+                &mut written,
+                ptr::null_mut(),
+            )
+        })
     }
 
     /// The messages that have arrived, without waiting for more. A message longer than

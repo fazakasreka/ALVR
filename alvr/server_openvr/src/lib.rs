@@ -325,6 +325,7 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                     if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
                         let target_timestamp =
                             poll_timestamp + context.get_motion_to_photon_latency();
+                        openxr_markers::report_head_pose_time(target_timestamp);
                         let controllers_pose_time_offset = context.get_tracker_pose_time_offset();
                         // We need to remove the additional offset that SteamVR adds
                         let target_controller_timestamp =
@@ -549,7 +550,10 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                 ServerCoreEvent::ProximityState(headset_is_worn) => unsafe {
                     SetProximityState(headset_is_worn)
                 },
-                ServerCoreEvent::Markers(markers) => openxr_markers::set_markers(markers),
+                ServerCoreEvent::Markers(streams) => openxr_markers::set_markers(streams),
+                ServerCoreEvent::MarkerCapabilities(capabilities) => {
+                    openxr_markers::set_capabilities(capabilities)
+                }
             }
         }
 
@@ -870,6 +874,11 @@ pub extern "C" fn initialize_runtime() {
         openxr_markers::start(
             &filesystem_layout,
             alvr_server_core::settings().headset.openxr_marker_tracking,
+            |configs| {
+                if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
+                    context.set_requested_marker_configs(configs);
+                }
+            },
         );
 
         unsafe {
@@ -894,6 +903,7 @@ pub extern "C" fn initialize_runtime() {
 
         let (context, events_receiver) = ServerCoreContext::new();
 
+        context.set_requested_marker_configs(openxr_markers::requested_configs());
         *SERVER_CORE_CONTEXT.write() = Some(context);
 
         spawn_event_loop(events_receiver);

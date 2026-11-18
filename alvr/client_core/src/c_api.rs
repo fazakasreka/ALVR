@@ -18,7 +18,8 @@ use alvr_graphics::{
     StreamViewParams,
 };
 use alvr_packets::{
-    ButtonEntry, ButtonValue, FaceData, FaceExpressions, MarkerData, TrackingData, VideoStreamKind,
+    ButtonEntry, ButtonValue, FaceData, FaceExpressions, MarkerCapabilities, MarkerData,
+    MarkerTrackingConfig, TrackingData, VideoStreamKind,
 };
 use alvr_session::{
     CodecType, FoveatedEncodingConfig, MediacodecPropType, MediacodecProperty, UpscalingConfig,
@@ -281,9 +282,11 @@ pub extern "C" fn alvr_pause() {
 /// Returns true if there was a new event
 #[unsafe(no_mangle)]
 pub extern "C" fn alvr_poll_event(out_event: *mut AlvrEvent) -> bool {
-    if let Some(context) = &*CLIENT_CORE_CONTEXT.lock()
-        && let Some(event) = context.poll_event()
-    {
+    let Some(context) = &*CLIENT_CORE_CONTEXT.lock() else {
+        return false;
+    };
+
+    while let Some(event) = context.poll_event() {
         let event = match event {
             ClientCoreEvent::UpdateHudMessage(message) => {
                 *HUD_MESSAGE.lock() = message;
@@ -347,14 +350,16 @@ pub extern "C" fn alvr_poll_event(out_event: *mut AlvrEvent) -> bool {
                 }
             }
             ClientCoreEvent::RealTimeConfig(_) => AlvrEvent::RealTimeConfig {},
+            // Clients of this API run a single QR code tracker, see alvr_set_qr_code_tracking
+            ClientCoreEvent::MarkerTrackingConfigs(_) => continue,
         };
 
         unsafe { *out_event = event };
 
-        true
-    } else {
-        false
+        return true;
     }
+
+    false
 }
 
 // Returns the length of the message. message_buffer can be null.
@@ -429,9 +434,29 @@ pub extern "C" fn alvr_send_playspace(width: f32, height: f32) {
     }
 }
 
-/// All markers currently seen, in the same space as the tracking, replacing the previous list.
+/// Whether the headset can track QR codes. Call once, before or after connecting: it is sent on
+/// every connection. The codes go to alvr_send_markers.
 #[unsafe(no_mangle)]
-pub extern "C" fn alvr_send_markers(markers: *const AlvrMarker, markers_count: u64) {
+pub extern "C" fn alvr_set_qr_code_tracking(supported: bool) {
+    if let Some(context) = &*CLIENT_CORE_CONTEXT.lock() {
+        // Neither the static nor the fixed size option, so the server asks for one tracker only
+        context.set_marker_capabilities(MarkerCapabilities {
+            qr_codes: supported,
+            fixed_size_markers: false,
+            static_markers: false,
+        });
+    }
+}
+
+/// All QR codes currently seen, in the same space as the tracking, replacing the previous list.
+/// `timestamp_ns` is the time the poses are for, on the clock of alvr_send_tracking's
+/// `poll_timestamp_ns`. Send them as often as the tracking for moving codes to follow.
+#[unsafe(no_mangle)]
+pub extern "C" fn alvr_send_markers(
+    timestamp_ns: u64,
+    markers: *const AlvrMarker,
+    markers_count: u64,
+) {
     let markers = if !markers.is_null() {
         unsafe { slice::from_raw_parts(markers, markers_count as usize) }
     } else {
@@ -450,7 +475,11 @@ pub extern "C" fn alvr_send_markers(markers: *const AlvrMarker, markers_count: u
         .collect();
 
     if let Some(context) = &*CLIENT_CORE_CONTEXT.lock() {
-        context.send_markers(markers);
+        context.send_markers(
+            MarkerTrackingConfig::default(),
+            Duration::from_nanos(timestamp_ns),
+            markers,
+        );
     }
 }
 

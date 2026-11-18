@@ -611,7 +611,25 @@ code lying face up on the centre of the rug:
 
 `rotation_degrees` is yaw, pitch and roll; all zero is an upright code facing +Z. `size` excludes
 the quiet zone. The drawn pattern looks like a QR code but does not decode. All codes are reported
-once a second while streaming, as if always in view.
+every frame while streaming, as if always in view, to every tracker the server asks for (an
+application's known marker size replaces `size` there, as a runtime must). The emulated headset
+supports both marker options, fixed size and static.
+
+To test applications that follow moving codes, give one a `motion`: it then circles its position
+horizontally, turning with it, like a code on a dog running around. The room keeps showing it at
+its position.
+
+```json
+{
+  "id": "DOG",
+  "position": [0.0, 0.4, -1.0],
+  "rotation_degrees": [0.0, -90.0, 0.0],
+  "size": 0.1,
+  "motion": { "radius": 0.5, "period_seconds": 4.0 }
+}
+```
+
+A negative `period_seconds` circles clockwise seen from above.
 
 
 ## HTTP API
@@ -991,7 +1009,9 @@ are bincode encoded by variant index: appending leaves existing indices untouche
 `StreamReady` itself would reinterpret every old client's packet. Old clients keep sending
 `StreamReady` and are handled exactly as before.
 
-**Markers** — `packets`, `client_core`, `server_core`, `server_openvr`. A new
-`ClientControlPacket::Markers`, appended last like `StreamReadyOnPort`. The server recenters the
-markers like any other pose and the driver shows them as fake Vive trackers; see
-[Markers](#markers).
+**Markers** — `packets`, `client_core`, `server_core`, `server_openvr`. New packets, appended
+last like `StreamReadyOnPort`: the headset reports what it can do
+(`ClientControlPacket::MarkerCapabilities`), the server says which trackers to run
+(`ServerControlPacket::MarkerTrackingConfigs`), and the headset reports what each tracker sees,
+with the time the poses are for (`ClientControlPacket::Markers`). The server recenters the markers
+like any other pose and the driver hands them to OpenXR applications; see [Markers](#markers).

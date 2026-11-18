@@ -1,4 +1,7 @@
 //! QR codes in the room, from `markers.json`. The emulated headset reports all of them as seen.
+//!
+//! A code with a `motion` circles its position, like one on a dog running around, to test
+//! applications that follow moving markers. The room shows it at its centre.
 
 use crate::scene::{Primitive, Scene, Texture, Vertex};
 use alvr_common::{
@@ -9,7 +12,7 @@ use alvr_common::{
 };
 use alvr_packets::MarkerData;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::{f32::consts::TAU, path::Path, time::Duration};
 
 pub const SETTINGS_FILE_NAME: &str = "markers.json";
 
@@ -28,9 +31,20 @@ pub struct MarkerSettings {
     pub rotation_degrees: [f32; 3],
     /// Edge length without the quiet zone, in metres.
     pub size: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motion: Option<MarkerMotion>,
+}
+
+/// A horizontal circle around the code's position, turning the code along with it.
+#[derive(Serialize, Deserialize, Clone, Copy)]
+pub struct MarkerMotion {
+    pub radius: f32,
+    /// For one turn. Negative turns clockwise seen from above.
+    pub period_seconds: f32,
 }
 
 impl MarkerSettings {
+    /// Where the code is at rest, and where the room shows it.
     pub fn pose(&self) -> Pose {
         let [yaw, pitch, roll] = self.rotation_degrees.map(f32::to_radians);
 
@@ -40,10 +54,25 @@ impl MarkerSettings {
         }
     }
 
-    pub fn data(&self) -> MarkerData {
+    /// Where the code is `time` after the tracking clock started.
+    pub fn pose_at(&self, time: Duration) -> Pose {
+        let pose = self.pose();
+        let Some(motion) = self.motion.filter(|motion| motion.period_seconds != 0.0) else {
+            return pose;
+        };
+
+        let angle = TAU * time.as_secs_f32() / motion.period_seconds;
+        let turn = Quat::from_rotation_y(angle);
+        Pose {
+            orientation: turn * pose.orientation,
+            position: pose.position + turn * Vec3::new(motion.radius, 0.0, 0.0),
+        }
+    }
+
+    pub fn data_at(&self, time: Duration) -> MarkerData {
         MarkerData {
             id: self.id.clone(),
-            pose: self.pose(),
+            pose: self.pose_at(time),
             size: self.size,
         }
     }
@@ -66,6 +95,7 @@ pub fn load_or_create(directory: &Path) -> Vec<MarkerSettings> {
                 position: [0.0, 0.003, 0.0],
                 rotation_degrees: [0.0, -90.0, 0.0],
                 size: 0.5,
+                motion: None,
             }],
         };
 

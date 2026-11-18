@@ -1,12 +1,20 @@
 //! XR_EXT_spatial_entity with the QR code capability of XR_EXT_spatial_marker_tracking, and the
 //! parts of XR_EXT_future they use.
 //!
-//! Every QR code the driver publishes is an entity with the marker and 2D bounds components. Its
+//! Every QR code the headset sees is an entity with the marker and 2D bounds components. Its
 //! entity id comes from its text, so it stays the same across snapshots, contexts and sessions.
 //! Asynchronous operations complete immediately: their futures are ready as soon as they exist.
+//!
+//! Each spatial context gets its codes from the headset tracker with its marker options, as far as
+//! the headset supports them. Both options are honoured either way: a context for static markers
+//! gets their poses averaged, and one with a marker size gets that size.
 
-use crate::{Downstream, State, log, math, state, void_fn};
-use alvr_marker_ipc::Snapshot as Markers;
+use crate::{
+    Downstream, State,
+    history::{At, Located},
+    log, math, state, void_fn,
+};
+use alvr_marker_ipc::{TrackingConfig, now_ns, performance_counter_to_ns};
 use openxr_sys::{self as xr, Handle, pfn};
 use std::{
     collections::HashSet,
@@ -33,8 +41,8 @@ pub(crate) struct SessionData {
 pub(crate) struct ContextData {
     session: u64,
     components: Vec<xr::SpatialComponentTypeEXT>,
-    /// From XrSpatialMarkerSizeEXT: the application knows the size of its markers.
-    marker_size: Option<f32>,
+    /// The marker options the application asked for.
+    config: TrackingConfig,
     /// Entities seen in this context's discovery snapshots, which may be created from their ids.
     discovered: HashSet<u64>,
     /// The marker ids the last discovery recommendation was sent for.
@@ -200,9 +208,72 @@ impl State {
         self.instances.get(&instance).map(|data| data.downstream)
     }
 
-    /// Whether the driver is running, so that QR codes can be offered.
+    /// Whether the headset tracks QR codes, as far as the driver knows.
     fn qr_codes_available(&mut self) -> bool {
-        self.markers.read().is_some()
+        self.markers
+            .refresh()
+            .is_some_and(|capabilities| capabilities.qr_codes)
+    }
+
+    /// Tells the driver the marker options of the application's spatial contexts, also the ones
+    /// being created.
+    pub(crate) fn sync_requests(&mut self) {
+        let configs = self
+            .contexts
+            .values()
+            .map(|context| context.config)
+            .chain(
+                self.futures
+                    .values()
+                    .filter_map(|future| match &future.kind {
+                        FutureKind::Context { context, .. } => Some(context.config),
+                        FutureKind::Discovery { .. } => None,
+                    }),
+            )
+            .collect::<Vec<_>>();
+        self.markers.client.set_requests(&configs);
+        self.markers.refresh();
+    }
+
+    /// The codes the context's tracker sees: their ids and texts, and where they are at `time`.
+    fn context_markers(
+        &mut self,
+        context: u64,
+        time: xr::Time,
+    ) -> Vec<(u64, String, Option<Located>)> {
+        let Some(capabilities) = self.markers.refresh() else {
+            return Vec::new();
+        };
+        let context = &self.contexts[&context];
+        let instance = self.sessions[&context.session].instance;
+        // The tracker the headset runs for these options
+        let tracker = context.config.supported_by(&capabilities);
+
+        let at = if context.config.static_markers {
+            At::Static
+        } else {
+            self.performance_counter_time(instance, time)
+                .map_or(At::Latest, At::Time)
+        };
+        let now = now_ns();
+        let history = &self.markers.history;
+        history
+            .seen(tracker, now)
+            .into_iter()
+            .map(|(id, text)| {
+                let located = history.locate(tracker, id, at, now);
+                (id, text, located)
+            })
+            .collect()
+    }
+
+    /// `time` on the clock of the marker times.
+    fn performance_counter_time(&self, instance: u64, time: xr::Time) -> Option<i64> {
+        let convert = self.instances.get(&instance)?.downstream.convert_time?;
+        let mut counter = 0;
+        let result = unsafe { convert(xr::Instance::from_raw(instance), time, &mut counter) };
+
+        (result == xr::Result::SUCCESS).then(|| performance_counter_to_ns(counter))
     }
 
     fn check_instance(&self, instance: xr::Instance, system: xr::SystemId) -> xr::Result {
@@ -314,20 +385,22 @@ impl State {
 
     fn snapshot_entity(
         context: &ContextData,
-        marker: &alvr_marker_ipc::Marker,
+        id: u64,
+        text: String,
+        located: Option<Located>,
         stage: Option<xr::Posef>,
     ) -> SnapshotEntity {
-        let Some(stage) = stage else {
+        let (Some(located), Some(stage)) = (located, stage) else {
             return SnapshotEntity {
-                id: marker.id,
+                id,
                 state: xr::SpatialEntityTrackingStateEXT::PAUSED,
                 bounds: xr::SpatialBounded2DDataEXT::default(),
-                text: marker.text.clone(),
+                text,
             };
         };
 
-        let [x, y, z, w] = marker.pose.orientation;
-        let [px, py, pz] = marker.pose.position;
+        let [x, y, z, w] = located.pose.orientation;
+        let [px, py, pz] = located.pose.position;
         let pose = xr::Posef {
             orientation: xr::Quaternionf { x, y, z, w },
             position: xr::Vector3f {
@@ -336,10 +409,11 @@ impl State {
                 z: pz,
             },
         };
-        let size = context.marker_size.unwrap_or(marker.size);
+        // As the extension requires: every code has the size the application gave
+        let size = context.config.marker_size.unwrap_or(located.size);
 
         SnapshotEntity {
-            id: marker.id,
+            id,
             state: xr::SpatialEntityTrackingStateEXT::TRACKING,
             bounds: xr::SpatialBounded2DDataEXT {
                 center: math::compose(stage, pose),
@@ -348,30 +422,42 @@ impl State {
                     height: size,
                 },
             },
-            text: marker.text.clone(),
+            text,
         }
     }
 
-    /// A context of `instance` to recommend a discovery for, when the markers have changed since
-    /// its last recommendation.
+    /// A context of `instance` to recommend a discovery for, when the codes its tracker sees have
+    /// changed since its last recommendation.
     fn take_discovery_recommendation(&mut self, instance: u64) -> Option<u64> {
-        let mut ids: Vec<u64> = self
-            .markers
-            .read()
-            .map(|markers: Markers| markers.markers.iter().map(|marker| marker.id).collect())
-            .unwrap_or_default();
-        ids.sort_unstable();
+        let capabilities = self.markers.refresh().unwrap_or_default();
+        let now = now_ns();
 
-        let sessions = &self.sessions;
-        let (&handle, context) = self.contexts.iter_mut().find(|(_, context)| {
-            sessions
+        for (&handle, context) in &mut self.contexts {
+            if self
+                .sessions
                 .get(&context.session)
-                .is_some_and(|session| session.instance == instance)
-                && context.announced.as_ref() != Some(&ids)
-        })?;
-        context.announced = Some(ids);
+                .is_none_or(|session| session.instance != instance)
+            {
+                continue;
+            }
 
-        Some(handle)
+            let tracker = context.config.supported_by(&capabilities);
+            let mut ids = self
+                .markers
+                .history
+                .seen(tracker, now)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+
+            if context.announced.as_ref() != Some(&ids) {
+                context.announced = Some(ids);
+                return Some(handle);
+            }
+        }
+
+        None
     }
 }
 
@@ -404,6 +490,7 @@ unsafe extern "system" fn destroy_session(session: xr::Session) -> xr::Result {
         let Some(data) = state.remove_session(session.into_raw()) else {
             return xr::Result::ERROR_HANDLE_INVALID;
         };
+        state.sync_requests();
         let Some(downstream) = state.downstream(data.instance) else {
             return xr::Result::ERROR_HANDLE_INVALID;
         };
@@ -495,6 +582,7 @@ unsafe extern "system" fn cancel_future(
         .is_some_and(|data| data.instance == instance.into_raw())
     {
         state.futures.remove(&future);
+        state.sync_requests();
         return xr::Result::SUCCESS;
     }
 
@@ -600,7 +688,7 @@ unsafe fn context_config(
     let mut context = ContextData {
         session,
         components: Vec::new(),
-        marker_size: None,
+        config: TrackingConfig::default(),
         discovered: HashSet::new(),
         announced: None,
     };
@@ -638,10 +726,13 @@ unsafe fn context_config(
                 if size.is_nan() || size <= 0.0 {
                     return Err(xr::Result::ERROR_VALIDATION_FAILURE);
                 }
-                context.marker_size = Some(size);
+                context.config.marker_size = Some(size);
+            } else if ty == xr::SpatialMarkerStaticOptimizationEXT::TYPE {
+                context.config.static_markers = unsafe {
+                    (*structure.cast::<xr::SpatialMarkerStaticOptimizationEXT>())
+                        .optimize_for_static_marker
+                } == xr::TRUE;
             }
-            // XrSpatialMarkerStaticOptimizationEXT needs nothing: the headset already treats
-            // every QR code as static
         }
     }
 
@@ -688,6 +779,8 @@ unsafe extern "system" fn create_context_async(
         },
     );
     unsafe { *future = xr::FutureEXT::from_raw(handle) };
+    // The headset starts the tracker while the application waits for the context
+    state.sync_requests();
 
     xr::Result::SUCCESS
 }
@@ -725,7 +818,10 @@ unsafe extern "system" fn create_context_complete(
     };
 
     let handle = state.new_handle();
-    log!("Created spatial context {handle:#x} for QR codes");
+    log!(
+        "Created spatial context {handle:#x} for QR codes, {:?}",
+        context.config
+    );
     state.contexts.insert(handle, context);
 
     unsafe {
@@ -737,7 +833,9 @@ unsafe extern "system" fn create_context_complete(
 }
 
 unsafe extern "system" fn destroy_context(context: xr::SpatialContextEXT) -> xr::Result {
-    if state().remove_context(context.into_raw()) {
+    let mut state = state();
+    if state.remove_context(context.into_raw()) {
+        state.sync_requests();
         xr::Result::SUCCESS
     } else {
         xr::Result::ERROR_HANDLE_INVALID
@@ -836,17 +934,13 @@ unsafe extern "system" fn create_discovery_snapshot_complete(
     };
     state.futures.remove(&info.future.into_raw());
 
-    let markers = state
-        .markers
-        .read()
-        .map(|markers| markers.markers)
-        .unwrap_or_default();
+    let markers = state.context_markers(context.into_raw(), info.time);
     let context_data = state.contexts.get_mut(&context.into_raw()).unwrap();
     let entities = markers
-        .iter()
-        .map(|marker| {
-            context_data.discovered.insert(marker.id);
-            State::snapshot_entity(context_data, marker, stage)
+        .into_iter()
+        .map(|(id, text, located)| {
+            context_data.discovered.insert(id);
+            State::snapshot_entity(context_data, id, text, located, stage)
         })
         .collect();
 
@@ -911,24 +1005,25 @@ unsafe extern "system" fn create_update_snapshot(
         Err(result) => return result,
     };
 
-    let markers = state
-        .markers
-        .read()
-        .map(|markers| markers.markers)
-        .unwrap_or_default();
+    let mut markers = state.context_markers(context.into_raw(), info.time);
     let context_data = &state.contexts[&context.into_raw()];
     let entities = ids
         .iter()
-        .map(|&id| match markers.iter().find(|marker| marker.id == id) {
-            Some(marker) => State::snapshot_entity(context_data, marker, stage),
-            // Out of the headset's sight, or the headset is not connected: it may come back
-            None => SnapshotEntity {
-                id,
-                state: xr::SpatialEntityTrackingStateEXT::PAUSED,
-                bounds: xr::SpatialBounded2DDataEXT::default(),
-                text: String::new(),
+        .map(
+            |&id| match markers.iter().position(|marker| marker.0 == id) {
+                Some(index) => {
+                    let (id, text, located) = markers.swap_remove(index);
+                    State::snapshot_entity(context_data, id, text, located, stage)
+                }
+                // Out of the headset's sight, or the headset is not connected: it may come back
+                None => SnapshotEntity {
+                    id,
+                    state: xr::SpatialEntityTrackingStateEXT::PAUSED,
+                    bounds: xr::SpatialBounded2DDataEXT::default(),
+                    text: String::new(),
+                },
             },
-        })
+        )
         .collect();
 
     let handle = state.new_handle();

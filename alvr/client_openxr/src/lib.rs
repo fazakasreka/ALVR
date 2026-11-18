@@ -386,6 +386,12 @@ pub fn entry_point() {
             .select_sources(&lobby_interaction_sources);
 
         let mut marker_tracker = markers::MarkerTracker::new(&xr_session, xr_system);
+        core_context.set_marker_capabilities(
+            marker_tracker
+                .as_ref()
+                .map(|tracker| tracker.capabilities())
+                .unwrap_or_default(),
+        );
 
         let mut session_running = false;
         let mut stream_context = None::<StreamContext>;
@@ -501,6 +507,16 @@ pub fn entry_point() {
                             .select_sources(&lobby_interaction_sources);
 
                         stream_context = None;
+
+                        // The server says again what to track on the next connection
+                        if let Some(tracker) = &mut marker_tracker {
+                            tracker.set_configs(&[]);
+                        }
+                    }
+                    ClientCoreEvent::MarkerTrackingConfigs(configs) => {
+                        if let Some(tracker) = &mut marker_tracker {
+                            tracker.set_configs(&configs);
+                        }
                     }
                     ClientCoreEvent::Haptics {
                         device_id,
@@ -576,12 +592,13 @@ pub fn entry_point() {
             let vsync_time =
                 Duration::from_nanos(frame_state.predicted_display_time.as_nanos() as _);
 
-            if let Some(markers) = marker_tracker
-                .as_mut()
-                .and_then(|tracker| tracker.update(frame_state.predicted_display_time))
+            if let Some(tracker) = &mut marker_tracker
                 && stream_context.is_some()
             {
-                core_context.send_markers(markers);
+                let time = frame_state.predicted_display_time;
+                for (config, markers) in tracker.update(time) {
+                    core_context.send_markers(config, from_xr_time(time), markers);
+                }
             }
 
             xr_frame_stream.begin().unwrap();

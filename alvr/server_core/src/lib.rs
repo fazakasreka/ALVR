@@ -5,6 +5,7 @@ mod hand_gestures;
 mod haptics;
 mod input_mapping;
 mod logging_backend;
+mod markers;
 mod sockets;
 mod statistics;
 mod tracking;
@@ -27,7 +28,7 @@ use alvr_events::{EventType, HapticsEvent};
 use alvr_filesystem as afs;
 use alvr_packets::{
     BatteryInfo, ButtonEntry, ClientConnectionsAction, DecoderInitializationConfig, Haptics,
-    MarkerData, VideoPacketHeader, VideoStreamKind,
+    MarkerCapabilities, MarkerTrackingConfig, VideoPacketHeader, VideoStreamKind,
 };
 use alvr_server_io::ServerSessionManager;
 use alvr_session::{
@@ -35,6 +36,8 @@ use alvr_session::{
 };
 use alvr_sockets::StreamSender;
 use bitrate::{BitrateManager, DynamicEncoderParams};
+pub use markers::MarkerStream;
+use markers::MarkerTracking;
 use statistics::StatisticsManager;
 use std::{
     collections::HashSet,
@@ -104,7 +107,11 @@ pub enum ServerCoreEvent {
     ShutdownPending,
     RestartPending,
     ProximityState(bool),
-    Markers(Vec<MarkerData>), // Poses already recentered
+    /// Every marker tracker the headset runs, with poses already recentered. Sent whenever one
+    /// of them updates.
+    Markers(Vec<MarkerStream>),
+    /// Of the headset that connected.
+    MarkerCapabilities(MarkerCapabilities),
 }
 
 pub struct ConnectionContext {
@@ -124,6 +131,7 @@ pub struct ConnectionContext {
     video_channel_sender: Mutex<Option<SyncSender<VideoPacket>>>,
     alpha_video_channel_sender: Mutex<Option<SyncSender<VideoPacket>>>,
     haptics_sender: Mutex<Option<StreamSender<Haptics>>>,
+    marker_tracking: Mutex<MarkerTracking>,
 }
 
 pub fn create_recording_file(connection_context: &ConnectionContext, settings: &Settings) {
@@ -262,6 +270,7 @@ impl ServerCoreContext {
             video_channel_sender: Mutex::new(None),
             alpha_video_channel_sender: Mutex::new(None),
             haptics_sender: Mutex::new(None),
+            marker_tracking: Mutex::new(MarkerTracking::default()),
         });
 
         let webserver_runtime = Runtime::new().unwrap();
@@ -342,6 +351,17 @@ impl ServerCoreContext {
         } else {
             latency
         }
+    }
+
+    /// The marker tracker configurations OpenXR applications ask for. The headset runs them,
+    /// without the options it does not support.
+    pub fn set_requested_marker_configs(&self, configs: Vec<MarkerTrackingConfig>) {
+        dbg_server_core!("set_requested_marker_configs");
+
+        self.connection_context
+            .marker_tracking
+            .lock()
+            .set_requested(configs);
     }
 
     pub fn get_tracker_pose_time_offset(&self) -> Duration {

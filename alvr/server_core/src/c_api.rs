@@ -320,7 +320,8 @@ pub unsafe extern "C" fn alvr_poll_event(out_event: *mut AlvrEvent, timeout_ns: 
             },
             ServerCoreEvent::GameRenderLatencyFeedback(_)
             | ServerCoreEvent::SetOpenvrProperty { .. }
-            | ServerCoreEvent::Markers(_) => {} // implementation not needed
+            | ServerCoreEvent::Markers(_)
+            | ServerCoreEvent::MarkerCapabilities(_) => {} // implementation not needed
             ServerCoreEvent::ProximityState(headset_is_worn) => unsafe {
                 *out_event = AlvrEvent::ProximityState(headset_is_worn);
             },

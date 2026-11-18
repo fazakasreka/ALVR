@@ -1,5 +1,5 @@
 use crate::{
-    ConnectionContext, FILESYSTEM_LAYOUT, SESSION_MANAGER, ServerCoreEvent,
+    ConnectionContext, FILESYSTEM_LAYOUT, MarkerStream, SESSION_MANAGER, ServerCoreEvent,
     ServerNegotiatedStreamingConfig,
     bitrate::BitrateManager,
     input_mapping::ButtonMappingManager,
@@ -874,6 +874,9 @@ fn connection_pipeline(
         TrackingManager::new(initial_settings.connection.statistics_history_size);
 
     let control_sender = Arc::new(Mutex::new(socket.request_reliable_stream()?));
+    ctx.marker_tracking
+        .lock()
+        .connect(Arc::clone(&control_sender));
     let mut video_sender = socket.request_unreliable_stream(VIDEO);
     let mut alpha_video_sender = enable_alpha_stream
         .then(|| socket.request_unreliable_stream::<VideoPacketHeader>(VIDEO_ALPHA));
@@ -1244,12 +1247,13 @@ fn connection_pipeline(
                         if !initial_settings.headset.tracking_ref_only {
                             let session_manager_lock = SESSION_MANAGER.read();
                             let config = &session_manager_lock.settings().headset;
+                            let marker_base = ctx.marker_tracking.lock().base_config();
                             ctx.tracking_manager
                                 .write()
-                                .recenter(&config.recentering_mode);
-                            let markers = ctx.tracking_manager.read().recentered_markers();
+                                .recenter(&config.recentering_mode, marker_base);
+                            let streams = ctx.tracking_manager.read().recentered_marker_streams();
                             ctx.events_sender
-                                .send(ServerCoreEvent::Markers(markers))
+                                .send(ServerCoreEvent::Markers(streams))
                                 .ok();
 
                             let area = packet.unwrap_or(Vec2::new(2.0, 2.0));
@@ -1369,18 +1373,42 @@ fn connection_pipeline(
                             .send(ServerCoreEvent::ProximityState(headset_is_worn))
                             .ok();
                     }
-                    ClientControlPacket::Markers(markers) => {
-                        let mut tracking_manager = ctx.tracking_manager.write();
-                        tracking_manager.set_markers(markers);
-                        if tracking_manager.update_marker_origin(
-                            &SESSION_MANAGER.read().settings().headset.recentering_mode,
-                        ) {
-                            info!("Origin moved to the QR code");
+                    ClientControlPacket::Markers {
+                        config,
+                        timestamp,
+                        markers,
+                    } => {
+                        let (configs, marker_base) = {
+                            let marker_tracking = ctx.marker_tracking.lock();
+                            (marker_tracking.configs(), marker_tracking.base_config())
+                        };
+                        // Not from a tracker the headset was just told to stop
+                        if let Some(configs) = configs.filter(|configs| configs.contains(&config)) {
+                            let mut tracking_manager = ctx.tracking_manager.write();
+                            tracking_manager.retain_marker_streams(&configs);
+                            tracking_manager.set_marker_stream(MarkerStream {
+                                config,
+                                timestamp,
+                                markers,
+                            });
+                            if tracking_manager.update_marker_origin(
+                                &SESSION_MANAGER.read().settings().headset.recentering_mode,
+                                marker_base,
+                            ) {
+                                info!("Origin moved to the QR code");
+                            }
+                            ctx.events_sender
+                                .send(ServerCoreEvent::Markers(
+                                    tracking_manager.recentered_marker_streams(),
+                                ))
+                                .ok();
                         }
+                    }
+                    ClientControlPacket::MarkerCapabilities(capabilities) => {
+                        info!("Headset marker capabilities: {capabilities:?}");
+                        ctx.marker_tracking.lock().set_capabilities(capabilities);
                         ctx.events_sender
-                            .send(ServerCoreEvent::Markers(
-                                tracking_manager.recentered_markers(),
-                            ))
+                            .send(ServerCoreEvent::MarkerCapabilities(capabilities))
                             .ok();
                     }
                     ClientControlPacket::Reserved(_) | ClientControlPacket::ReservedBuffer(_) => (),
@@ -1527,6 +1555,7 @@ fn connection_pipeline(
     keepalive_thread.join().ok();
     lifecycle_check_thread.join().ok();
 
+    ctx.marker_tracking.lock().disconnect();
     ctx.events_sender
         .send(ServerCoreEvent::Markers(Vec::new()))
         .ok();

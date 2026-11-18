@@ -7,7 +7,7 @@ pub use face::*;
 pub use vmc::*;
 
 use crate::{
-    ConnectionContext, SESSION_MANAGER, ServerCoreEvent,
+    ConnectionContext, MarkerStream, SESSION_MANAGER, ServerCoreEvent,
     connection::STREAMING_RECV_TIMEOUT,
     hand_gestures::{self, HAND_GESTURE_BUTTON_SET, HandGestureManager},
     input_mapping::ButtonMappingManager,
@@ -18,7 +18,7 @@ use alvr_common::{
     info, inputs as inp,
 };
 use alvr_events::{EventType, TrackingEvent};
-use alvr_packets::{MarkerData, TrackingData};
+use alvr_packets::{MarkerTrackingConfig, TrackingData};
 use alvr_session::{
     BodyTrackingConfig, HeadsetConfig, RecenteringMode, Settings, VMCConfig,
     settings_schema::Switch,
@@ -74,8 +74,8 @@ pub struct TrackingManager {
     device_motions_history: HashMap<u64, VecDeque<(Duration, DeviceMotion)>>,
     hand_skeletons_history: [VecDeque<(Duration, [Pose; 26])>; 2],
     max_history_size: usize,
-    markers: Vec<MarkerData>,    // client's reference space
-    marker_origin: Option<Pose>, // client's reference space, last origin taken from a QR code
+    marker_streams: Vec<MarkerStream>, // client's reference space, one per tracker
+    marker_origin: Option<Pose>,       // client's reference space, last origin taken from a QR code
     // With no code text configured: the text of the first code that set the origin
     first_code_text: Option<String>,
 }
@@ -88,29 +88,55 @@ impl TrackingManager {
             device_motions_history: HashMap::new(),
             hand_skeletons_history: [VecDeque::new(), VecDeque::new()],
             max_history_size,
-            markers: Vec::new(),
+            marker_streams: Vec::new(),
             marker_origin: None,
             first_code_text: None,
         }
     }
 
-    pub fn set_markers(&mut self, markers: Vec<MarkerData>) {
-        self.markers = markers;
+    /// Replaces the markers of the stream's tracker.
+    pub fn set_marker_stream(&mut self, stream: MarkerStream) {
+        match self
+            .marker_streams
+            .iter_mut()
+            .find(|existing| existing.config == stream.config)
+        {
+            Some(existing) => *existing = stream,
+            None => self.marker_streams.push(stream),
+        }
     }
 
-    pub fn recentered_markers(&self) -> Vec<MarkerData> {
-        self.markers
+    /// Forgets the trackers the headset no longer runs.
+    pub fn retain_marker_streams(&mut self, configs: &[MarkerTrackingConfig]) {
+        self.marker_streams
+            .retain(|stream| configs.contains(&stream.config));
+    }
+
+    pub fn recentered_marker_streams(&self) -> Vec<MarkerStream> {
+        self.marker_streams
             .iter()
-            .map(|marker| MarkerData {
-                pose: self.recenter_pose(marker.pose),
-                ..marker.clone()
+            .map(|stream| MarkerStream {
+                markers: stream
+                    .markers
+                    .iter()
+                    .map(|marker| alvr_packets::MarkerData {
+                        pose: self.recenter_pose(marker.pose),
+                        ..marker.clone()
+                    })
+                    .collect(),
+                ..stream.clone()
             })
             .collect()
     }
 
-    // In Marker mode, moves the origin to the QR code when it moved noticeably (jitter is ignored,
-    // a recenter of the client's space is followed). Returns true if the origin changed.
-    pub fn update_marker_origin(&mut self, recentering_mode: &RecenteringMode) -> bool {
+    // In Marker mode, moves the origin to the QR code seen by the `base` tracker when it moved
+    // noticeably (jitter is ignored, a recenter of the client's space is followed). Returns true if
+    // the origin changed.
+    pub fn update_marker_origin(
+        &mut self,
+        recentering_mode: &RecenteringMode,
+        base: Option<MarkerTrackingConfig>,
+    ) -> bool {
         let RecenteringMode::Marker { code_text } = recentering_mode else {
             self.marker_origin = None;
             self.first_code_text = None;
@@ -125,8 +151,11 @@ impl TrackingManager {
             .or(self.first_code_text.as_ref());
 
         let Some((id, origin)) = self
-            .markers
+            .marker_streams
             .iter()
+            .find(|stream| Some(stream.config) == base)
+            .into_iter()
+            .flat_map(|stream| &stream.markers)
             .find(|m| wanted.is_none_or(|text| m.id == *text))
             .and_then(|m| Some((m.id.clone(), floor_origin_from_marker(m.pose)?)))
         else {
@@ -150,10 +179,14 @@ impl TrackingManager {
         true
     }
 
-    pub fn recenter(&mut self, recentering_mode: &RecenteringMode) {
+    pub fn recenter(
+        &mut self,
+        recentering_mode: &RecenteringMode,
+        marker_base: Option<MarkerTrackingConfig>,
+    ) {
         let recentering_mode = match recentering_mode {
             RecenteringMode::Marker { .. } => {
-                self.update_marker_origin(recentering_mode);
+                self.update_marker_origin(recentering_mode, marker_base);
                 if let Some(origin) = self.marker_origin {
                     self.inverse_recentering_origin = origin.inverse();
                     return;
@@ -634,8 +667,10 @@ mod tests {
         assert_origin(wall, Vec3::new(0.5, 0.0, -3.0), -Vec3::Z);
     }
 
-    fn code(id: &str, x: f32) -> MarkerData {
-        MarkerData {
+    const BASE: Option<MarkerTrackingConfig> = Some(MarkerTrackingConfig::BASE);
+
+    fn code(id: &str, x: f32) -> alvr_packets::MarkerData {
+        alvr_packets::MarkerData {
             id: id.into(),
             pose: Pose {
                 position: Vec3::new(x, 1.0, -2.0),
@@ -645,24 +680,55 @@ mod tests {
         }
     }
 
+    fn stream(
+        config: MarkerTrackingConfig,
+        markers: Vec<alvr_packets::MarkerData>,
+    ) -> MarkerStream {
+        MarkerStream {
+            config,
+            timestamp: Duration::ZERO,
+            markers,
+        }
+    }
+
     #[test]
     fn first_code_keeps_origin() {
         let mode = RecenteringMode::Marker {
             code_text: String::new(),
         };
         let mut manager = TrackingManager::new(10);
+        let base = MarkerTrackingConfig::BASE;
 
-        manager.set_markers(vec![code("dog", 0.0)]);
-        assert!(manager.update_marker_origin(&mode));
+        manager.set_marker_stream(stream(base, vec![code("dog", 0.0)]));
+        assert!(manager.update_marker_origin(&mode, BASE));
 
         // A different code, alone or next to the first one, is ignored
-        manager.set_markers(vec![code("cat", 1.0)]);
-        assert!(!manager.update_marker_origin(&mode));
-        manager.set_markers(vec![code("cat", 1.0), code("dog", 0.0)]);
-        assert!(!manager.update_marker_origin(&mode));
+        manager.set_marker_stream(stream(base, vec![code("cat", 1.0)]));
+        assert!(!manager.update_marker_origin(&mode, BASE));
+        manager.set_marker_stream(stream(base, vec![code("cat", 1.0), code("dog", 0.0)]));
+        assert!(!manager.update_marker_origin(&mode, BASE));
 
         // The first code moving still moves the origin
-        manager.set_markers(vec![code("dog", 0.5)]);
-        assert!(manager.update_marker_origin(&mode));
+        manager.set_marker_stream(stream(base, vec![code("dog", 0.5)]));
+        assert!(manager.update_marker_origin(&mode, BASE));
+    }
+
+    #[test]
+    fn only_the_base_tracker_moves_the_origin() {
+        let mode = RecenteringMode::Marker {
+            code_text: "dog".into(),
+        };
+        let mut manager = TrackingManager::new(10);
+        let moving = MarkerTrackingConfig::default();
+
+        // A tracker an application asked for, e.g. for a code on a moving dog
+        manager.set_marker_stream(stream(moving, vec![code("dog", 0.0)]));
+        assert!(!manager.update_marker_origin(&mode, BASE));
+
+        manager.set_marker_stream(stream(MarkerTrackingConfig::BASE, vec![code("dog", 0.0)]));
+        assert!(manager.update_marker_origin(&mode, BASE));
+
+        manager.retain_marker_streams(&[MarkerTrackingConfig::BASE]);
+        assert_eq!(manager.recentered_marker_streams().len(), 1);
     }
 }

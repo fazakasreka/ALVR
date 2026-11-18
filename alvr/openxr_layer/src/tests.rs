@@ -1,13 +1,20 @@
 //! The layer driven the way the OpenXR loader and an application drive it, on top of a fake
-//! runtime that, like SteamVR, implements none of the extensions.
+//! runtime that, like SteamVR, implements none of the extensions but the time conversion.
 
-use crate::{LAYER_NAME, xrNegotiateLoaderApiLayerInterface};
-use alvr_marker_ipc::{FLAG_CLIENT_CONNECTED, Pose, Server};
+use crate::{LAYER_NAME, TIME_EXTENSION, xrNegotiateLoaderApiLayerInterface};
+use alvr_marker_ipc::{
+    Capabilities, FLAG_CLIENT_CONNECTED, Marker, Pose, Server, Stream, TrackingConfig, now_ns,
+    ns_to_performance_counter,
+};
 use openxr_sys::{self as xr, Handle, loader, pfn};
 use std::{
     ffi::{CStr, c_char},
     mem, ptr,
-    sync::{Mutex, MutexGuard},
+    sync::{
+        Mutex, MutexGuard,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::{self, Receiver},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -50,13 +57,39 @@ fn runtime() -> MutexGuard<'static, Option<Runtime>> {
     RUNTIME.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-const RUNTIME_EXTENSIONS: [&CStr; 0] = [];
+const RUNTIME_EXTENSIONS: [&CStr; 1] = [TIME_EXTENSION];
+/// xrCreateInstance calls on the runtime, failed ones too.
+static CREATE_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+/// Whether the runtime lists its extensions, as SteamVR does.
+static LISTS_EXTENSIONS: AtomicBool = AtomicBool::new(true);
+
+unsafe extern "system" fn runtime_enumerate_extensions(
+    layer: *const c_char,
+    capacity: u32,
+    count: *mut u32,
+    properties: *mut xr::ExtensionProperties,
+) -> xr::Result {
+    assert!(layer.is_null());
+    unsafe { *count = RUNTIME_EXTENSIONS.len() as u32 };
+    if capacity == 0 {
+        return xr::Result::SUCCESS;
+    }
+    for (i, name) in RUNTIME_EXTENSIONS.iter().enumerate() {
+        let property = unsafe { &mut *properties.add(i) };
+        for (j, byte) in name.to_bytes_with_nul().iter().enumerate() {
+            property.extension_name[j] = *byte as c_char;
+        }
+        property.extension_version = 1;
+    }
+    xr::Result::SUCCESS
+}
 
 unsafe extern "system" fn runtime_create_instance(
     info: *const xr::InstanceCreateInfo,
     _layer_info: *const loader::ApiLayerCreateInfo,
     instance: *mut xr::Instance,
 ) -> xr::Result {
+    CREATE_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
     let info = unsafe { &*info };
     let names = (0..info.enabled_extension_count as usize)
         .map(|i| unsafe { CStr::from_ptr(*info.enabled_extension_names.add(i)) })
@@ -141,6 +174,16 @@ unsafe extern "system" fn runtime_locate_space(
     xr::Result::SUCCESS
 }
 
+/// OpenXR times are performance counter nanoseconds here.
+unsafe extern "system" fn runtime_convert_time(
+    _: xr::Instance,
+    time: xr::Time,
+    counter: *mut i64,
+) -> xr::Result {
+    unsafe { *counter = ns_to_performance_counter(time.as_nanos()) };
+    xr::Result::SUCCESS
+}
+
 unsafe extern "system" fn runtime_get_instance_proc_addr(
     _: xr::Instance,
     name: *const c_char,
@@ -159,6 +202,14 @@ unsafe extern "system" fn runtime_get_instance_proc_addr(
         b"xrCreateReferenceSpace" => f!(runtime_create_reference_space, pfn::CreateReferenceSpace),
         b"xrDestroySpace" => f!(runtime_destroy_space, pfn::DestroySpace),
         b"xrLocateSpace" => f!(runtime_locate_space, pfn::LocateSpace),
+        b"xrEnumerateInstanceExtensionProperties" if LISTS_EXTENSIONS.load(Ordering::SeqCst) => f!(
+            runtime_enumerate_extensions,
+            pfn::EnumerateInstanceExtensionProperties
+        ),
+        b"xrConvertTimeToWin32PerformanceCounterKHR" => f!(
+            runtime_convert_time,
+            pfn::ConvertTimeToWin32PerformanceCounterKHR
+        ),
         _ => {
             unsafe { *function = None };
             return xr::Result::ERROR_FUNCTION_UNSUPPORTED;
@@ -253,20 +304,85 @@ fn pose(x: f32, y: f32, z: f32) -> Pose {
     }
 }
 
-/// Sends markers, as the driver does, and waits until the layer has them.
-fn publish(server: &mut Server, markers: &[(&str, Pose, f32)]) {
-    server.publish(FLAG_CLIENT_CONNECTED, markers.iter().copied());
+const MOVING: TrackingConfig = TrackingConfig {
+    static_markers: false,
+    marker_size: None,
+};
+const STATIC: TrackingConfig = TrackingConfig {
+    static_markers: true,
+    marker_size: None,
+};
+const STATIC_SIZED: TrackingConfig = TrackingConfig {
+    static_markers: true,
+    marker_size: Some(0.5),
+};
+const HEADSET: Capabilities = Capabilities {
+    qr_codes: true,
+    fixed_size_markers: true,
+    static_markers: true,
+};
+
+/// The driver's end, and what the layers ask it for.
+fn start_driver() -> (Server, Receiver<Vec<TrackingConfig>>) {
+    let (sender, receiver) = mpsc::channel();
+    let server = Server::start_named(&pipe_name(), move |configs| {
+        sender.send(configs).ok();
+    })
+    .unwrap();
+
+    (server, receiver)
+}
+
+/// Waits until the layers ask for `expected`.
+fn expect_requests(requests: &Receiver<Vec<TrackingConfig>>, expected: &[TrackingConfig]) {
+    let start = Instant::now();
+    loop {
+        let configs = requests
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("no request for {expected:?}"));
+        if configs.len() == expected.len() && expected.iter().all(|c| configs.contains(c)) {
+            return;
+        }
+        assert!(start.elapsed() < Duration::from_secs(5), "{configs:?}");
+    }
+}
+
+/// Sends what every tracker of the headset sees now, as the driver does, and waits until the
+/// layer has it. Returns the time the poses are for.
+fn publish(server: &mut Server, markers: &[(&str, Pose, f32)]) -> xr::Time {
+    let time_ns = now_ns();
+    let streams = [MOVING, STATIC, STATIC_SIZED]
+        .into_iter()
+        .map(|config| Stream {
+            config,
+            time_ns,
+            markers: markers
+                .iter()
+                .map(|&(text, pose, size)| Marker::new(text, pose, size))
+                .collect(),
+        })
+        .collect();
+    server.publish(FLAG_CLIENT_CONNECTED, HEADSET, streams);
 
     let generation = server.generation();
     let start = Instant::now();
-    while crate::state()
-        .markers
-        .read()
-        .is_none_or(|snapshot| snapshot.generation != generation)
-    {
+    loop {
+        let mut state = crate::state();
+        state.markers.refresh();
+        if state
+            .markers
+            .client
+            .read()
+            .is_some_and(|snapshot| snapshot.generation == generation)
+        {
+            break;
+        }
+        drop(state);
         assert!(start.elapsed() < Duration::from_secs(5));
         thread::sleep(Duration::from_millis(1));
     }
+
+    xr::Time::from_nanos(time_ns)
 }
 
 const ALL_EXTENSIONS: [&CStr; 3] = [
@@ -276,7 +392,6 @@ const ALL_EXTENSIONS: [&CStr; 3] = [
 ];
 
 const SYSTEM: xr::SystemId = unsafe { mem::transmute(1_u64) };
-const TIME: xr::Time = unsafe { mem::transmute(1_000_000_i64) };
 
 struct App {
     gipa: pfn::GetInstanceProcAddr,
@@ -315,8 +430,9 @@ impl App {
         capability: xr::SpatialCapabilityEXT,
         ty: xr::StructureType,
         components: &[xr::SpatialComponentTypeEXT],
-        marker_size: Option<f32>,
+        config: TrackingConfig,
     ) -> Result<xr::SpatialContextEXT, xr::Result> {
+        let marker_size = config.marker_size;
         let create: pfn::CreateSpatialContextAsyncEXT = self.get(c"xrCreateSpatialContextAsyncEXT");
         let complete: pfn::CreateSpatialContextCompleteEXT =
             self.get(c"xrCreateSpatialContextCompleteEXT");
@@ -334,7 +450,7 @@ impl App {
             } else {
                 ptr::null()
             },
-            optimize_for_static_marker: xr::TRUE,
+            optimize_for_static_marker: config.static_markers.into(),
         };
         let config = xr::SpatialCapabilityConfigurationBaseHeaderEXT {
             ty,
@@ -394,7 +510,7 @@ impl App {
         Ok(completion.spatial_context)
     }
 
-    fn discover(&self, context: xr::SpatialContextEXT) -> xr::SpatialSnapshotEXT {
+    fn discover(&self, context: xr::SpatialContextEXT, time: xr::Time) -> xr::SpatialSnapshotEXT {
         let create: pfn::CreateSpatialDiscoverySnapshotAsyncEXT =
             self.get(c"xrCreateSpatialDiscoverySnapshotAsyncEXT");
         let complete: pfn::CreateSpatialDiscoverySnapshotCompleteEXT =
@@ -416,7 +532,7 @@ impl App {
             ty: xr::CreateSpatialDiscoverySnapshotCompletionInfoEXT::TYPE,
             next: ptr::null(),
             base_space: xr::Space::from_raw(LOCAL),
-            time: TIME,
+            time,
             future,
         };
         let mut completion = xr::CreateSpatialDiscoverySnapshotCompletionEXT {
@@ -558,19 +674,25 @@ fn close(a: xr::Vector3f, b: [f32; 3]) -> bool {
 #[test]
 fn markers_reach_the_application() {
     let _serial = serial();
-    let mut writer = Server::start_named(&pipe_name()).unwrap();
-    writer.publish(
-        FLAG_CLIENT_CONNECTED,
-        [
+    let (mut writer, requests) = start_driver();
+    let mut time = publish(
+        &mut writer,
+        &[
             ("dog", pose(1.0, 0.0, -2.0), 0.2),
             ("cat", pose(-1.0, 1.0, -3.0), 0.1),
         ],
     );
 
+    CREATE_ATTEMPTS.store(0, Ordering::SeqCst);
     let (result, instance, gipa) = create_instance(&ALL_EXTENSIONS);
     assert_eq!(result, xr::Result::SUCCESS);
-    // SteamVR would have refused them
-    assert!(runtime().as_ref().unwrap().enabled_extensions.is_empty());
+    // SteamVR would have refused them; the layer converts times with the runtime
+    assert_eq!(
+        runtime().as_ref().unwrap().enabled_extensions,
+        [TIME_EXTENSION.to_str().unwrap()]
+    );
+    // In one go: SteamVR asserts when created again after a failed attempt
+    assert_eq!(CREATE_ATTEMPTS.load(Ordering::SeqCst), 1);
     let app = App { gipa, instance };
 
     assert_eq!(
@@ -633,7 +755,7 @@ fn markers_reach_the_application() {
             xr::SpatialCapabilityEXT::MARKER_TRACKING_ARUCO_MARKER,
             xr::SpatialCapabilityConfigurationArucoMarkerEXT::TYPE,
             &both,
-            None
+            MOVING
         ),
         Err(xr::Result::ERROR_SPATIAL_CAPABILITY_UNSUPPORTED_EXT)
     );
@@ -643,7 +765,7 @@ fn markers_reach_the_application() {
             qr,
             xr::SpatialCapabilityConfigurationAprilTagEXT::TYPE,
             &both,
-            None
+            MOVING
         ),
         Err(xr::Result::ERROR_SPATIAL_CAPABILITY_CONFIGURATION_INVALID_EXT)
     );
@@ -653,20 +775,23 @@ fn markers_reach_the_application() {
             qr,
             qr_config,
             &[xr::SpatialComponentTypeEXT::MESH_3D],
-            None
+            MOVING
         ),
         Err(xr::Result::ERROR_SPATIAL_COMPONENT_UNSUPPORTED_FOR_CAPABILITY_EXT)
     );
 
+    // For codes that move
     let context = app
-        .create_context(session, qr, qr_config, &both, None)
+        .create_context(session, qr, qr_config, &both, MOVING)
         .unwrap();
+    // The headset is asked to track them that way
+    expect_requests(&requests, &[MOVING]);
 
     // A new context gets a discovery recommendation, once
     assert_eq!(app.poll_event(), Some(context));
     assert_eq!(app.poll_event(), None);
 
-    let snapshot = app.discover(context);
+    let snapshot = app.discover(context, time);
     let mut entities = app.query(snapshot);
     entities.sort_by_key(|entity| entity.2.center.position.x as i32);
     assert_eq!(entities.len(), 2);
@@ -748,7 +873,7 @@ fn markers_reach_the_application() {
     );
 
     let update: pfn::CreateSpatialUpdateSnapshotEXT = app.get(c"xrCreateSpatialUpdateSnapshotEXT");
-    let update_snapshot = |entity: xr::SpatialEntityEXT| {
+    let update_snapshot = |entity: xr::SpatialEntityEXT, time: xr::Time| {
         let info = xr::SpatialUpdateSnapshotCreateInfoEXT {
             ty: xr::SpatialUpdateSnapshotCreateInfoEXT::TYPE,
             next: ptr::null(),
@@ -757,7 +882,7 @@ fn markers_reach_the_application() {
             component_type_count: 0,
             component_types: ptr::null(),
             base_space: xr::Space::from_raw(LOCAL),
-            time: TIME,
+            time,
         };
         let mut snapshot = xr::SpatialSnapshotEXT::NULL;
         assert_eq!(
@@ -768,23 +893,29 @@ fn markers_reach_the_application() {
     };
 
     // The dog moves
-    publish(
+    let before = time;
+    time = publish(
         &mut writer,
         &[
             ("dog", pose(2.0, 0.0, -2.0), 0.2),
             ("cat", pose(-1.0, 1.0, -3.0), 0.1),
         ],
     );
-    let updated = app.query(update_snapshot(entity));
+    let updated = app.query(update_snapshot(entity, time));
     assert_eq!(updated.len(), 1);
     assert_eq!(updated[0].1, xr::SpatialEntityTrackingStateEXT::TRACKING);
     assert!(close(updated[0].2.center.position, [2.0, -1.5, -2.0]));
+    // Where it was at the time asked for, half way between its two poses
+    let middle = xr::Time::from_nanos((before.as_nanos() + time.as_nanos()) / 2);
+    let updated = app.query(update_snapshot(entity, middle));
+    // To the performance counter's tick
+    assert!((updated[0].2.center.position.x - 1.5).abs() < 1e-3);
     // Same markers, no recommendation
     assert_eq!(app.poll_event(), None);
 
     // The headset loses sight of it
-    publish(&mut writer, &[("cat", pose(-1.0, 1.0, -3.0), 0.1)]);
-    let updated = app.query(update_snapshot(entity));
+    time = publish(&mut writer, &[("cat", pose(-1.0, 1.0, -3.0), 0.1)]);
+    let updated = app.query(update_snapshot(entity, time));
     assert_eq!(updated[0].1, xr::SpatialEntityTrackingStateEXT::PAUSED);
     assert_eq!(app.poll_event(), Some(context));
 
@@ -795,10 +926,11 @@ fn markers_reach_the_application() {
             qr,
             qr_config,
             &[xr::SpatialComponentTypeEXT::MARKER],
-            Some(0.5),
+            STATIC_SIZED,
         )
         .unwrap();
-    let markers_only_snapshot = app.discover(markers_only);
+    expect_requests(&requests, &[MOVING, STATIC_SIZED]);
+    let markers_only_snapshot = app.discover(markers_only, time);
     assert_eq!(
         unsafe { query(markers_only_snapshot, &condition, &mut query_result) },
         xr::Result::ERROR_SPATIAL_COMPONENT_NOT_ENABLED_EXT
@@ -810,11 +942,24 @@ fn markers_reach_the_application() {
         unsafe { destroy_context(markers_only) },
         xr::Result::SUCCESS
     );
+    expect_requests(&requests, &[MOVING]);
     let sized = app
-        .create_context(session, qr, qr_config, &both, Some(0.5))
+        .create_context(session, qr, qr_config, &both, STATIC_SIZED)
         .unwrap();
-    let sized_entities = app.query(app.discover(sized));
+    let sized_entities = app.query(app.discover(sized, time));
     assert_eq!(sized_entities[0].2.extents.width, 0.5);
+
+    // Static codes are averaged over their latest poses
+    let static_context = app
+        .create_context(session, qr, qr_config, &both, STATIC)
+        .unwrap();
+    expect_requests(&requests, &[MOVING, STATIC_SIZED, STATIC]);
+    publish(&mut writer, &[("cat", pose(-1.0, 1.0, -3.0), 0.1)]);
+    time = publish(&mut writer, &[("cat", pose(-1.2, 1.0, -3.0), 0.1)]);
+    let averaged = app.query(app.discover(static_context, time));
+    // Over every pose of the last second: mostly at -1, once at -1.2
+    let x = averaged[0].2.center.position.x;
+    assert!(-1.2 < x && x < -1.0, "{x}");
     // Destroying the context destroyed its snapshots
     let destroy_snapshot: pfn::DestroySpatialSnapshotEXT = app.get(c"xrDestroySpatialSnapshotEXT");
     assert_eq!(
@@ -826,7 +971,7 @@ fn markers_reach_the_application() {
     // The driver stops
     drop(writer);
     assert!(app.capabilities().is_empty());
-    let updated = app.query(update_snapshot(entity));
+    let updated = app.query(update_snapshot(entity, time));
     assert_eq!(updated[0].1, xr::SpatialEntityTrackingStateEXT::PAUSED);
 
     let destroy_session: pfn::DestroySession = app.get(c"xrDestroySession");
@@ -839,6 +984,22 @@ fn markers_reach_the_application() {
     );
 
     let destroy_instance: pfn::DestroyInstance = app.get(c"xrDestroyInstance");
+    assert_eq!(unsafe { destroy_instance(instance) }, xr::Result::SUCCESS);
+}
+
+#[test]
+fn a_runtime_that_does_not_list_its_extensions_is_tried() {
+    let _serial = serial();
+    LISTS_EXTENSIONS.store(false, Ordering::SeqCst);
+    let (result, instance, gipa) = create_instance(&ALL_EXTENSIONS);
+    LISTS_EXTENSIONS.store(true, Ordering::SeqCst);
+
+    assert_eq!(result, xr::Result::SUCCESS);
+    assert_eq!(
+        runtime().as_ref().unwrap().enabled_extensions,
+        [TIME_EXTENSION.to_str().unwrap()]
+    );
+    let destroy_instance: pfn::DestroyInstance = get(gipa, instance, c"xrDestroyInstance");
     assert_eq!(unsafe { destroy_instance(instance) }, xr::Result::SUCCESS);
 }
 

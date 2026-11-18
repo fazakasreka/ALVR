@@ -8,6 +8,7 @@
 //! the application's alpha. It gets a decoder of its own, and its frames are paired with the color
 //! frames by timestamp when they are displayed.
 
+use crate::markers::MarkerSettings;
 use crate::{
     camera::{Camera, IPD},
     decoder::{self, DecodedFrame, DecoderKind, VideoDecoder},
@@ -22,12 +23,15 @@ use alvr_common::{
     info,
     parking_lot::{Mutex, RwLock},
 };
-use alvr_packets::{ButtonEntry, ButtonValue, FaceData, MarkerData, TrackingData, VideoStreamKind};
+use alvr_packets::{
+    ButtonEntry, ButtonValue, FaceData, MarkerCapabilities, MarkerData, MarkerTrackingConfig,
+    TrackingData, VideoStreamKind,
+};
 use alvr_session::{CodecType, PassthroughMode};
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::Arc,
+    sync::{Arc, LazyLock},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -98,7 +102,15 @@ impl Default for ClientStatus {
 /// leads color by a frame or two; anything beyond this is a stream that stopped pairing up.
 const MAX_PENDING_ALPHA_FRAMES: usize = 8;
 
-const MARKERS_INTERVAL: Duration = Duration::from_secs(1);
+/// The clock of the tracking's `poll_timestamp`, which marker times are on too.
+static TRACKING_CLOCK: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// The emulated headset tracks QR codes with every option.
+const MARKER_CAPABILITIES: MarkerCapabilities = MarkerCapabilities {
+    qr_codes: true,
+    fixed_size_markers: true,
+    static_markers: true,
+};
 
 /// The pose the tracking thread reads. Written by the UI thread every frame.
 #[derive(Clone, Copy)]
@@ -469,7 +481,8 @@ pub struct EmulatedClient {
     announced_inputs: Option<HashSet<u64>>,
     /// Latest haptics pulse per hand, held until the UI takes it. Left is index 0.
     haptics: [Option<HapticsEvent>; 2],
-    markers_sent_at: Option<Instant>,
+    /// The marker trackers the server asked for.
+    marker_configs: Vec<MarkerTrackingConfig>,
 }
 
 impl EmulatedClient {
@@ -491,6 +504,7 @@ impl EmulatedClient {
         };
 
         let context = Arc::new(ClientCoreContext::new(capabilities));
+        context.set_marker_capabilities(MARKER_CAPABILITIES);
         context.resume();
 
         Self {
@@ -514,7 +528,7 @@ impl EmulatedClient {
             sent_buttons: HashMap::new(),
             announced_inputs: None,
             haptics: [None; 2],
-            markers_sent_at: None,
+            marker_configs: Vec::new(),
         }
     }
 
@@ -615,22 +629,28 @@ impl EmulatedClient {
         self.announced_inputs = Some(input_ids);
     }
 
-    /// Reports the markers once per [`MARKERS_INTERVAL`] while streaming, as a headset would.
-    pub fn sync_markers(&mut self, markers: &[MarkerData]) {
+    /// Reports where the markers are now, to every tracker the server asked for. Call once per
+    /// frame while streaming, as a headset reports them.
+    pub fn sync_markers(&mut self, markers: &[MarkerSettings]) {
         if !self.status.streaming {
             return;
         }
 
-        let now = Instant::now();
-        if self
-            .markers_sent_at
-            .is_some_and(|sent| now.saturating_duration_since(sent) < MARKERS_INTERVAL)
-        {
-            return;
+        let timestamp = TRACKING_CLOCK.elapsed();
+        for config in &self.marker_configs {
+            let seen = markers
+                .iter()
+                .map(|marker| {
+                    let mut data = marker.data_at(timestamp);
+                    // As a runtime must: every code has the size the application gave
+                    if let Some(size) = config.marker_size {
+                        data.size = size;
+                    }
+                    data
+                })
+                .collect::<Vec<MarkerData>>();
+            self.context.send_markers(*config, timestamp, seen);
         }
-
-        self.context.send_markers(markers.to_vec());
-        self.markers_sent_at = Some(now);
     }
 
     /// Drains client core events and keeps [`ClientStatus`] in step. Call once per frame.
@@ -675,7 +695,7 @@ impl EmulatedClient {
                     // state and the interaction profile must go out again.
                     self.sent_buttons.clear();
                     self.announced_inputs = None;
-                    self.markers_sent_at = None;
+                    self.marker_configs.clear();
 
                     self.start_tracking(config.negotiated_config.refresh_rate_hint);
                 }
@@ -796,6 +816,10 @@ impl EmulatedClient {
                 ClientCoreEvent::RealTimeConfig(config) => {
                     self.configured_passthrough = config.passthrough;
                     self.update_passthrough();
+                }
+                ClientCoreEvent::MarkerTrackingConfigs(configs) => {
+                    info!("Tracking markers with {configs:?}");
+                    self.marker_configs = configs;
                 }
             }
         }
@@ -979,7 +1003,6 @@ fn tracking_loop(
     send_timing: Arc<Mutex<SendTracker>>,
     refresh_rate: f32,
 ) {
-    let origin = Instant::now();
     let interval = Duration::from_secs_f32(1.0 / (refresh_rate * TRACKING_RATE_MULTIPLIER));
     let mut deadline = Instant::now();
 
@@ -1059,7 +1082,7 @@ fn tracking_loop(
         });
 
         context.send_tracking(TrackingData {
-            poll_timestamp: origin.elapsed(),
+            poll_timestamp: TRACKING_CLOCK.elapsed(),
             device_motions,
             hand_skeletons,
             face: FaceData::default(),

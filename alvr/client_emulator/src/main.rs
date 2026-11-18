@@ -61,7 +61,7 @@ use alvr_common::{
     info,
     parking_lot::Mutex,
 };
-use alvr_packets::{ButtonValue, MarkerData};
+use alvr_packets::ButtonValue;
 use alvr_session::PassthroughMode;
 use eframe::{
     App, CreationContext, Frame, NativeOptions,
@@ -139,7 +139,7 @@ struct EmulatorApp {
     hand_settings: HandSettings,
     /// Emulated hand state, mutated by both the UI and the API commands. Left is index 0.
     hands: [HandState; 2],
-    markers: Vec<MarkerData>,
+    markers: Vec<markers::MarkerSettings>,
     /// The icons and 6DoF panels of the controllers and the hands, which share one implementation.
     pose_overlay: PoseOverlay,
     /// Pending releases queued by the API's click endpoint.
@@ -263,7 +263,7 @@ impl EmulatorApp {
             controller_ui: ControllerUi::new(),
             hand_settings,
             hands,
-            markers: marker_settings.iter().map(|marker| marker.data()).collect(),
+            markers: marker_settings,
             pose_overlay: PoseOverlay::new(),
             timed_releases: Vec::new(),
             loaded_models: [None, None],

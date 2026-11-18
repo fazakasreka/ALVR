@@ -15,8 +15,8 @@ use alvr_common::{
 };
 use alvr_packets::{
     AUDIO, ClientConnectionResult, ClientControlPacket, ClientStatistics, ConnectionAcceptedInfo,
-    HAPTICS, Haptics, STATISTICS, ServerControlPacket, StreamConfigPacket, TRACKING, TrackingData,
-    VIDEO, VIDEO_ALPHA, VideoPacketHeader, VideoStreamingCapabilities,
+    HAPTICS, Haptics, MarkerCapabilities, STATISTICS, ServerControlPacket, StreamConfigPacket,
+    TRACKING, TrackingData, VIDEO, VIDEO_ALPHA, VideoPacketHeader, VideoStreamingCapabilities,
     VideoStreamingCapabilitiesExt,
 };
 use alvr_session::{SocketProtocol, settings_schema::Switch};
@@ -69,6 +69,7 @@ pub struct ConnectionContext {
     pub alpha_decoder_callback: Mutex<Option<Box<DecoderCallback>>>,
     pub global_view_params_queue: Mutex<VecDeque<(Duration, [ViewParams; 2])>>,
     pub max_prediction: RwLock<Duration>,
+    pub marker_capabilities: Mutex<Option<MarkerCapabilities>>,
 }
 
 fn set_hud_message(event_queue: &Mutex<VecDeque<ClientCoreEvent>>, message: &str) {
@@ -341,7 +342,12 @@ fn connection_pipeline(
     let mut alpha_video_receiver = enable_alpha_stream.then(|| {
         stream_socket.subscribe_to_stream::<VideoPacketHeader>(VIDEO_ALPHA, MAX_UNREAD_PACKETS)
     });
-    let mut game_audio_receiver = stream_socket.subscribe_to_stream(AUDIO, MAX_UNREAD_PACKETS);
+    // Only subscribed when it is played: the server sends game audio whatever the client can do,
+    // and an unread stream holds up the whole socket once its buffers are used up, video included.
+    // Packets of a stream nobody subscribed to are read and dropped.
+    let plays_game_audio = audio_enabled && matches!(settings.audio.game_audio, Switch::Enabled(_));
+    let mut game_audio_receiver =
+        plays_game_audio.then(|| stream_socket.subscribe_to_stream(AUDIO, MAX_UNREAD_PACKETS));
     let tracking_sender = stream_socket.request_stream(TRACKING);
     let mut haptics_receiver =
         stream_socket.subscribe_to_stream::<Haptics>(HAPTICS, MAX_UNREAD_PACKETS);
@@ -471,27 +477,28 @@ fn connection_pipeline(
         })
     });
 
-    let game_audio_thread =
-        if let (true, Switch::Enabled(config)) = (audio_enabled, settings.audio.game_audio) {
-            let device = alvr_audio::new_output(None).to_con()?;
-            thread::spawn({
-                let ctx = Arc::clone(&ctx);
-                move || {
-                    while is_streaming(&ctx) {
-                        alvr_common::show_err(audio::play_audio_loop(
-                            || is_streaming(&ctx),
-                            &device,
-                            2,
-                            negotiated_config.game_audio_sample_rate,
-                            config.buffering.clone(),
-                            &mut game_audio_receiver,
-                        ));
-                    }
+    let game_audio_thread = if let (Some(mut game_audio_receiver), Switch::Enabled(config)) =
+        (game_audio_receiver.take(), settings.audio.game_audio)
+    {
+        let device = alvr_audio::new_output(None).to_con()?;
+        thread::spawn({
+            let ctx = Arc::clone(&ctx);
+            move || {
+                while is_streaming(&ctx) {
+                    alvr_common::show_err(audio::play_audio_loop(
+                        || is_streaming(&ctx),
+                        &device,
+                        2,
+                        negotiated_config.game_audio_sample_rate,
+                        config.buffering.clone(),
+                        &mut game_audio_receiver,
+                    ));
                 }
-            })
-        } else {
-            thread::spawn(|| ())
-        };
+            }
+        })
+    } else {
+        thread::spawn(|| ())
+    };
 
     let microphone_thread =
         if audio_enabled && matches!(settings.audio.microphone, Switch::Enabled(_)) {
@@ -630,6 +637,11 @@ fn connection_pipeline(
                             .lock()
                             .push_back(ClientCoreEvent::RealTimeConfig(config));
                     }
+                    Ok(ServerControlPacket::MarkerTrackingConfigs(configs)) => {
+                        event_queue
+                            .lock()
+                            .push_back(ClientCoreEvent::MarkerTrackingConfigs(configs));
+                    }
                     Ok(ServerControlPacket::StartStream) => {
                         error!("Unexpected StartStream paceket");
                     }
@@ -677,6 +689,11 @@ fn connection_pipeline(
         }
     });
 
+    if let Some(capabilities) = *ctx.marker_capabilities.lock() {
+        control_sender
+            .send(&ClientControlPacket::MarkerCapabilities(capabilities))
+            .ok();
+    }
     *ctx.control_sender.lock() = Some(control_sender);
     *ctx.tracking_sender.lock() = Some(tracking_sender);
     *ctx.statistics_sender.lock() = Some(statistics_sender);

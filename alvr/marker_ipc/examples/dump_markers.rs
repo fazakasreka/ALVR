@@ -2,7 +2,7 @@
 //!
 //! `cargo run -p alvr_marker_ipc --example dump_markers [-- --watch]`
 
-use alvr_marker_ipc::{Client, FLAG_CLIENT_CONNECTED};
+use alvr_marker_ipc::{Client, FLAG_CLIENT_CONNECTED, now_ns};
 use std::{process::ExitCode, thread, time::Duration};
 
 fn main() -> ExitCode {
@@ -15,24 +15,32 @@ fn main() -> ExitCode {
             Some(snapshot) if last_generation != Some(snapshot.generation) => {
                 last_generation = Some(snapshot.generation);
                 println!(
-                    "generation {}, headset {}, {} marker(s)",
+                    "generation {}, headset {}, {:?}",
                     snapshot.generation,
                     if snapshot.flags & FLAG_CLIENT_CONNECTED != 0 {
                         "connected"
                     } else {
                         "not connected"
                     },
-                    snapshot.markers.len()
+                    snapshot.capabilities,
                 );
-                for marker in &snapshot.markers {
+                for stream in &snapshot.streams {
                     println!(
-                        "  {:016x} \"{}\" position {:?} orientation {:?} size {}",
-                        marker.id,
-                        marker.text,
-                        marker.pose.position,
-                        marker.pose.orientation,
-                        marker.size
+                        "  tracker {:?}: {} marker(s), {:.1} ms old",
+                        stream.config,
+                        stream.markers.len(),
+                        (now_ns() - stream.time_ns) as f64 / 1e6
                     );
+                    for marker in &stream.markers {
+                        println!(
+                            "    {:016x} \"{}\" position {:?} orientation {:?} size {}",
+                            marker.id,
+                            marker.text,
+                            marker.pose.position,
+                            marker.pose.orientation,
+                            marker.size
+                        );
+                    }
                 }
             }
             Some(_) => (),

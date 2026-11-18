@@ -27,8 +27,8 @@ use alvr_common::{
     warn,
 };
 use alvr_packets::{
-    BatteryInfo, ButtonEntry, ClientControlPacket, ClientStreamConfig, MarkerData, RealTimeConfig,
-    TrackingData, VideoStreamKind,
+    BatteryInfo, ButtonEntry, ClientControlPacket, ClientStreamConfig, MarkerCapabilities,
+    MarkerData, MarkerTrackingConfig, RealTimeConfig, TrackingData, VideoStreamKind,
 };
 use alvr_session::CodecType;
 use alvr_system_info::Platform;
@@ -60,6 +60,9 @@ pub enum ClientCoreEvent {
         stream: VideoStreamKind,
     },
     RealTimeConfig(RealTimeConfig),
+    /// The marker trackers to run, replacing the previous list. Each tracker's markers go to
+    /// [`ClientCoreContext::send_markers`] with its configuration.
+    MarkerTrackingConfigs(Vec<MarkerTrackingConfig>),
 }
 
 // Note: this struct may change without breaking network protocol changes
@@ -214,11 +217,36 @@ impl ClientCoreContext {
         }
     }
 
-    pub fn send_markers(&self, markers: Vec<MarkerData>) {
+    /// What the headset can do with markers. Sent to the server now and on every connection.
+    pub fn set_marker_capabilities(&self, capabilities: MarkerCapabilities) {
+        dbg_client_core!("set_marker_capabilities");
+
+        *self.connection_context.marker_capabilities.lock() = Some(capabilities);
+        if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
+            sender
+                .send(&ClientControlPacket::MarkerCapabilities(capabilities))
+                .ok();
+        }
+    }
+
+    /// The markers the tracker of `config` currently sees, replacing its previous list.
+    /// `timestamp` is the time the poses are for, on the clock of the tracking's `poll_timestamp`.
+    pub fn send_markers(
+        &self,
+        config: MarkerTrackingConfig,
+        timestamp: Duration,
+        markers: Vec<MarkerData>,
+    ) {
         dbg_client_core!("send_markers");
 
         if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
-            sender.send(&ClientControlPacket::Markers(markers)).ok();
+            sender
+                .send(&ClientControlPacket::Markers {
+                    config,
+                    timestamp,
+                    markers,
+                })
+                .ok();
         }
     }
 

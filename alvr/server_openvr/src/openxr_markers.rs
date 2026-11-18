@@ -2,23 +2,46 @@
 //!
 //! SteamVR's OpenXR runtime knows nothing about markers, so ALVR ships an OpenXR API layer
 //! (alvr/openxr_layer) that implements XR_EXT_spatial_marker_tracking inside each application.
-//! The driver sends the markers the headset sees to it through a named pipe, and registers the
-//! layer with the OpenXR loader when SteamVR starts.
+//! The driver exchanges markers and the applications' tracker configurations with it through a
+//! named pipe, and registers the layer with the OpenXR loader when SteamVR starts.
+//!
+//! Marker times are converted from the headset's clock to the PC's performance counter, the clock
+//! OpenXR times convert to, the way the head pose is: the head pose submitted to SteamVR now is
+//! the one for the headset time `poll_timestamp + motion-to-photon latency`.
 
-use alvr_common::{debug, info, parking_lot::Mutex, warn};
+use alvr_common::{info, parking_lot::Mutex, warn};
 use alvr_filesystem as afs;
-use alvr_marker_ipc::{FLAG_CLIENT_CONNECTED, Pose, Server};
-use alvr_packets::MarkerData;
+use alvr_marker_ipc::{
+    Capabilities, FLAG_CLIENT_CONNECTED, Marker, Pose, Server, Stream, TrackingConfig, now_ns,
+};
+use alvr_packets::{MarkerCapabilities, MarkerTrackingConfig};
+use alvr_server_core::MarkerStream;
+use std::time::Duration;
+
+/// Weight of each new sample of the clock offset. Smooths network jitter over about a second.
+const CLOCK_OFFSET_SMOOTHING: f64 = 0.02;
 
 struct State {
     server: Server,
     client_connected: bool,
-    markers: Vec<MarkerData>,
+    /// Of the headset connected last.
+    capabilities: Capabilities,
+    streams: Vec<MarkerStream>,
+    /// Performance counter time minus headset time, in nanoseconds.
+    clock_offset_ns: Option<f64>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+/// What OpenXR applications ask for, kept for a server context created after they asked.
+static REQUESTED: Mutex<Vec<MarkerTrackingConfig>> = Mutex::new(Vec::new());
 
-pub fn start(layout: &afs::Layout, enabled: bool) {
+/// `on_requests` gets the tracker configurations OpenXR applications ask for, whenever they
+/// change.
+pub fn start(
+    layout: &afs::Layout,
+    enabled: bool,
+    on_requests: impl Fn(Vec<MarkerTrackingConfig>) + Send + Sync + 'static,
+) {
     #[cfg(windows)]
     registration::register(layout, enabled);
     #[cfg(not(windows))]
@@ -28,7 +51,12 @@ pub fn start(layout: &afs::Layout, enabled: bool) {
         return;
     }
 
-    let server = match Server::start() {
+    let server = match Server::start(move |configs| {
+        info!("OpenXR applications ask for marker trackers {configs:?}");
+        let configs = configs.into_iter().map(from_ipc_config).collect::<Vec<_>>();
+        *REQUESTED.lock() = configs.clone();
+        on_requests(configs);
+    }) {
         Ok(server) => server,
         Err(e) => {
             warn!("OpenXR applications will not get markers: {e}");
@@ -39,8 +67,15 @@ pub fn start(layout: &afs::Layout, enabled: bool) {
     *STATE.lock() = Some(State {
         server,
         client_connected: false,
-        markers: Vec::new(),
+        capabilities: Capabilities::default(),
+        streams: Vec::new(),
+        clock_offset_ns: None,
     });
+}
+
+/// The tracker configurations OpenXR applications ask for.
+pub fn requested_configs() -> Vec<MarkerTrackingConfig> {
+    REQUESTED.lock().clone()
 }
 
 /// Joins the server's threads, so that the driver can be unloaded.
@@ -51,15 +86,56 @@ pub fn stop() {
 pub fn set_client_connected(connected: bool) {
     if let Some(state) = &mut *STATE.lock() {
         state.client_connected = connected;
+        if !connected {
+            state.streams.clear();
+            state.clock_offset_ns = None;
+        }
         publish(state);
     }
 }
 
-/// `markers` are recentered: in the space the headset pose is submitted to SteamVR in.
-pub fn set_markers(markers: Vec<MarkerData>) {
+pub fn set_capabilities(capabilities: MarkerCapabilities) {
     if let Some(state) = &mut *STATE.lock() {
-        state.markers = markers;
+        state.capabilities = Capabilities {
+            qr_codes: capabilities.qr_codes,
+            fixed_size_markers: capabilities.fixed_size_markers,
+            static_markers: capabilities.static_markers,
+        };
         publish(state);
+    }
+}
+
+/// The head pose being submitted to SteamVR now is for `headset_time`.
+pub fn report_head_pose_time(headset_time: Duration) {
+    if let Some(state) = &mut *STATE.lock() {
+        let offset = (now_ns() as i128 - headset_time.as_nanos() as i128) as f64;
+        state.clock_offset_ns = Some(match state.clock_offset_ns {
+            Some(smoothed) => smoothed + (offset - smoothed) * CLOCK_OFFSET_SMOOTHING,
+            None => offset,
+        });
+    }
+}
+
+/// Every tracker of the headset, with poses recentered: in the space the headset pose is
+/// submitted to SteamVR in.
+pub fn set_markers(streams: Vec<MarkerStream>) {
+    if let Some(state) = &mut *STATE.lock() {
+        state.streams = streams;
+        publish(state);
+    }
+}
+
+fn from_ipc_config(config: TrackingConfig) -> MarkerTrackingConfig {
+    MarkerTrackingConfig {
+        static_markers: config.static_markers,
+        marker_size: config.marker_size,
+    }
+}
+
+fn to_ipc_config(config: MarkerTrackingConfig) -> TrackingConfig {
+    TrackingConfig {
+        static_markers: config.static_markers,
+        marker_size: config.marker_size,
     }
 }
 
@@ -70,20 +146,34 @@ fn publish(state: &mut State) {
         0
     };
 
-    state.server.publish(
-        flags,
-        state.markers.iter().map(|marker| {
-            (
-                marker.id.as_str(),
-                Pose {
-                    orientation: marker.pose.orientation.to_array(),
-                    position: marker.pose.position.to_array(),
-                },
-                marker.size,
-            )
-        }),
-    );
-    debug!("Published {} marker(s) to OpenXR", state.markers.len());
+    let streams = state
+        .streams
+        .iter()
+        .map(|stream| Stream {
+            config: to_ipc_config(stream.config),
+            time_ns: match state.clock_offset_ns {
+                Some(offset) => (stream.timestamp.as_nanos() as f64 + offset) as i64,
+                // No tracking yet to tell the clocks apart
+                None => now_ns(),
+            },
+            markers: stream
+                .markers
+                .iter()
+                .map(|marker| {
+                    Marker::new(
+                        &marker.id,
+                        Pose {
+                            orientation: marker.pose.orientation.to_array(),
+                            position: marker.pose.position.to_array(),
+                        },
+                        marker.size,
+                    )
+                })
+                .collect(),
+        })
+        .collect();
+
+    state.server.publish(flags, state.capabilities, streams);
 }
 
 #[cfg(windows)]
