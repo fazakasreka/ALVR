@@ -11,7 +11,7 @@ license.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-alvr_marker_shm = { path = "../marker_shm" }
+alvr_marker_ipc = { path = "../marker_ipc" }
 openxr-sys = "0.13"
 
 [target.'cfg(windows)'.dependencies]

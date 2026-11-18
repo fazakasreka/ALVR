@@ -1,24 +1,17 @@
-//! Prints the markers the ALVR driver currently publishes to OpenXR applications.
+//! Prints the markers the ALVR driver currently sends to OpenXR applications.
 //!
-//! `cargo run -p alvr_marker_shm --example dump_markers [-- --watch]`
+//! `cargo run -p alvr_marker_ipc --example dump_markers [-- --watch]`
 
-use alvr_marker_shm::{FLAG_CLIENT_CONNECTED, Reader};
+use alvr_marker_ipc::{Client, FLAG_CLIENT_CONNECTED};
 use std::{process::ExitCode, thread, time::Duration};
 
 fn main() -> ExitCode {
     let watch = std::env::args().any(|arg| arg == "--watch");
 
-    let reader = match Reader::open() {
-        Ok(reader) => reader,
-        Err(e) => {
-            println!("No marker memory (is SteamVR running with the ALVR driver?): {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
+    let mut client = Client::new();
     let mut last_generation = None;
     loop {
-        match reader.read() {
+        match client.read() {
             Some(snapshot) if last_generation != Some(snapshot.generation) => {
                 last_generation = Some(snapshot.generation);
                 println!(
@@ -44,7 +37,11 @@ fn main() -> ExitCode {
             }
             Some(_) => (),
             None => {
-                println!("The driver is not running");
+                if last_generation.take().is_some() || !watch {
+                    println!(
+                        "The driver is not running (is SteamVR running with the ALVR driver?)"
+                    );
+                }
                 if !watch {
                     return ExitCode::FAILURE;
                 }

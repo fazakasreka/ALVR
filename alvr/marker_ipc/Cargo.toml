@@ -1,5 +1,5 @@
 [package]
-name = "alvr_marker_shm"
+name = "alvr_marker_ipc"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,13 +11,10 @@ license.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
-    "Wdk_Foundation",
-    "Wdk_System_Memory",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
-    "Win32_System_Memory",
-    "Win32_System_RemoteDesktop",
-    "Win32_System_SystemInformation",
-    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
 ] }

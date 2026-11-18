@@ -2,23 +2,21 @@
 //!
 //! SteamVR's OpenXR runtime knows nothing about markers, so ALVR ships an OpenXR API layer
 //! (alvr/openxr_layer) that implements XR_EXT_spatial_marker_tracking inside each application.
-//! The driver publishes the markers the headset sees to shared memory for it, and registers the
+//! The driver sends the markers the headset sees to it through a named pipe, and registers the
 //! layer with the OpenXR loader when SteamVR starts.
 
 use alvr_common::{debug, info, parking_lot::Mutex, warn};
 use alvr_filesystem as afs;
-use alvr_marker_shm::{FLAG_CLIENT_CONNECTED, HEARTBEAT_INTERVAL, Pose, Writer};
+use alvr_marker_ipc::{FLAG_CLIENT_CONNECTED, Pose, Server};
 use alvr_packets::MarkerData;
-use std::{sync::Arc, thread};
 
 struct State {
-    writer: Arc<Writer>,
+    server: Server,
     client_connected: bool,
     markers: Vec<MarkerData>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
-static HEARTBEAT_THREAD: Mutex<Option<thread::JoinHandle<()>>> = Mutex::new(None);
 
 pub fn start(layout: &afs::Layout, enabled: bool) {
     #[cfg(windows)]
@@ -30,8 +28,8 @@ pub fn start(layout: &afs::Layout, enabled: bool) {
         return;
     }
 
-    let writer = match Writer::create() {
-        Ok(writer) => Arc::new(writer),
+    let server = match Server::start() {
+        Ok(server) => server,
         Err(e) => {
             warn!("OpenXR applications will not get markers: {e}");
             return;
@@ -39,26 +37,15 @@ pub fn start(layout: &afs::Layout, enabled: bool) {
     };
 
     *STATE.lock() = Some(State {
-        writer: Arc::clone(&writer),
+        server,
         client_connected: false,
         markers: Vec::new(),
     });
-
-    *HEARTBEAT_THREAD.lock() = Some(thread::spawn(move || {
-        // Runs until stop() drops the other reference
-        while Arc::strong_count(&writer) > 1 {
-            writer.heartbeat();
-            thread::sleep(HEARTBEAT_INTERVAL);
-        }
-        // Dropping the writer tells readers it is gone
-    }));
 }
 
+/// Joins the server's threads, so that the driver can be unloaded.
 pub fn stop() {
     STATE.lock().take();
-    if let Some(thread) = HEARTBEAT_THREAD.lock().take() {
-        thread.join().ok();
-    }
 }
 
 pub fn set_client_connected(connected: bool) {
@@ -76,14 +63,14 @@ pub fn set_markers(markers: Vec<MarkerData>) {
     }
 }
 
-fn publish(state: &State) {
+fn publish(state: &mut State) {
     let flags = if state.client_connected {
         FLAG_CLIENT_CONNECTED
     } else {
         0
     };
 
-    state.writer.publish(
+    state.server.publish(
         flags,
         state.markers.iter().map(|marker| {
             (

@@ -10,16 +10,18 @@ of the runtime:
 
 ```text
 headset ── QR codes (ClientControlPacket::Markers) ──▶ ALVR driver in vrserver.exe
-                                                            │ shared memory (alvr_marker_shm)
+                                                            │ named pipe (alvr_marker_ipc)
 app ─▶ OpenXR loader ─▶ this layer ─▶ SteamVR OpenXR runtime
 ```
 
-- **The driver owns the markers.** It recenters them like the headset pose and publishes them, with
-  a heartbeat, to the named shared memory `Local\ALVR_Markers` (see `alvr/marker_shm`). Poses are in
-  the space the driver submits the headset pose in, which SteamVR's OpenXR runtime calls `STAGE`
-  (the driver keeps the standing zero pose at identity).
-- **The layer is thin.** It reads that memory (one seqlock-guarded copy, no system call) and maps it
-  onto the extensions, locating its own `STAGE` space in the application's base space.
+- **The driver owns the markers.** It recenters them like the headset pose and serves them on the
+  named pipe `\\.\pipe\ALVR_Markers` (see `alvr/marker_ipc`): each connected layer gets the
+  complete current state when it connects and whenever it changes. Poses are in the space the
+  driver submits the headset pose in, which SteamVR's OpenXR runtime calls `STAGE` (the driver keeps
+  the standing zero pose at identity).
+- **The layer is thin.** It reads whatever has arrived when the application asks for markers, without
+  waiting, and maps the latest state onto the extensions, locating its own `STAGE` space in the
+  application's base space. A broken pipe means the driver is gone.
 
 ## What is implemented
 
@@ -50,14 +52,13 @@ and **Headset → OpenXR marker tracking** in the dashboard writes `1` (disabled
 
 Packaged (AppContainer) applications, such as UWP apps, read neither that key nor the streamer folder
 by default, so the driver grants `ALL APPLICATION PACKAGES` read access to the key and to the
-`openxr_layer` folder. The shared memory grants them read access too, and the layer opens it through
-the session's namespace when `Local\` points to the container's own namespace.
+`openxr_layer` folder. The pipe grants them read access too; the layer only reads from it.
 
 Setting `DISABLE_XR_APILAYER_ALVR_MARKER_TRACKING` (any value) turns the layer off for one process.
 
 ## Debugging
 
-- `cargo run -p alvr_marker_shm --example dump_markers -- --watch` prints what the driver publishes.
+- `cargo run -p alvr_marker_ipc --example dump_markers -- --watch` prints what the driver sends.
 - `cargo run -p alvr_openxr_layer --example marker_probe --release -- 15` runs a minimal OpenXR
   application (D3D11, empty frames) on SteamVR and prints the codes it gets, relative to the head
   and to `STAGE`. The headset shows black while it runs.
@@ -69,7 +70,7 @@ Setting `DISABLE_XR_APILAYER_ALVR_MARKER_TRACKING` (any value) turns the layer o
 
 ## Limitations
 
-- Windows only; the shared memory has no Linux implementation yet.
+- Windows only; the pipe has no Linux implementation yet.
 - 64-bit applications only.
 - Applications cannot ask for marker types or dictionaries: there is no channel from the layer back
   to the headset yet, and the headset only detects QR codes.

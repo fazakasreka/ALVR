@@ -413,7 +413,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "alvr_marker_shm"
+name = "alvr_marker_ipc"
 version = "21.0.0-dev12"
 dependencies = [
  "windows-sys 0.61.2",
@@ -423,7 +423,7 @@ dependencies = [
 name = "alvr_openxr_layer"
 version = "21.0.0-dev12"
 dependencies = [
- "alvr_marker_shm",
+ "alvr_marker_ipc",
  "openxr",
  "openxr-sys",
  "windows 0.62.2",
@@ -490,7 +490,7 @@ version = "21.0.0-dev12"
 dependencies = [
  "alvr_common",
  "alvr_filesystem",
- "alvr_marker_shm",
+ "alvr_marker_ipc",
  "alvr_packets",
  "alvr_server_core",
  "alvr_server_io",

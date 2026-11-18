@@ -8,7 +8,7 @@
 //! ```text
 //! app → OpenXR loader → this layer → SteamVR OpenXR runtime → vrserver ← ALVR driver
 //!                           ↑                                                │
-//!                           └────────── shared memory (alvr_marker_shm) ─────┘
+//!                           └──────────── named pipe (alvr_marker_ipc) ──────┘
 //! ```
 //!
 //! The ALVR driver owns the markers: it receives them from the headset and publishes their poses
@@ -24,7 +24,7 @@ mod spatial;
 #[cfg(test)]
 mod tests;
 
-use alvr_marker_shm::Reader;
+use alvr_marker_ipc::{Client, Snapshot};
 use log::log;
 use openxr_sys::{self as xr, Handle, loader, pfn};
 use std::{
@@ -32,7 +32,6 @@ use std::{
     ffi::{CStr, c_char},
     mem, ptr, slice,
     sync::{LazyLock, Mutex, MutexGuard},
-    time::{Duration, Instant},
 };
 
 const LAYER_NAME: &CStr = c"XR_APILAYER_ALVR_marker_tracking";
@@ -40,9 +39,6 @@ const LAYER_NAME: &CStr = c"XR_APILAYER_ALVR_marker_tracking";
 const SPATIAL_EXTENSIONS: [&CStr; 2] =
     [c"XR_EXT_spatial_entity", c"XR_EXT_spatial_marker_tracking"];
 const FUTURE_EXTENSION: &CStr = c"XR_EXT_future";
-
-/// How often the layer looks for the driver's shared memory while it is missing.
-const SHARED_MEMORY_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 macro_rules! void_fn {
     ($f:expr, $ty:ty) => {
@@ -107,41 +103,49 @@ struct InstanceData {
     provides_future: bool,
 }
 
-/// The markers published by the ALVR driver.
-#[derive(Default)]
+/// The markers sent by the ALVR driver.
 struct Markers {
-    reader: Option<Reader>,
-    last_open_attempt: Option<Instant>,
+    client: Client,
+    was_connected: bool,
+}
+
+impl Default for Markers {
+    fn default() -> Self {
+        Self {
+            client: Client::new_named(&pipe_name()),
+            was_connected: false,
+        }
+    }
 }
 
 impl Markers {
     /// `None` while the driver is not running.
-    fn read(&mut self) -> Option<alvr_marker_shm::Snapshot> {
-        if self.reader.is_none()
-            && self
-                .last_open_attempt
-                .is_none_or(|last| last.elapsed() >= SHARED_MEMORY_RETRY_INTERVAL)
-        {
-            self.last_open_attempt = Some(Instant::now());
-            match Reader::open_named(&shared_memory_name()) {
-                Ok(reader) => {
-                    log!("Connected to the ALVR driver");
-                    self.reader = Some(reader);
+    fn read(&mut self) -> Option<Snapshot> {
+        let snapshot = self.client.read();
+
+        let is_connected = self.client.is_connected();
+        if is_connected != self.was_connected {
+            self.was_connected = is_connected;
+            log!(
+                "{}",
+                if is_connected {
+                    "Connected to the ALVR driver"
+                } else {
+                    "Disconnected from the ALVR driver"
                 }
-                Err(e) => log!("The ALVR driver is not running ({e})"),
-            }
+            );
         }
 
-        self.reader.as_ref()?.read()
+        snapshot
     }
 }
 
 #[cfg(not(test))]
-fn shared_memory_name() -> String {
-    alvr_marker_shm::SHARED_MEMORY_NAME.to_owned()
+fn pipe_name() -> String {
+    alvr_marker_ipc::PIPE_NAME.to_owned()
 }
 #[cfg(test)]
-use tests::shared_memory_name;
+use tests::pipe_name;
 
 #[derive(Default)]
 struct State {

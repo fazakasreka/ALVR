@@ -2,15 +2,17 @@
 //! runtime that, like SteamVR, implements none of the extensions.
 
 use crate::{LAYER_NAME, xrNegotiateLoaderApiLayerInterface};
-use alvr_marker_shm::{FLAG_CLIENT_CONNECTED, Pose, Writer};
+use alvr_marker_ipc::{FLAG_CLIENT_CONNECTED, Pose, Server};
 use openxr_sys::{self as xr, Handle, loader, pfn};
 use std::{
     ffi::{CStr, c_char},
     mem, ptr,
     sync::{Mutex, MutexGuard},
+    thread,
+    time::{Duration, Instant},
 };
 
-pub fn shared_memory_name() -> String {
+pub fn pipe_name() -> String {
     format!("ALVR_Markers_layer_test_{}", std::process::id())
 }
 
@@ -248,6 +250,22 @@ fn pose(x: f32, y: f32, z: f32) -> Pose {
     Pose {
         orientation: [0.0, 0.0, 0.0, 1.0],
         position: [x, y, z],
+    }
+}
+
+/// Sends markers, as the driver does, and waits until the layer has them.
+fn publish(server: &mut Server, markers: &[(&str, Pose, f32)]) {
+    server.publish(FLAG_CLIENT_CONNECTED, markers.iter().copied());
+
+    let generation = server.generation();
+    let start = Instant::now();
+    while crate::state()
+        .markers
+        .read()
+        .is_none_or(|snapshot| snapshot.generation != generation)
+    {
+        assert!(start.elapsed() < Duration::from_secs(5));
+        thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -540,7 +558,7 @@ fn close(a: xr::Vector3f, b: [f32; 3]) -> bool {
 #[test]
 fn markers_reach_the_application() {
     let _serial = serial();
-    let writer = Writer::create_named(&shared_memory_name()).unwrap();
+    let mut writer = Server::start_named(&pipe_name()).unwrap();
     writer.publish(
         FLAG_CLIENT_CONNECTED,
         [
@@ -653,7 +671,7 @@ fn markers_reach_the_application() {
     entities.sort_by_key(|entity| entity.2.center.position.x as i32);
     assert_eq!(entities.len(), 2);
     let (cat, dog) = (entities[0], entities[1]);
-    assert_eq!(dog.0, alvr_marker_shm::marker_id("dog"));
+    assert_eq!(dog.0, alvr_marker_ipc::marker_id("dog"));
     assert_eq!(dog.1, xr::SpatialEntityTrackingStateEXT::TRACKING);
     // In the application's space, the stage is 1.5 m lower
     assert!(close(dog.2.center.position, [1.0, -1.5, -2.0]));
@@ -750,9 +768,9 @@ fn markers_reach_the_application() {
     };
 
     // The dog moves
-    writer.publish(
-        FLAG_CLIENT_CONNECTED,
-        [
+    publish(
+        &mut writer,
+        &[
             ("dog", pose(2.0, 0.0, -2.0), 0.2),
             ("cat", pose(-1.0, 1.0, -3.0), 0.1),
         ],
@@ -765,7 +783,7 @@ fn markers_reach_the_application() {
     assert_eq!(app.poll_event(), None);
 
     // The headset loses sight of it
-    writer.publish(FLAG_CLIENT_CONNECTED, [("cat", pose(-1.0, 1.0, -3.0), 0.1)]);
+    publish(&mut writer, &[("cat", pose(-1.0, 1.0, -3.0), 0.1)]);
     let updated = app.query(update_snapshot(entity));
     assert_eq!(updated[0].1, xr::SpatialEntityTrackingStateEXT::PAUSED);
     assert_eq!(app.poll_event(), Some(context));

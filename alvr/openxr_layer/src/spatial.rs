@@ -6,7 +6,7 @@
 //! Asynchronous operations complete immediately: their futures are ready as soon as they exist.
 
 use crate::{Downstream, State, log, math, state, void_fn};
-use alvr_marker_shm::Snapshot as Markers;
+use alvr_marker_ipc::Snapshot as Markers;
 use openxr_sys::{self as xr, Handle, pfn};
 use std::{
     collections::HashSet,
@@ -314,7 +314,7 @@ impl State {
 
     fn snapshot_entity(
         context: &ContextData,
-        marker: &alvr_marker_shm::Marker,
+        marker: &alvr_marker_ipc::Marker,
         stage: Option<xr::Posef>,
     ) -> SnapshotEntity {
         let Some(stage) = stage else {

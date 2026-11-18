@@ -15,7 +15,7 @@ gpl = [] # Enable for FFmpeg support on Windows. Always enabled on Linux
 [dependencies]
 alvr_common.workspace = true
 alvr_filesystem.workspace = true
-alvr_marker_shm = { path = "../marker_shm" }
+alvr_marker_ipc = { path = "../marker_ipc" }
 alvr_packets.workspace = true
 alvr_server_core.workspace = true
 alvr_server_io.workspace = true
