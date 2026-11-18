@@ -344,6 +344,7 @@ pub fn entry_point() {
             preferred_encoding_gamma: 1.0,
             prefer_hdr: false,
             audio: true,
+            alpha_stream: true,
         };
         let core_context = Arc::new(ClientCoreContext::new(capabilities));
 

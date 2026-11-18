@@ -77,6 +77,9 @@ pub struct ClientCapabilities {
     pub preferred_encoding_gamma: f32,
     pub prefer_hdr: bool,
     pub audio: bool,
+    /// Whether the client can decode the companion monochrome alpha stream of the 8 bit alpha
+    /// passthrough mode. Requires a second decoder instance.
+    pub alpha_stream: bool,
 }
 
 pub struct ClientCoreContext {

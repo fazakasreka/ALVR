@@ -17,7 +17,9 @@ use alvr_graphics::{
     GraphicsContext, HandData, LobbyRenderer, LobbyViewParams, SDR_FORMAT_GL, StreamRenderer,
     StreamViewParams,
 };
-use alvr_packets::{ButtonEntry, ButtonValue, FaceData, TrackingData};
+use alvr_packets::{
+    ButtonEntry, ButtonValue, FaceData, FaceExpressions, MarkerData, TrackingData, VideoStreamKind,
+};
 use alvr_session::{
     CodecType, FoveatedEncodingConfig, MediacodecPropType, MediacodecProperty, UpscalingConfig,
 };
@@ -35,6 +37,9 @@ static HUD_MESSAGE: Mutex<String> = Mutex::new(String::new());
 static SETTINGS: Mutex<String> = Mutex::new(String::new());
 static SERVER_VERSION: Mutex<String> = Mutex::new(String::new());
 static DECODER_CONFIG_BUFFER: Mutex<Vec<u8>> = Mutex::new(vec![]);
+/// Kept separate from the color buffer: both configs are emitted back to back at stream start, so
+/// a shared buffer would let the second overwrite the first before the client reads it.
+static ALPHA_DECODER_CONFIG_BUFFER: Mutex<Vec<u8>> = Mutex::new(vec![]);
 
 // Core interface:
 
@@ -53,6 +58,17 @@ pub struct AlvrClientCapabilities {
     prefer_10bit: bool,
     preferred_encoding_gamma: f32,
     prefer_hdr: bool,
+    /// Whether the client can decode the companion monochrome alpha stream. The server only
+    /// creates that stream when this is set and its passthrough mode asks for it.
+    alpha_stream: bool,
+}
+
+/// Identifies which of the two video streams a decoder config belongs to.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AlvrVideoStreamKind {
+    Color = 0,
+    Alpha = 1,
 }
 
 #[repr(u8)]
@@ -76,6 +92,7 @@ pub enum AlvrEvent {
     /// Note: All subsequent DecoderConfig events should be ignored until reconnection
     DecoderConfig {
         codec: AlvrCodecType,
+        stream: AlvrVideoStreamKind,
     },
     // Unimplemented
     RealTimeConfig {},
@@ -96,6 +113,13 @@ pub struct AlvrDeviceMotion {
     pose: AlvrPose,
     linear_velocity: [f32; 3],
     angular_velocity: [f32; 3],
+}
+
+#[repr(C)]
+pub struct AlvrMarker {
+    id: *const c_char, // QR code text
+    pose: AlvrPose,    // Centre of the marker; +Y towards its top edge, +Z out of its face
+    size: f32,         // Edge length in metres
 }
 
 #[allow(dead_code)]
@@ -225,6 +249,7 @@ pub extern "C" fn alvr_initialize(capabilities: AlvrClientCapabilities) {
         preferred_encoding_gamma: capabilities.preferred_encoding_gamma,
         prefer_hdr: capabilities.prefer_hdr,
         audio: true,
+        alpha_stream: capabilities.alpha_stream,
     };
     *CLIENT_CORE_CONTEXT.lock() = Some(ClientCoreContext::new(capabilities));
 }
@@ -292,11 +317,25 @@ pub extern "C" fn alvr_poll_event(out_event: *mut AlvrEvent) -> bool {
                 frequency,
                 amplitude,
             },
-            // The C API has no alpha stream support, so only the color config is surfaced.
             ClientCoreEvent::DecoderConfig {
-                codec, config_nal, ..
+                codec,
+                config_nal,
+                stream,
             } => {
-                *DECODER_CONFIG_BUFFER.lock() = config_nal;
+                // Stashed here and fetched by the client with alvr_get_decoder_config or
+                // alvr_get_alpha_decoder_config, according to the stream kind reported below.
+                let stream = match stream {
+                    VideoStreamKind::Color => {
+                        *DECODER_CONFIG_BUFFER.lock() = config_nal;
+
+                        AlvrVideoStreamKind::Color
+                    }
+                    VideoStreamKind::Alpha => {
+                        *ALPHA_DECODER_CONFIG_BUFFER.lock() = config_nal;
+
+                        AlvrVideoStreamKind::Alpha
+                    }
+                };
 
                 AlvrEvent::DecoderConfig {
                     codec: match codec {
@@ -304,6 +343,7 @@ pub extern "C" fn alvr_poll_event(out_event: *mut AlvrEvent) -> bool {
                         CodecType::Hevc => AlvrCodecType::Hevc,
                         CodecType::AV1 => AlvrCodecType::AV1,
                     },
+                    stream,
                 }
             }
             ClientCoreEvent::RealTimeConfig(_) => AlvrEvent::RealTimeConfig {},
@@ -360,6 +400,21 @@ pub extern "C" fn alvr_get_decoder_config(out_buffer: *mut c_char) -> u64 {
     size as u64
 }
 
+/// Returns the number of bytes of the config buffer of the companion alpha stream. Only non-empty
+/// after a DecoderConfig event with stream == ALVR_VIDEO_STREAM_KIND_ALPHA.
+#[unsafe(no_mangle)]
+pub extern "C" fn alvr_get_alpha_decoder_config(out_buffer: *mut c_char) -> u64 {
+    let buffer = ALPHA_DECODER_CONFIG_BUFFER.lock();
+
+    let size = buffer.len();
+
+    if !out_buffer.is_null() {
+        unsafe { ptr::copy_nonoverlapping(buffer.as_ptr(), out_buffer.cast(), size) }
+    }
+
+    size as u64
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn alvr_send_battery(device_id: u64, gauge_value: f32, is_plugged: bool) {
     if let Some(context) = &*CLIENT_CORE_CONTEXT.lock() {
@@ -371,6 +426,31 @@ pub extern "C" fn alvr_send_battery(device_id: u64, gauge_value: f32, is_plugged
 pub extern "C" fn alvr_send_playspace(width: f32, height: f32) {
     if let Some(context) = &*CLIENT_CORE_CONTEXT.lock() {
         context.send_playspace(Some(Vec2::new(width, height)));
+    }
+}
+
+/// All markers currently seen, in the same space as the tracking, replacing the previous list.
+#[unsafe(no_mangle)]
+pub extern "C" fn alvr_send_markers(markers: *const AlvrMarker, markers_count: u64) {
+    let markers = if !markers.is_null() {
+        unsafe { slice::from_raw_parts(markers, markers_count as usize) }
+    } else {
+        &[]
+    };
+
+    let markers = markers
+        .iter()
+        .map(|marker| MarkerData {
+            id: unsafe { CStr::from_ptr(marker.id) }
+                .to_string_lossy()
+                .into_owned(),
+            pose: alvr_common::from_capi_pose(&marker.pose),
+            size: marker.size,
+        })
+        .collect();
+
+    if let Some(context) = &*CLIENT_CORE_CONTEXT.lock() {
+        context.send_markers(markers);
     }
 }
 
@@ -423,6 +503,61 @@ pub extern "C" fn alvr_send_view_params(view_params: *const AlvrViewParams) {
     }
 }
 
+/// # Safety
+/// `ptr` must point to `count` valid AlvrDeviceMotion values.
+unsafe fn device_motions_from_capi(
+    ptr: *const AlvrDeviceMotion,
+    count: u64,
+) -> Vec<(u64, DeviceMotion)> {
+    let mut raw_motions = vec![AlvrDeviceMotion::default(); count as _];
+    unsafe {
+        ptr::copy_nonoverlapping(ptr, raw_motions.as_mut_ptr(), count as usize);
+    }
+
+    raw_motions
+        .into_iter()
+        .map(|motion| {
+            (
+                motion.device_id,
+                DeviceMotion {
+                    pose: alvr_common::from_capi_pose(&motion.pose),
+                    linear_velocity: Vec3::from_slice(&motion.linear_velocity),
+                    angular_velocity: Vec3::from_slice(&motion.angular_velocity),
+                },
+            )
+        })
+        .collect()
+}
+
+/// # Safety
+/// `ptr` must be null or point to 2 pointers, each null or pointing to 26 valid AlvrPose values.
+unsafe fn hand_skeletons_from_capi(ptr: *const *const AlvrPose) -> [Option<[Pose; 26]>; 2] {
+    if ptr.is_null() {
+        return [None, None];
+    }
+
+    let hand_skeletons = unsafe { slice::from_raw_parts(ptr, 2) };
+
+    [0, 1].map(|idx| {
+        let hand_skeleton = hand_skeletons[idx];
+
+        (!hand_skeleton.is_null()).then(|| {
+            let hand_skeleton = unsafe { slice::from_raw_parts(hand_skeleton, 26) };
+
+            let mut array = [Pose::IDENTITY; 26];
+
+            for (pose, capi_pose) in array.iter_mut().zip(hand_skeleton.iter()) {
+                *pose = Pose {
+                    orientation: alvr_common::from_capi_quat(&capi_pose.orientation),
+                    position: Vec3::from_slice(&capi_pose.position),
+                };
+            }
+
+            array
+        })
+    })
+}
+
 /// hand_skeleton:
 /// * outer ptr: array of 2 (can be null);
 /// * inner ptr: array of 26 (can be null if hand is absent)
@@ -436,55 +571,8 @@ pub extern "C" fn alvr_send_tracking(
     hand_skeletons: *const *const AlvrPose,
     combined_eye_gaze: *const AlvrQuat,
 ) {
-    let mut raw_motions = vec![AlvrDeviceMotion::default(); device_motions_count as _];
-    unsafe {
-        ptr::copy_nonoverlapping(
-            device_motions,
-            raw_motions.as_mut_ptr(),
-            device_motions_count as usize,
-        );
-    }
-
-    let device_motions = raw_motions
-        .into_iter()
-        .map(|motion| {
-            (
-                motion.device_id,
-                DeviceMotion {
-                    pose: alvr_common::from_capi_pose(&motion.pose),
-                    linear_velocity: Vec3::from_slice(&motion.linear_velocity),
-                    angular_velocity: Vec3::from_slice(&motion.angular_velocity),
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-
-    let hand_skeletons = if !hand_skeletons.is_null() {
-        let hand_skeletons = unsafe { slice::from_raw_parts(hand_skeletons, 2) };
-        let hand_skeletons = hand_skeletons
-            .iter()
-            .map(|&hand_skeleton| {
-                (!hand_skeleton.is_null()).then(|| {
-                    let hand_skeleton = unsafe { slice::from_raw_parts(hand_skeleton, 26) };
-
-                    let mut array = [Pose::IDENTITY; 26];
-
-                    for (pose, capi_pose) in array.iter_mut().zip(hand_skeleton.iter()) {
-                        *pose = Pose {
-                            orientation: alvr_common::from_capi_quat(&capi_pose.orientation),
-                            position: Vec3::from_slice(&capi_pose.position),
-                        };
-                    }
-
-                    array
-                })
-            })
-            .collect::<Vec<_>>();
-
-        [hand_skeletons[0], hand_skeletons[1]]
-    } else {
-        [None, None]
-    };
+    let device_motions = unsafe { device_motions_from_capi(device_motions, device_motions_count) };
+    let hand_skeletons = unsafe { hand_skeletons_from_capi(hand_skeletons) };
 
     let eyes_combined = if !combined_eye_gaze.is_null() {
         Some(alvr_common::from_capi_quat(unsafe { &*combined_eye_gaze }))
@@ -506,6 +594,64 @@ pub extern "C" fn alvr_send_tracking(
     }
 }
 
+/// Same as `alvr_send_tracking`, but also carries per eye gaze and face expression weights. Used
+/// by the visionOS client, which has both and no OpenXR face tracking extensions to get them from.
+///
+/// hand_skeletons:
+/// * outer ptr: array of 2 (can be null);
+/// * inner ptr: array of 26 (can be null if the hand is absent)
+///
+/// eye_gazes:
+/// * outer ptr: array of 2 (can be null);
+/// * inner ptr: pose (can be null if the eye gaze is absent)
+///
+/// face_data: 70 Meta style expression weights, or null. Positions of the eye gaze poses are
+/// ignored: the protocol only carries orientations.
+#[unsafe(no_mangle)]
+pub extern "C" fn alvr_send_tracking_and_face_data(
+    poll_timestamp_ns: u64,
+    device_motions: *const AlvrDeviceMotion,
+    device_motions_count: u64,
+    hand_skeletons: *const *const AlvrPose,
+    eye_gazes: *const *const AlvrPose,
+    face_data: *const f32,
+) {
+    let device_motions = unsafe { device_motions_from_capi(device_motions, device_motions_count) };
+    let hand_skeletons = unsafe { hand_skeletons_from_capi(hand_skeletons) };
+
+    let eyes_social = if eye_gazes.is_null() {
+        [None, None]
+    } else {
+        let eye_gazes = unsafe { slice::from_raw_parts(eye_gazes, 2) };
+
+        [0, 1].map(|idx| {
+            (!eye_gazes[idx].is_null())
+                .then(|| alvr_common::from_capi_quat(unsafe { &(*eye_gazes[idx]).orientation }))
+        })
+    };
+
+    // visionOS derives both eye gazes from a single ARKit gaze ray, so either one is as good a
+    // combined gaze as the other. It is what drives foveated encoding on the server.
+    let eyes_combined = eyes_social[0].or(eyes_social[1]);
+
+    let face_expressions = (!face_data.is_null())
+        .then(|| FaceExpressions::Fb(unsafe { slice::from_raw_parts(face_data, 70) }.to_vec()));
+
+    if let Some(context) = &*CLIENT_CORE_CONTEXT.lock() {
+        context.send_tracking(TrackingData {
+            poll_timestamp: Duration::from_nanos(poll_timestamp_ns),
+            device_motions,
+            hand_skeletons,
+            face: FaceData {
+                eyes_combined,
+                eyes_social,
+                face_expressions,
+            },
+            body: None,
+        });
+    }
+}
+
 /// Safety: `context` must be thread safe and valid until the StreamingStopped event.
 #[unsafe(no_mangle)]
 pub extern "C" fn alvr_set_decoder_input_callback(
@@ -521,6 +667,37 @@ pub extern "C" fn alvr_set_decoder_input_callback(
         context.set_decoder_input_callback(Box::new(move |timestamp, buffer| {
             // Make sure to capture the struct itself instead of just the pointer to make the
             // borrow checker happy
+            let callback_context = &callback_context;
+
+            callback(AlvrVideoFrameData {
+                callback_context: callback_context.0,
+                timestamp_ns: timestamp.as_nanos() as u64,
+                buffer_ptr: buffer.as_ptr(),
+                buffer_size: buffer.len() as u64,
+            })
+        }));
+    }
+}
+
+/// Same as `alvr_set_decoder_input_callback`, for the companion monochrome alpha stream. Only ever
+/// called when the client advertised `alpha_stream` and the server negotiated it.
+///
+/// Setting this also requests an IDR: the alpha encoder is created after the color one and misses
+/// the keyframe emitted at stream start, and a decoder produces nothing until it sees one.
+///
+/// Safety: `context` must be thread safe and valid until the StreamingStopped event.
+#[unsafe(no_mangle)]
+pub extern "C" fn alvr_set_alpha_decoder_input_callback(
+    callback_context: *mut c_void,
+    callback: extern "C" fn(AlvrVideoFrameData) -> bool,
+) {
+    struct CallbackContext(*mut c_void);
+    unsafe impl Send for CallbackContext {}
+
+    let callback_context = CallbackContext(callback_context);
+
+    if let Some(context) = &*CLIENT_CORE_CONTEXT.lock() {
+        context.set_alpha_decoder_input_callback(Box::new(move |timestamp, buffer| {
             let callback_context = &callback_context;
 
             callback(AlvrVideoFrameData {

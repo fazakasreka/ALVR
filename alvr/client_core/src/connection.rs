@@ -219,9 +219,7 @@ fn connection_pipeline(
                         ext_str: String::new(),
                     }
                     .with_ext(VideoStreamingCapabilitiesExt {
-                        // The alpha stream needs a second decoder instance; MediaCodec supports
-                        // this on all currently targeted devices.
-                        alpha_stream: true,
+                        alpha_stream: capabilities.alpha_stream,
                     }),
                 ),
             },

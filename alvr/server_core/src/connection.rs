@@ -1476,9 +1476,11 @@ fn connection_pipeline(
 
     // This requests shutdown from threads
     *ctx.video_channel_sender.lock() = None;
+    *ctx.alpha_video_channel_sender.lock() = None;
     *ctx.haptics_sender.lock() = None;
 
     *ctx.video_recording_file.lock() = None;
+    *ctx.alpha_video_recording_file.lock() = None;
 
     session_manager_lock.update_client_connections(
         client_hostname,

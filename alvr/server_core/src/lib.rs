@@ -30,7 +30,9 @@ use alvr_packets::{
     MarkerData, VideoPacketHeader, VideoStreamKind,
 };
 use alvr_server_io::ServerSessionManager;
-use alvr_session::{CodecType, H264Profile, OpenvrProperty, Settings, SteamvrHmdInitConfig};
+use alvr_session::{
+    CodecType, H264Profile, OpenvrProperty, PassthroughMode, Settings, SteamvrHmdInitConfig,
+};
 use alvr_sockets::StreamSender;
 use bitrate::{BitrateManager, DynamicEncoderParams};
 use statistics::StatisticsManager;
@@ -115,6 +117,8 @@ pub struct ConnectionContext {
     alpha_decoder_config: Mutex<Option<DecoderInitializationConfig>>,
     video_mirror_sender: Mutex<Option<broadcast::Sender<Vec<u8>>>>,
     video_recording_file: Mutex<Option<File>>,
+    /// Alpha bitstream capture, kept separate because it is its own elementary stream.
+    alpha_video_recording_file: Mutex<Option<File>>,
     connection_threads: Mutex<Vec<JoinHandle<()>>>,
     clients_to_be_removed: Mutex<HashSet<String>>,
     video_channel_sender: Mutex<Option<SyncSender<VideoPacket>>>,
@@ -130,12 +134,10 @@ pub fn create_recording_file(connection_context: &ConnectionContext, settings: &
         CodecType::AV1 => "av1",
     };
 
-    let path = FILESYSTEM_LAYOUT.get().unwrap().log_dir.join(format!(
-        "recording.{}.{ext}",
-        chrono::Local::now().format("%F.%H-%M-%S")
-    ));
+    let log_dir = &FILESYSTEM_LAYOUT.get().unwrap().log_dir;
+    let stem = format!("recording.{}", chrono::Local::now().format("%F.%H-%M-%S"));
 
-    match File::create(path) {
+    match File::create(log_dir.join(format!("{stem}.{ext}"))) {
         Ok(mut file) => {
             if let Some(config) = &*connection_context.decoder_config.lock() {
                 file.write_all(&config.config_buffer).ok();
@@ -150,6 +152,25 @@ pub fn create_recording_file(connection_context: &ConnectionContext, settings: &
         }
         Err(e) => {
             error!("Failed to record video on disk: {e}");
+        }
+    }
+
+    // Separate file: the alpha plane is its own elementary stream and will not play interleaved.
+    if matches!(
+        settings.video.passthrough.as_option(),
+        Some(PassthroughMode::AlphaStream(_))
+    ) {
+        match File::create(log_dir.join(format!("{stem}.alpha.{ext}"))) {
+            Ok(mut file) => {
+                if let Some(config) = &*connection_context.alpha_decoder_config.lock() {
+                    file.write_all(&config.config_buffer).ok();
+                }
+
+                *connection_context.alpha_video_recording_file.lock() = Some(file);
+            }
+            Err(e) => {
+                error!("Failed to record the alpha stream on disk: {e}");
+            }
         }
     }
 }
@@ -235,6 +256,7 @@ impl ServerCoreContext {
             alpha_decoder_config: Mutex::new(None),
             video_mirror_sender: Mutex::new(None),
             video_recording_file: Mutex::new(None),
+            alpha_video_recording_file: Mutex::new(None),
             connection_threads: Mutex::new(Vec::new()),
             clients_to_be_removed: Mutex::new(HashSet::new()),
             video_channel_sender: Mutex::new(None),
@@ -388,10 +410,13 @@ impl ServerCoreContext {
         });
     }
 
-    /// Config NALs for the companion alpha stream. Deliberately not mirrored or recorded: the
-    /// capture files hold the color stream only.
+    /// Config NALs for the companion alpha stream. Not mirrored: the mirror carries color only.
     pub fn set_alpha_video_config_nals(&self, config_buffer: Vec<u8>, codec: CodecType) {
         dbg_server_core!("set_alpha_video_config_nals");
+
+        if let Some(file) = &mut *self.connection_context.alpha_video_recording_file.lock() {
+            file.write_all(&config_buffer).ok();
+        }
 
         *self.connection_context.alpha_decoder_config.lock() = Some(DecoderInitializationConfig {
             codec,
@@ -401,11 +426,15 @@ impl ServerCoreContext {
         });
     }
 
-    /// Alpha NALs bypass the statistics, mirror, recording and IDR corruption logic of the color
+    /// Alpha NALs bypass the statistics, mirror and IDR corruption logic of the color
     /// path: the color stream owns frame pacing and recovery, and duplicating that bookkeeping
     /// here would double count frames and fight over the shared IDR state.
     pub fn send_alpha_video_nal(&self, timestamp: Duration, is_idr: bool, nal_buffer: Vec<u8>) {
         dbg_server_core!("send_alpha_video_nal");
+
+        if let Some(file) = &mut *self.connection_context.alpha_video_recording_file.lock() {
+            file.write_all(&nal_buffer).ok();
+        }
 
         if let Some(sender) = &*self.connection_context.alpha_video_channel_sender.lock()
             && sender

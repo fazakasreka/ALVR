@@ -109,6 +109,10 @@ pub fn init_logging() {
     {
         use std::io::Write;
         env_logger::builder()
+            // env_logger defaults to Error when RUST_LOG is unset. The filter gates the format
+            // closure below, which is where send_log runs, so without this nothing below Error
+            // reaches stderr OR the streamer. Match the Android branch.
+            .filter_level(alvr_common::log::LevelFilter::Info)
             .format(|f, record| {
                 if send_log(record) {
                     writeln!(f, "{}", record.args())

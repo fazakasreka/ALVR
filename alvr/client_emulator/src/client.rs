@@ -487,6 +487,7 @@ impl EmulatedClient {
             preferred_encoding_gamma: 1.0,
             prefer_hdr: false,
             audio: false,
+            alpha_stream: true,
         };
 
         let context = Arc::new(ClientCoreContext::new(capabilities));

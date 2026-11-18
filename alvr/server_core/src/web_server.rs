@@ -202,6 +202,7 @@ async fn start_recording(State(ctx): State<Arc<ConnectionContext>>) {
 
 async fn stop_recording(State(ctx): State<Arc<ConnectionContext>>) {
     *ctx.video_recording_file.lock() = None;
+    *ctx.alpha_video_recording_file.lock() = None;
 }
 
 async fn add_firewall_rules() {
