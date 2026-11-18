@@ -19,7 +19,7 @@ impl Connection {
         Err(io::ErrorKind::Unsupported.into())
     }
 
-    pub fn read_available(&mut self, _buffer: &mut Vec<u8>) -> io::Result<()> {
-        Ok(())
+    pub fn read_available(&mut self, _max_len: usize) -> io::Result<Vec<Vec<u8>>> {
+        Ok(Vec::new())
     }
 }

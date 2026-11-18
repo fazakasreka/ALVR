@@ -52,7 +52,9 @@ and **Headset → OpenXR marker tracking** in the dashboard writes `1` (disabled
 
 Packaged (AppContainer) applications, such as UWP apps, read neither that key nor the streamer folder
 by default, so the driver grants `ALL APPLICATION PACKAGES` read access to the key and to the
-`openxr_layer` folder. The pipe grants them read access too; the layer only reads from it.
+`openxr_layer` folder. The pipe belongs to the user running SteamVR and is open only to their
+processes, including their AppContainers, which may only read from it. The layer only trusts a pipe
+created by its own user.
 
 Setting `DISABLE_XR_APILAYER_ALVR_MARKER_TRACKING` (any value) turns the layer off for one process.
 

@@ -3,10 +3,10 @@
 //! The driver, running inside vrserver.exe, serves a named pipe; the API layer, loaded into every
 //! OpenXR application, connects to it. Data only flows from the driver to the layer: when a layer
 //! connects, and whenever the markers change, the driver sends the complete current state, a
-//! [`Snapshot`], as one frame. The layer reads whatever has arrived when it needs markers and keeps
-//! the latest snapshot. A broken pipe means the driver is gone.
+//! [`Snapshot`], as one message. The layer reads whatever has arrived when it needs markers and
+//! keeps the latest snapshot. A broken pipe means the driver is gone.
 //!
-//! A frame is a little endian `u32` byte length followed by the encoded snapshot.
+//! The pipe is in message mode, so each message is exactly one encoded snapshot.
 //!
 //! Poses are in the space the driver submits the headset pose to SteamVR in, which is what
 //! SteamVR's OpenXR runtime calls the STAGE space.
@@ -36,8 +36,8 @@ const MAGIC: u32 = u32::from_le_bytes(*b"ALVM");
 pub const MAX_MARKERS: usize = 32;
 /// Longer marker texts are cut short at a character boundary.
 pub const MAX_TEXT_LEN: usize = 2048;
-/// Frames announcing more are treated as a broken connection.
-const MAX_FRAME_LEN: usize = 1024 * 1024;
+/// Longer messages are treated as a broken connection.
+const MAX_MESSAGE_LEN: usize = 1024 * 1024;
 
 /// How often a client tries to connect while the driver is not running.
 pub const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -96,33 +96,30 @@ fn truncate(text: &str) -> &str {
     &text[..end]
 }
 
-fn encode_frame(snapshot: &Snapshot) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend(MAGIC.to_le_bytes());
-    payload.extend(PROTOCOL_VERSION.to_le_bytes());
-    payload.extend(snapshot.flags.to_le_bytes());
-    payload.extend(snapshot.generation.to_le_bytes());
-    payload.extend((snapshot.markers.len() as u32).to_le_bytes());
+fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
+    let mut message = Vec::new();
+    message.extend(MAGIC.to_le_bytes());
+    message.extend(PROTOCOL_VERSION.to_le_bytes());
+    message.extend(snapshot.flags.to_le_bytes());
+    message.extend(snapshot.generation.to_le_bytes());
+    message.extend((snapshot.markers.len() as u32).to_le_bytes());
     for marker in &snapshot.markers {
-        payload.extend(marker.id.to_le_bytes());
+        message.extend(marker.id.to_le_bytes());
         for value in marker.pose.orientation.iter().chain(&marker.pose.position) {
-            payload.extend(value.to_le_bytes());
+            message.extend(value.to_le_bytes());
         }
-        payload.extend(marker.size.to_le_bytes());
-        payload.extend((marker.text.len() as u32).to_le_bytes());
-        payload.extend(marker.text.as_bytes());
+        message.extend(marker.size.to_le_bytes());
+        message.extend((marker.text.len() as u32).to_le_bytes());
+        message.extend(marker.text.as_bytes());
     }
 
-    let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
-    frame.extend(payload);
-
-    frame
+    message
 }
 
-/// Reads little endian values off the front of a payload.
-struct PayloadReader<'a>(&'a [u8]);
+/// Reads little endian values off the front of a message.
+struct MessageReader<'a>(&'a [u8]);
 
-impl<'a> PayloadReader<'a> {
+impl<'a> MessageReader<'a> {
     fn bytes(&mut self, len: usize) -> Option<&'a [u8]> {
         let (taken, rest) = self.0.split_at_checked(len)?;
         self.0 = rest;
@@ -146,9 +143,9 @@ impl<'a> PayloadReader<'a> {
     }
 }
 
-/// `None` for a payload of another protocol version, or one that does not decode.
-fn decode_payload(payload: &[u8]) -> Option<Snapshot> {
-    let mut reader = PayloadReader(payload);
+/// `None` for a message of another protocol version, or one that does not decode.
+fn decode_snapshot(message: &[u8]) -> Option<Snapshot> {
+    let mut reader = MessageReader(message);
 
     if reader.u32()? != MAGIC || reader.u32()? != PROTOCOL_VERSION {
         return None;
@@ -203,7 +200,7 @@ impl Server {
 
     pub fn start_named(name: &str) -> io::Result<Self> {
         let snapshot = Snapshot::default();
-        let pipe = sys::Server::start(name, encode_frame(&snapshot))?;
+        let pipe = sys::Server::start(name, encode_snapshot(&snapshot))?;
 
         Ok(Self { pipe, snapshot })
     }
@@ -237,7 +234,7 @@ impl Server {
                 .collect(),
         };
 
-        self.pipe.send(encode_frame(&self.snapshot));
+        self.pipe.send(encode_snapshot(&self.snapshot));
     }
 }
 
@@ -246,7 +243,6 @@ pub struct Client {
     name: String,
     connection: Option<sys::Connection>,
     last_connect_attempt: Option<Instant>,
-    received: Vec<u8>,
     snapshot: Option<Snapshot>,
     /// How often to try connecting while the driver is not running.
     pub connect_retry_interval: Duration,
@@ -262,7 +258,6 @@ impl Client {
             name: name.to_owned(),
             connection: None,
             last_connect_attempt: None,
-            received: Vec::new(),
             snapshot: None,
             connect_retry_interval: CONNECT_RETRY_INTERVAL,
         }
@@ -316,37 +311,22 @@ impl Client {
 
     fn disconnect(&mut self) {
         self.connection = None;
-        self.received.clear();
         self.snapshot = None;
     }
 
-    /// Reads everything that has arrived and keeps the last complete snapshot.
+    /// Reads everything that has arrived and keeps the latest snapshot.
     fn receive(&mut self) -> io::Result<()> {
         let Some(connection) = &mut self.connection else {
             return Ok(());
         };
-        connection.read_available(&mut self.received)?;
 
-        loop {
-            let Some(header) = self.received.get(..4) else {
-                return Ok(());
-            };
-            let len = u32::from_le_bytes(header.try_into().unwrap()) as usize;
-            if len > MAX_FRAME_LEN {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "frame too large",
-                ));
-            }
-            if self.received.len() < 4 + len {
-                return Ok(());
-            }
-
-            let frame = self.received.drain(..4 + len).collect::<Vec<_>>();
-            if let Some(snapshot) = decode_payload(&frame[4..]) {
+        for message in connection.read_available(MAX_MESSAGE_LEN)? {
+            if let Some(snapshot) = decode_snapshot(&message) {
                 self.snapshot = Some(snapshot);
             }
         }
+
+        Ok(())
     }
 }
 
@@ -368,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn frames_round_trip() {
+    fn snapshots_round_trip() {
         let snapshot = Snapshot {
             flags: FLAG_CLIENT_CONNECTED,
             generation: 7,
@@ -380,28 +360,22 @@ mod tests {
             }],
         };
 
-        let frame = encode_frame(&snapshot);
-        assert_eq!(
-            u32::from_le_bytes(frame[..4].try_into().unwrap()) as usize,
-            frame.len() - 4
-        );
-        assert_eq!(decode_payload(&frame[4..]), Some(snapshot));
+        assert_eq!(decode_snapshot(&encode_snapshot(&snapshot)), Some(snapshot));
     }
 
     #[test]
-    fn bad_payloads_are_rejected() {
-        let frame = encode_frame(&Snapshot::default());
-        let payload = &frame[4..];
+    fn bad_messages_are_rejected() {
+        let message = encode_snapshot(&Snapshot::default());
 
-        assert!(decode_payload(&payload[..payload.len() - 1]).is_none());
+        assert!(decode_snapshot(&message[..message.len() - 1]).is_none());
 
-        let mut extra = payload.to_vec();
+        let mut extra = message.clone();
         extra.push(0);
-        assert!(decode_payload(&extra).is_none());
+        assert!(decode_snapshot(&extra).is_none());
 
-        let mut other_version = payload.to_vec();
+        let mut other_version = message.clone();
         other_version[4] = other_version[4].wrapping_add(1);
-        assert!(decode_payload(&other_version).is_none());
+        assert!(decode_snapshot(&other_version).is_none());
     }
 
     #[test]
@@ -485,6 +459,29 @@ mod tests {
             wait_for(&mut client, |snapshot| {
                 snapshot.as_ref().is_some_and(|s| s.markers.len() == 1)
             });
+        }
+
+        #[test]
+        fn clients_connecting_at_once_all_get_the_markers() {
+            let name = unique_name("crowd");
+            let mut server = Server::start_named(&name).unwrap();
+            server.publish(0, [("dog", pose(1.0), 0.2)]);
+
+            let clients = (0..16)
+                .map(|_| {
+                    let name = name.clone();
+                    thread::spawn(move || {
+                        let mut client = Client::new_named(&name);
+                        client.connect_retry_interval = Duration::ZERO;
+                        wait_for(&mut client, |snapshot| {
+                            snapshot.as_ref().is_some_and(|s| s.markers.len() == 1)
+                        });
+                    })
+                })
+                .collect::<Vec<_>>();
+            for client in clients {
+                client.join().unwrap();
+            }
         }
 
         #[test]
