@@ -3,8 +3,8 @@
 //! The emulated headset reports a code while it could read it: in the view, facing the camera and
 //! near enough for its size. `always_seen` reports every code all the time instead.
 //!
-//! A code with a `motion` circles its position, like one on a dog running around, to test
-//! applications that follow moving markers. The room shows it where it is.
+//! A code with a `motion` circles its position, to test applications that follow moving markers.
+//! The room shows it where it is.
 
 use crate::{
     camera::Camera,
@@ -13,7 +13,7 @@ use crate::{
 use alvr_common::{
     Pose,
     anyhow::{Context, Result, bail},
-    glam::{EulerRot, Mat4, Quat, Vec3},
+    glam::{EulerRot, Quat, Vec3},
     hash_string, info, warn,
 };
 use alvr_packets::{MarkerData, MarkerPayload};
@@ -35,8 +35,9 @@ const MAX_DISTANCE_IN_SIZES: f32 = 20.0;
 /// A code turned further than this from the camera is not read.
 const MAX_VIEWING_ANGLE: f32 = 70.0_f32.to_radians();
 
+/// A code in `markers.json`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct MarkerSettings {
+pub struct Marker {
     /// The text the code holds, unless it holds `bytes_hex`. Names the code either way.
     pub id: String,
     /// Bytes the code holds instead of text, as hexadecimal digits.
@@ -66,6 +67,7 @@ pub struct MarkerNoise {
     /// Share of the detections that are off by `outlier_mm`, in a random direction.
     #[serde(default)]
     pub outlier_probability: f32,
+    /// How far off an outlier is.
     #[serde(default)]
     pub outlier_mm: f32,
 }
@@ -101,16 +103,20 @@ fn scramble(seed: u64) -> u64 {
     (z ^ (z >> 31)) | 1
 }
 
-/// xorshift64, enough for detection noise.
+/// xorshift64, enough for detection noise and patterns.
 struct Random(u64);
 
 impl Random {
-    /// In [0, 1).
-    fn uniform(&mut self) -> f32 {
+    fn next_u64(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
-        (self.0 >> 40) as f32 / (1u64 << 24) as f32
+        self.0
+    }
+
+    /// In [0, 1).
+    fn uniform(&mut self) -> f32 {
+        (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
     }
 
     /// Standard normal, by Box-Muller.
@@ -129,7 +135,7 @@ pub struct MarkerMotion {
     pub period_seconds: f32,
 }
 
-impl MarkerSettings {
+impl Marker {
     /// Where the code is at rest.
     pub fn pose(&self) -> Pose {
         let [yaw, pitch, roll] = self.rotation_degrees.map(f32::to_radians);
@@ -155,7 +161,30 @@ impl MarkerSettings {
         }
     }
 
-    pub fn payload(&self) -> Result<MarkerPayload> {
+    /// What the code holds, checking the rest of its definition too.
+    fn parse(&self) -> Result<MarkerPayload> {
+        if !(self.size > 0.0 && self.size.is_finite()) {
+            bail!("The size of \"{}\" is not positive", self.id);
+        }
+        if self.noise.is_some_and(|noise| {
+            ![
+                noise.position_mm,
+                noise.angle_degrees,
+                noise.outlier_probability,
+                noise.outlier_mm,
+            ]
+            .iter()
+            .all(|value| value.is_finite() && *value >= 0.0)
+        }) {
+            bail!("The noise of \"{}\" is not finite and positive", self.id);
+        }
+        if self
+            .motion
+            .is_some_and(|motion| !motion.radius.is_finite() || !motion.period_seconds.is_finite())
+        {
+            bail!("The motion of \"{}\" is not finite", self.id);
+        }
+
         let Some(hex) = &self.bytes_hex else {
             return Ok(MarkerPayload::Text(self.id.clone()));
         };
@@ -201,67 +230,70 @@ impl MarkerSettings {
     }
 }
 
-/// Every code in the room, and how they are reported.
+/// `markers.json`: every code in the room, and how they are reported.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
-pub struct MarkerSettingsFile {
+pub struct MarkerFile {
     /// Report every code all the time, wherever the headset looks.
     #[serde(default)]
     pub always_seen: bool,
-    pub markers: Vec<MarkerSettings>,
+    pub markers: Vec<Marker>,
 }
 
-impl MarkerSettingsFile {
-    pub fn validate(&self) -> Result<()> {
-        for marker in &self.markers {
-            marker.payload()?;
-            if !(marker.size > 0.0 && marker.size.is_finite()) {
-                bail!("The size of \"{}\" is not positive", marker.id);
-            }
-            if marker.noise.is_some_and(|noise| {
-                ![
-                    noise.position_mm,
-                    noise.angle_degrees,
-                    noise.outlier_probability,
-                    noise.outlier_mm,
-                ]
-                .iter()
-                .all(|value| value.is_finite() && *value >= 0.0)
-            }) {
-                bail!("The noise of \"{}\" is not finite and positive", marker.id);
-            }
-            if marker.motion.is_some_and(|motion| {
-                !motion.radius.is_finite() || !motion.period_seconds.is_finite()
-            }) {
-                bail!("The motion of \"{}\" is not finite", marker.id);
-            }
-        }
+/// The codes of a valid [`MarkerFile`].
+#[derive(Default)]
+pub struct MarkerRoom {
+    pub always_seen: bool,
+    /// Each code, with what it holds.
+    pub markers: Vec<(Marker, MarkerPayload)>,
+}
 
-        Ok(())
+/// A code where it is now, and what the headset reports of it.
+pub struct MarkerObservation {
+    pub pose: Pose,
+    /// `None` while the headset does not see the code.
+    pub detection: Option<MarkerData>,
+}
+
+impl MarkerRoom {
+    pub fn new(file: MarkerFile) -> Result<Self> {
+        let markers = file
+            .markers
+            .into_iter()
+            .map(|marker| {
+                let payload = marker.parse()?;
+
+                Ok((marker, payload))
+            })
+            .collect::<Result<_>>()?;
+
+        Ok(Self {
+            always_seen: file.always_seen,
+            markers,
+        })
     }
 
-    /// The codes a headset at `head` reads `time` after the tracking clock started, and where.
-    pub fn seen(&self, head: Pose, time: Duration) -> Vec<MarkerData> {
+    /// Where each code is `time` after the tracking clock started, and what a headset at `head`
+    /// reads of it.
+    pub fn observe(&self, head: Pose, time: Duration) -> Vec<MarkerObservation> {
         self.markers
             .iter()
-            .filter_map(|marker| {
+            .map(|(marker, payload)| {
                 let pose = marker.pose_at(time);
-                if !self.always_seen && !marker.is_seen_from(pose, head) {
-                    return None;
-                }
+                let seen = self.always_seen || marker.is_seen_from(pose, head);
 
-                let pose = match &marker.noise {
-                    Some(noise) => {
-                        noise.apply(pose, hash_string(&marker.id) ^ time.as_nanos() as u64)
-                    }
-                    None => pose,
-                };
-
-                Some(MarkerData {
-                    // Validated when loaded
-                    payload: marker.payload().ok()?,
+                MarkerObservation {
                     pose,
-                    size: marker.size,
-                })
+                    detection: seen.then(|| MarkerData {
+                        payload: payload.clone(),
+                        pose: match &marker.noise {
+                            Some(noise) => {
+                                noise.apply(pose, hash_string(&marker.id) ^ time.as_nanos() as u64)
+                            }
+                            None => pose,
+                        },
+                        size: marker.size,
+                    }),
+                }
             })
             .collect()
     }
@@ -269,13 +301,13 @@ impl MarkerSettingsFile {
 
 /// Loads the markers in `directory`, writing a default file first if none exists: one code lying
 /// face up on the centre of the bundled room's rug.
-pub fn load_or_create(directory: &Path) -> MarkerSettingsFile {
+pub fn load_or_create(directory: &Path) -> MarkerRoom {
     let path = directory.join(SETTINGS_FILE_NAME);
 
     if !path.exists() {
-        let file = MarkerSettingsFile {
+        let file = MarkerFile {
             always_seen: false,
-            markers: vec![MarkerSettings {
+            markers: vec![Marker {
                 id: "ALVR-QR-1".into(),
                 bytes_hex: None,
                 position: [0.0, 0.003, 0.0],
@@ -299,28 +331,26 @@ pub fn load_or_create(directory: &Path) -> MarkerSettingsFile {
     }
 
     match load_file(&path) {
-        Ok(file) => file,
+        Ok(room) => room,
         Err(e) => {
             warn!(
                 "Cannot load {}: {e:#}. No markers in the room.",
                 path.display()
             );
-            MarkerSettingsFile::default()
+            MarkerRoom::default()
         }
     }
 }
 
-fn load_file(path: &Path) -> Result<MarkerSettingsFile> {
+fn load_file(path: &Path) -> Result<MarkerRoom> {
     let text = std::fs::read_to_string(path).context("Cannot read marker settings")?;
-    let file: MarkerSettingsFile =
-        serde_json::from_str(&text).context("Cannot parse marker settings")?;
-    file.validate()?;
+    let file: MarkerFile = serde_json::from_str(&text).context("Cannot parse marker settings")?;
 
-    Ok(file)
+    MarkerRoom::new(file)
 }
 
 /// The code's model, around its centre: +X to its right, +Y to its top edge, its face towards +Z.
-pub fn marker_scene(marker: &MarkerSettings) -> Scene {
+pub fn marker_scene(marker: &Marker) -> Scene {
     let half = marker.size / 2.0 * (MODULES + 2 * QUIET_ZONE) as f32 / MODULES as f32;
     // Off the surface it lies on, to avoid z-fighting
     let lift = 0.001;
@@ -348,23 +378,15 @@ pub fn marker_scene(marker: &MarkerSettings) -> Scene {
     }
 }
 
-pub fn model_matrix(pose: Pose) -> Mat4 {
-    Mat4::from_rotation_translation(pose.orientation, pose.position)
-}
-
 /// Looks like a QR code but does not decode: the data modules are noise seeded by the text.
 fn pattern_texture(id: &str) -> Texture {
     let mut dark = [[false; MODULES]; MODULES];
 
     // Data modules first, then the fixed patterns on top.
-    let mut state = hash_string(id) | 1;
+    let mut random = Random(scramble(hash_string(id)));
     for row in dark.iter_mut() {
         for module in row.iter_mut() {
-            // xorshift64
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            *module = state & 1 == 1;
+            *module = random.next_u64() & 1 == 1;
         }
     }
 
@@ -412,8 +434,8 @@ fn pattern_texture(id: &str) -> Texture {
 mod tests {
     use super::*;
 
-    fn upright(position: [f32; 3], size: f32) -> MarkerSettings {
-        MarkerSettings {
+    fn upright(position: [f32; 3], size: f32) -> Marker {
+        Marker {
             id: "dog".into(),
             bytes_hex: None,
             position,
@@ -452,26 +474,35 @@ mod tests {
 
     #[test]
     fn the_default_code_is_seen_when_looking_down_at_it() {
-        let file = MarkerSettingsFile {
+        let file = MarkerFile {
             always_seen: false,
-            markers: vec![MarkerSettings {
+            markers: vec![Marker {
                 rotation_degrees: [0.0, -90.0, 0.0],
                 ..upright([0.0, 0.003, 0.0], 0.5)
             }],
         };
-        assert!(file.seen(HEAD, Duration::ZERO).is_empty());
+        let seen = |room: &MarkerRoom, head: Pose| {
+            room.observe(head, Duration::ZERO)
+                .iter()
+                .filter(|observation| observation.detection.is_some())
+                .count()
+        };
+
+        let room = MarkerRoom::new(file.clone()).unwrap();
+        assert_eq!(seen(&room, HEAD), 0);
 
         let looking_down = Pose {
             orientation: Quat::from_rotation_x(-80.0_f32.to_radians()),
             ..HEAD
         };
-        assert_eq!(file.seen(looking_down, Duration::ZERO).len(), 1);
+        assert_eq!(seen(&room, looking_down), 1);
 
-        let always = MarkerSettingsFile {
+        let always = MarkerRoom::new(MarkerFile {
             always_seen: true,
             ..file
-        };
-        assert_eq!(always.seen(HEAD, Duration::ZERO).len(), 1);
+        })
+        .unwrap();
+        assert_eq!(seen(&always, HEAD), 1);
     }
 
     #[test]
@@ -502,13 +533,19 @@ mod tests {
         let mut marker = upright([0.0; 3], 0.1);
         marker.bytes_hex = Some("00ff10".into());
         assert_eq!(
-            marker.payload().unwrap(),
+            marker.parse().unwrap(),
             MarkerPayload::Bytes(vec![0, 0xff, 0x10])
         );
 
         marker.bytes_hex = Some("0".into());
-        assert!(marker.payload().is_err());
+        assert!(marker.parse().is_err());
         marker.bytes_hex = Some("zz".into());
-        assert!(marker.payload().is_err());
+        assert!(marker.parse().is_err());
+    }
+
+    #[test]
+    fn patterns_are_the_same_for_the_same_text() {
+        assert_eq!(pattern_texture("dog").pixels, pattern_texture("dog").pixels);
+        assert_ne!(pattern_texture("dog").pixels, pattern_texture("cat").pixels);
     }
 }

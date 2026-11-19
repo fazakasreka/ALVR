@@ -118,9 +118,9 @@ pub struct AlvrDeviceMotion {
 
 #[repr(C)]
 pub struct AlvrMarker {
-    id: *const c_char, // QR code text
-    pose: AlvrPose,    // Centre of the marker; +Y towards its top edge, +Z out of its face
-    size: f32,         // Edge length in metres
+    text: *const c_char,
+    pose: AlvrPose,
+    size: f32,
 }
 
 #[allow(dead_code)]
@@ -452,6 +452,9 @@ pub extern "C" fn alvr_set_qr_code_tracking(supported: bool) {
 /// All QR codes currently seen, in the same space as the tracking, replacing the previous list.
 /// `timestamp_ns` is the time the poses are for, on the clock of alvr_send_tracking's
 /// `poll_timestamp_ns`. Send them as often as the tracking for moving codes to follow.
+///
+/// Each marker's pose is its centre, with +Y towards its top edge and +Z out of its face, and its
+/// size is its edge length in metres. Markers with a null `text` are skipped.
 #[unsafe(no_mangle)]
 pub extern "C" fn alvr_send_markers(
     timestamp_ns: u64,
@@ -466,9 +469,10 @@ pub extern "C" fn alvr_send_markers(
 
     let markers = markers
         .iter()
+        .filter(|marker| !marker.text.is_null())
         .map(|marker| MarkerData {
             payload: MarkerPayload::Text(
-                unsafe { CStr::from_ptr(marker.id) }
+                unsafe { CStr::from_ptr(marker.text) }
                     .to_string_lossy()
                     .into_owned(),
             ),
@@ -922,7 +926,7 @@ pub extern "C" fn alvr_start_stream_opengl(config: AlvrStreamConfig) {
         false, // TODO: limited range fix config
         1.0,   // TODO: encoding gamma config
         upscaling,
-        false, // the C API does not support the alpha stream
+        false, // this renderer does not composite the alpha stream
     )));
 }
 

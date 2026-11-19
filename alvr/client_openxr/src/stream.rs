@@ -271,8 +271,7 @@ impl StreamContext {
         self.config.passthrough.is_some()
     }
 
-    /// `stage_in_previous` is where STAGE's new origin is in the previous one: the identity when
-    /// it did not change, `None` if not known.
+    /// `stage_in_previous` as in `ClientControlPacket::PlayspaceSync`.
     pub fn update_reference_space(&mut self, stage_in_previous: Option<Pose>) {
         self.input_thread_running.set(false);
 

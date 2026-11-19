@@ -5,18 +5,19 @@
 //! thread owning the wgpu device, so capture requests are queued and answered by the UI thread.
 
 use crate::{
-    client::FrameTiming,
+    client::{FrameTiming, StageChange},
     controllers::Hand,
     hands::HandPose,
-    markers::{MarkerSettings, MarkerSettingsFile},
+    markers::{Marker, MarkerFile, MarkerRoom},
 };
 use alvr_common::{
-    glam::{Quat, Vec3},
+    Pose,
+    glam::{Quat, Vec2, Vec3},
     info,
     parking_lot::{Condvar, Mutex},
 };
 use alvr_packets::ButtonValue;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     sync::Arc,
@@ -468,11 +469,11 @@ pub struct SharedState {
     /// Latest marker snapshot published by the UI thread, for `/api/markers`.
     pub markers: Mutex<MarkersResponse>,
     /// Markers set by `POST /api/markers`, replacing the current ones on the next frame.
-    pub marker_update: Mutex<Option<MarkerSettingsFile>>,
+    pub marker_update: Mutex<Option<MarkerRoom>>,
     /// The emulated headset's STAGE, published by the UI thread for `GET /api/stage`.
     pub stage: Mutex<StageResponse>,
     /// Changes queued by `POST /api/stage`.
-    pub stage_changes: Mutex<VecDeque<StageRequest>>,
+    pub stage_changes: Mutex<VecDeque<StageChange>>,
 }
 
 /// `GET /api/stage`: where the emulated headset's STAGE is in the room, and its size.
@@ -484,17 +485,13 @@ pub struct StageResponse {
     pub area: [f32; 2],
 }
 
-/// `POST /api/stage`: a change of the emulated headset's STAGE, as after a new boundary or a
-/// recenter.
+/// `POST /api/stage`: a [`StageChange`].
 #[derive(Deserialize, Clone, Copy)]
 pub struct StageRequest {
-    /// The new size of its bounds.
     #[serde(default)]
     pub area: Option<[f32; 2]>,
-    /// Where its new origin is in the previous one.
     #[serde(default)]
     pub moved: Option<StageMove>,
-    /// Whether the headset runtime tells where it moved. Default true.
     #[serde(default = "default_true")]
     pub known: bool,
 }
@@ -512,6 +509,19 @@ fn default_true() -> bool {
     true
 }
 
+impl From<StageRequest> for StageChange {
+    fn from(request: StageRequest) -> Self {
+        Self {
+            area: request.area.map(Vec2::from_array),
+            moved: request.moved.map(|moved| Pose {
+                orientation: Quat::from_rotation_y(moved.yaw_degrees.to_radians()),
+                position: Vec3::from_array(moved.position),
+            }),
+            known: request.known,
+        }
+    }
+}
+
 /// `GET /api/markers`: the codes in the room, as in `markers.json`, with where they are now and
 /// whether the headset sees them.
 #[derive(Serialize, Default)]
@@ -523,7 +533,7 @@ pub struct MarkersResponse {
 #[derive(Serialize)]
 pub struct MarkerStatus {
     #[serde(flatten)]
-    pub settings: MarkerSettings,
+    pub marker: Marker,
     /// Reported to the server this frame.
     pub seen: bool,
     pub current_position: [f32; 3],
@@ -581,6 +591,21 @@ enum Reply {
     Error(u16, String),
 }
 
+fn read_body(request: &mut tiny_http::Request) -> Result<String, Reply> {
+    let mut body = String::new();
+    request
+        .as_reader()
+        .read_to_string(&mut body)
+        .map_err(|e| Reply::Error(400, format!("Cannot read request body: {e}")))?;
+
+    Ok(body)
+}
+
+fn read_json<T: DeserializeOwned>(request: &mut tiny_http::Request) -> Result<T, Reply> {
+    serde_json::from_str(&read_body(request)?)
+        .map_err(|e| Reply::Error(400, format!("Invalid JSON: {e}")))
+}
+
 fn route(shared: &SharedState, request: &mut tiny_http::Request) -> Reply {
     let method = request.method().clone();
     // Strip any query string; none of the endpoints take parameters.
@@ -602,10 +627,10 @@ fn route(shared: &SharedState, request: &mut tiny_http::Request) -> Reply {
         }
 
         (tiny_http::Method::Post, path) if path.starts_with("/api/controllers/") => {
-            let mut body = String::new();
-            if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                return Reply::Error(400, format!("Cannot read request body: {e}"));
-            }
+            let body = match read_body(request) {
+                Ok(body) => body,
+                Err(reply) => return reply,
+            };
 
             let rest = &path["/api/controllers/".len()..];
             controller_route(shared, rest, &body)
@@ -619,10 +644,10 @@ fn route(shared: &SharedState, request: &mut tiny_http::Request) -> Reply {
         }
 
         (tiny_http::Method::Post, path) if path.starts_with("/api/hands/") => {
-            let mut body = String::new();
-            if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                return Reply::Error(400, format!("Cannot read request body: {e}"));
-            }
+            let body = match read_body(request) {
+                Ok(body) => body,
+                Err(reply) => return reply,
+            };
 
             let rest = &path["/api/hands/".len()..];
             hand_route(shared, rest, &body)
@@ -631,42 +656,28 @@ fn route(shared: &SharedState, request: &mut tiny_http::Request) -> Reply {
         (tiny_http::Method::Get, "/api/view/color") => capture(shared, CaptureRequestKind::Color),
         (tiny_http::Method::Get, "/api/view/depth") => capture(shared, CaptureRequestKind::Depth),
 
-        (tiny_http::Method::Post, "/api/move") => {
-            let mut body = String::new();
-            if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                return Reply::Error(400, format!("Cannot read request body: {e}"));
+        (tiny_http::Method::Post, "/api/move") => match read_json::<MoveRequest>(request) {
+            Ok(parsed) => {
+                shared.moves.lock().push_back(PendingMove {
+                    position: parsed.position.map(Vec3::from_array),
+                    yaw: parsed.yaw,
+                    pitch: parsed.pitch,
+                    roll: parsed.roll,
+                });
+
+                Reply::Json("{\"ok\":true}".into())
             }
+            Err(reply) => reply,
+        },
 
-            match serde_json::from_str::<MoveRequest>(&body) {
-                Ok(parsed) => {
-                    shared.moves.lock().push_back(PendingMove {
-                        position: parsed.position.map(Vec3::from_array),
-                        yaw: parsed.yaw,
-                        pitch: parsed.pitch,
-                        roll: parsed.roll,
-                    });
+        (tiny_http::Method::Post, "/api/source") => match read_json::<SourceRequest>(request) {
+            Ok(parsed) => {
+                *shared.source.lock() = Some(parsed.source);
 
-                    Reply::Json("{\"ok\":true}".into())
-                }
-                Err(e) => Reply::Error(400, format!("Invalid JSON: {e}")),
+                Reply::Json("{\"ok\":true}".into())
             }
-        }
-
-        (tiny_http::Method::Post, "/api/source") => {
-            let mut body = String::new();
-            if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                return Reply::Error(400, format!("Cannot read request body: {e}"));
-            }
-
-            match serde_json::from_str::<SourceRequest>(&body) {
-                Ok(parsed) => {
-                    *shared.source.lock() = Some(parsed.source);
-
-                    Reply::Json("{\"ok\":true}".into())
-                }
-                Err(e) => Reply::Error(400, format!("Invalid JSON: {e}")),
-            }
-        }
+            Err(reply) => reply,
+        },
 
         (tiny_http::Method::Get, "/api/drive") => {
             match serde_json::to_string(&*shared.drive.lock()) {
@@ -675,21 +686,14 @@ fn route(shared: &SharedState, request: &mut tiny_http::Request) -> Reply {
             }
         }
 
-        (tiny_http::Method::Post, "/api/drive") => {
-            let mut body = String::new();
-            if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                return Reply::Error(400, format!("Cannot read request body: {e}"));
-            }
+        (tiny_http::Method::Post, "/api/drive") => match read_json::<DriveRequest>(request) {
+            Ok(parsed) => {
+                *shared.drive.lock() = parsed;
 
-            match serde_json::from_str::<DriveRequest>(&body) {
-                Ok(parsed) => {
-                    *shared.drive.lock() = parsed;
-
-                    Reply::Json("{\"ok\":true}".into())
-                }
-                Err(e) => Reply::Error(400, format!("Invalid JSON: {e}")),
+                Reply::Json("{\"ok\":true}".into())
             }
-        }
+            Err(reply) => reply,
+        },
 
         (tiny_http::Method::Get, "/api/stage") => {
             match serde_json::to_string_pretty(&*shared.stage.lock()) {
@@ -698,27 +702,20 @@ fn route(shared: &SharedState, request: &mut tiny_http::Request) -> Reply {
             }
         }
 
-        (tiny_http::Method::Post, "/api/stage") => {
-            let mut body = String::new();
-            if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                return Reply::Error(400, format!("Cannot read request body: {e}"));
+        (tiny_http::Method::Post, "/api/stage") => match read_json::<StageRequest>(request) {
+            Ok(parsed)
+                if parsed.area.is_some_and(|[w, h]| {
+                    !(w > 0.0 && h > 0.0 && w.is_finite() && h.is_finite())
+                }) =>
+            {
+                Reply::Error(400, "The area must be positive".into())
             }
-
-            match serde_json::from_str::<StageRequest>(&body) {
-                Ok(parsed)
-                    if parsed.area.is_some_and(|[w, h]| {
-                        !(w > 0.0 && h > 0.0 && w.is_finite() && h.is_finite())
-                    }) =>
-                {
-                    Reply::Error(400, "The area must be positive".into())
-                }
-                Ok(parsed) => {
-                    shared.stage_changes.lock().push_back(parsed);
-                    Reply::Json("{\"ok\":true}".into())
-                }
-                Err(e) => Reply::Error(400, format!("Invalid JSON: {e}")),
+            Ok(parsed) => {
+                shared.stage_changes.lock().push_back(parsed.into());
+                Reply::Json("{\"ok\":true}".into())
             }
-        }
+            Err(reply) => reply,
+        },
 
         (tiny_http::Method::Get, "/api/markers") => {
             match serde_json::to_string_pretty(&*shared.markers.lock()) {
@@ -727,23 +724,16 @@ fn route(shared: &SharedState, request: &mut tiny_http::Request) -> Reply {
             }
         }
 
-        (tiny_http::Method::Post, "/api/markers") => {
-            let mut body = String::new();
-            if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                return Reply::Error(400, format!("Cannot read request body: {e}"));
-            }
-
-            match serde_json::from_str::<MarkerSettingsFile>(&body) {
-                Ok(parsed) => match parsed.validate() {
-                    Ok(()) => {
-                        *shared.marker_update.lock() = Some(parsed);
-                        Reply::Json("{\"ok\":true}".into())
-                    }
-                    Err(e) => Reply::Error(400, format!("{e:#}")),
-                },
-                Err(e) => Reply::Error(400, format!("Invalid JSON: {e}")),
-            }
-        }
+        (tiny_http::Method::Post, "/api/markers") => match read_json::<MarkerFile>(request) {
+            Ok(parsed) => match MarkerRoom::new(parsed) {
+                Ok(room) => {
+                    *shared.marker_update.lock() = Some(room);
+                    Reply::Json("{\"ok\":true}".into())
+                }
+                Err(e) => Reply::Error(400, format!("{e:#}")),
+            },
+            Err(reply) => reply,
+        },
 
         _ => Reply::Error(404, format!("No such endpoint: {method} {url}")),
     }

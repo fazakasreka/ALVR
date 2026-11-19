@@ -53,8 +53,9 @@ pub fn has_permission(permission: &str) -> bool {
     .unwrap()
 }
 
-// True after the user denied the permission once (and may still be asked again)
-pub fn was_permission_denied(permission: &str) -> bool {
+// shouldShowRequestPermissionRationale: true after the user denied the permission once, false
+// again after a permanent denial
+pub fn should_show_permission_rationale(permission: &str) -> bool {
     vm().attach_current_thread(|env| {
         let permission = env.new_string(permission)?;
 

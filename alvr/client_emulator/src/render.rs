@@ -9,7 +9,7 @@ use crate::{
     scene::Scene,
     skinned::{SkinnedModel, SkinnedVertex},
 };
-use alvr_common::{glam::Mat4, parking_lot::Mutex, warn};
+use alvr_common::{glam::Mat4, warn};
 use bytemuck::{Pod, Zeroable};
 use std::num::NonZeroU32;
 use wgpu::{
@@ -307,8 +307,6 @@ impl Mesh {
 pub struct SceneRenderer {
     pipeline: MeshPipeline,
     mesh: Mesh,
-    /// The QR codes in the room, each with its model matrix: they can move, and be replaced.
-    markers: Mutex<Vec<(Mesh, Mat4)>>,
     /// Colour format this pipeline was built for. Offscreen capture targets must use the same
     /// format, or the pipeline fails render pass validation.
     color_format: TextureFormat,
@@ -327,28 +325,7 @@ impl SceneRenderer {
         Self {
             pipeline,
             mesh,
-            markers: Mutex::new(Vec::new()),
             color_format: output_format,
-        }
-    }
-
-    /// Replaces the QR code models, each around its centre.
-    pub fn set_markers(&self, device: &Device, queue: &Queue, markers: &[Scene]) {
-        *self.markers.lock() = markers
-            .iter()
-            .map(|scene| {
-                (
-                    Mesh::new(device, queue, &self.pipeline, scene),
-                    Mat4::IDENTITY,
-                )
-            })
-            .collect();
-    }
-
-    /// Where the QR codes are, in the order they were set. Takes effect with the next view.
-    pub fn set_marker_poses(&self, models: &[Mat4]) {
-        for ((_, model), new) in self.markers.lock().iter_mut().zip(models) {
-            *model = *new;
         }
     }
 
@@ -363,23 +340,62 @@ impl SceneRenderer {
     pub fn draw<'pass>(&self, pass: &mut wgpu::RenderPass<'pass>, eye: Eye) {
         pass.set_pipeline(&self.pipeline.pipeline);
         self.mesh.draw(pass, eye);
-        for (marker, _) in self.markers.lock().iter() {
-            marker.draw(pass, eye);
-        }
     }
 
     /// Uploads the view-projection matrix into the given eye's uniform slot.
-    pub fn set_view(&self, queue: &Queue, camera: &Camera, eye: Eye, aspect_ratio: f32) {
-        let view_proj = Camera::projection_matrix(aspect_ratio) * camera.view_matrix(eye);
-        self.set_view_projection(queue, eye, view_proj);
-    }
-
-    /// Uploads a view-projection matrix built elsewhere, for drawing the scene from a pose other
-    /// than the live camera's.
     pub fn set_view_projection(&self, queue: &Queue, eye: Eye, view_proj: Mat4) {
         self.mesh.set_view(queue, eye, view_proj);
-        for (marker, model) in self.markers.lock().iter() {
-            marker.set_view(queue, eye, view_proj * *model);
+    }
+}
+
+/// Renders the QR codes in the room.
+///
+/// Part of the room like [`SceneRenderer`], so drawn wherever the scene is, but independent of it
+/// so the codes do not depend on the environment loading. The codes can move, and be replaced.
+pub struct MarkerRenderer {
+    pipeline: MeshPipeline,
+    /// Each code with its model matrix.
+    markers: Vec<(Mesh, Mat4)>,
+}
+
+impl MarkerRenderer {
+    pub fn new(device: &Device, queue: &Queue, output_format: TextureFormat) -> Self {
+        Self {
+            pipeline: MeshPipeline::new(device, queue, output_format),
+            markers: Vec::new(),
+        }
+    }
+
+    /// Replaces the code models, each around its centre.
+    pub fn set_markers(&mut self, device: &Device, queue: &Queue, markers: &[Scene]) {
+        self.markers = markers
+            .iter()
+            .map(|scene| {
+                (
+                    Mesh::new(device, queue, &self.pipeline, scene),
+                    Mat4::IDENTITY,
+                )
+            })
+            .collect();
+    }
+
+    /// Where the codes are, in the order they were set. Takes effect with the next view.
+    pub fn set_poses(&mut self, models: &[Mat4]) {
+        for ((_, model), new) in self.markers.iter_mut().zip(models) {
+            *model = *new;
+        }
+    }
+
+    pub fn set_view_projection(&self, queue: &Queue, eye: Eye, view_proj: Mat4) {
+        for (mesh, model) in &self.markers {
+            mesh.set_view(queue, eye, view_proj * *model);
+        }
+    }
+
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, eye: Eye) {
+        pass.set_pipeline(&self.pipeline.pipeline);
+        for (mesh, _) in &self.markers {
+            mesh.draw(pass, eye);
         }
     }
 }
@@ -1378,8 +1394,8 @@ impl DeviceModels<'_> {
 
 /// Renders both eyes side by side into an offscreen target and reads the result back.
 ///
-/// Visible controller and hand models are drawn into the capture as well, so the endpoints show
-/// the same scene as the window.
+/// The QR codes and visible controller and hand models are drawn into the capture as well, so the
+/// endpoints show the same scene as the window.
 ///
 /// Returns tightly packed pixels: RGBA8 for colour, or 8-bit greyscale for depth.
 #[expect(clippy::too_many_arguments)]
@@ -1387,6 +1403,7 @@ pub fn capture_stereo(
     device: &Device,
     queue: &Queue,
     renderer: &SceneRenderer,
+    markers: Option<&MarkerRenderer>,
     devices: &DeviceModels<'_>,
     camera: &Camera,
     eye_width: u32,
@@ -1397,8 +1414,13 @@ pub fn capture_stereo(
     let aspect_ratio = eye_width as f32 / eye_height as f32;
 
     // Both eyes have their own uniform slot, so a single pass can draw them into two viewports.
-    renderer.set_view(queue, camera, Eye::Left, aspect_ratio);
-    renderer.set_view(queue, camera, Eye::Right, aspect_ratio);
+    for eye in [Eye::Left, Eye::Right] {
+        let view_proj = Camera::projection_matrix(aspect_ratio) * camera.view_matrix(eye);
+        renderer.set_view_projection(queue, eye, view_proj);
+        if let Some(markers) = markers {
+            markers.set_view_projection(queue, eye, view_proj);
+        }
+    }
 
     devices.upload(
         queue,
@@ -1454,6 +1476,9 @@ pub fn capture_stereo(
             );
 
             renderer.draw(&mut pass, eye);
+            if let Some(markers) = markers {
+                markers.draw(&mut pass, eye);
+            }
             devices.draw(&mut pass, eye);
         }
     }

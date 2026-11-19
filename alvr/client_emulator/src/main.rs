@@ -50,7 +50,7 @@ use crate::{
     overlay::{PoseOverlay, PoseTarget, Slot},
     render::{
         CaptureKind, ControllerRenderer, DeviceModels, GIZMO_SLOTS, GizmoDevice, GizmoRenderer,
-        HandRenderer, HandTint, SceneRenderer, capture_stereo,
+        HandRenderer, HandTint, MarkerRenderer, SceneRenderer, capture_stereo,
     },
     scene::Scene,
     skinned::SkinnedModel,
@@ -58,7 +58,7 @@ use crate::{
 };
 use alvr_common::{
     Pose, error,
-    glam::{Mat4, Quat, Vec2, Vec3},
+    glam::{Mat4, Quat, Vec3},
     info,
     parking_lot::Mutex,
 };
@@ -140,8 +140,8 @@ struct EmulatorApp {
     hand_settings: HandSettings,
     /// Emulated hand state, mutated by both the UI and the API commands. Left is index 0.
     hands: [HandState; 2],
-    markers: markers::MarkerSettingsFile,
-    /// The scene renderer has the models of the current markers.
+    marker_room: markers::MarkerRoom,
+    /// The marker renderer has the models of the current markers.
     markers_uploaded: bool,
     /// The icons and 6DoF panels of the controllers and the hands, which share one implementation.
     pose_overlay: PoseOverlay,
@@ -170,7 +170,17 @@ impl EmulatorApp {
 
         let mut scene = None;
         let mut scene_error = None;
-        let marker_settings = markers::load_or_create(&paths::user_dir());
+        let marker_room = markers::load_or_create(&paths::user_dir());
+
+        // Independent of the environment, which may fail to load
+        if let Some(state) = context.wgpu_render_state.as_ref() {
+            let renderer = MarkerRenderer::new(&state.device, &state.queue, state.target_format);
+            state
+                .renderer
+                .write()
+                .callback_resources
+                .insert(Arc::new(Mutex::new(renderer)));
+        }
 
         match Scene::load(&environment_path) {
             Ok(loaded) => {
@@ -265,7 +275,7 @@ impl EmulatorApp {
             controller_ui: ControllerUi::new(),
             hand_settings,
             hands,
-            markers: marker_settings,
+            marker_room,
             markers_uploaded: false,
             pose_overlay: PoseOverlay::new(),
             timed_releases: Vec::new(),
@@ -637,14 +647,6 @@ impl EmulatorApp {
         if let Some(profile_id) = profile_id {
             client.sync_interaction_profile(profile_id, input_ids);
         }
-
-        client.sync_markers(
-            &self.markers,
-            Pose {
-                orientation: head_orientation,
-                position: head_position,
-            },
-        );
     }
 
     /// World-space model matrices of the controllers whose 3D model should be drawn, composed
@@ -714,84 +716,84 @@ impl EmulatorApp {
     fn apply_stage_changes(&mut self) {
         let changes = std::mem::take(&mut *self.shared.stage_changes.lock());
         for change in changes {
-            self.client.change_stage(client::StageChange {
-                area: change.area.map(Vec2::from_array),
-                moved: change.moved.map(|moved| Pose {
-                    orientation: Quat::from_rotation_y(moved.yaw_degrees.to_radians()),
-                    position: Vec3::from_array(moved.position),
-                }),
-                known: change.known,
-            });
+            self.client.change_stage(change);
         }
 
-        let (stage, area) = self.client.stage();
+        let stage = self.client.stage();
         *self.shared.stage.lock() = StageResponse {
-            position: stage.position.to_array(),
-            orientation: stage.orientation.to_array(),
-            area: area.to_array(),
+            position: stage.pose.position.to_array(),
+            orientation: stage.pose.orientation.to_array(),
+            area: stage.area.to_array(),
         };
     }
 
-    /// Takes marker changes from the API, moves the codes in the room to where they are now, and
-    /// publishes them for `/api/markers`.
+    /// Takes marker changes from the API, moves the codes in the room to where they are now,
+    /// reports the ones the headset sees, and publishes them for `/api/markers`.
     fn update_markers(&mut self, frame: &Frame) {
-        if let Some(markers) = self.shared.marker_update.lock().take() {
-            info!("Markers replaced: {} code(s)", markers.markers.len());
-            self.markers = markers;
+        if let Some(room) = self.shared.marker_update.lock().take() {
+            info!("Markers replaced: {} code(s)", room.markers.len());
+            self.marker_room = room;
             self.markers_uploaded = false;
         }
 
-        let time = client::tracking_time();
+        let time = self.client.tracking_time();
         let head = Pose {
             orientation: self.camera.orientation(),
             position: self.camera.position,
         };
-        let poses = self
-            .markers
-            .markers
+        let observations = self.marker_room.observe(head, time);
+
+        let seen = observations
             .iter()
-            .map(|marker| marker.pose_at(time))
+            .filter_map(|observation| observation.detection.clone())
             .collect::<Vec<_>>();
+        self.client.sync_markers(time, &seen);
 
         if let Some(state) = frame.wgpu_render_state() {
             let renderer = state
                 .renderer
                 .read()
                 .callback_resources
-                .get::<Arc<SceneRenderer>>()
+                .get::<Arc<Mutex<MarkerRenderer>>>()
                 .cloned();
             if let Some(renderer) = renderer {
+                let mut renderer = renderer.lock();
                 if !self.markers_uploaded {
                     let scenes = self
-                        .markers
+                        .marker_room
                         .markers
                         .iter()
-                        .map(markers::marker_scene)
+                        .map(|(marker, _)| markers::marker_scene(marker))
                         .collect::<Vec<_>>();
                     renderer.set_markers(&state.device, &state.queue, &scenes);
                     self.markers_uploaded = true;
                 }
-                renderer.set_marker_poses(
-                    &poses
+                renderer.set_poses(
+                    &observations
                         .iter()
-                        .map(|&pose| markers::model_matrix(pose))
+                        .map(|observation| {
+                            Mat4::from_rotation_translation(
+                                observation.pose.orientation,
+                                observation.pose.position,
+                            )
+                        })
                         .collect::<Vec<_>>(),
                 );
             }
         }
 
         *self.shared.markers.lock() = MarkersResponse {
-            always_seen: self.markers.always_seen,
+            always_seen: self.marker_room.always_seen,
             markers: self
-                .markers
+                .marker_room
                 .markers
                 .iter()
-                .zip(poses)
-                .map(|(marker, pose)| MarkerStatus {
-                    settings: marker.clone(),
-                    seen: self.markers.always_seen || marker.is_seen_from(pose, head),
-                    current_position: pose.position.to_array(),
-                    current_orientation: pose.orientation.to_array(),
+                .zip(observations)
+                .map(|((marker, _), observation)| MarkerStatus {
+                    marker: marker.clone(),
+                    seen: observation.detection.is_some(),
+                    current_position: observation.pose.position.to_array(),
+                    current_orientation: observation.pose.orientation.to_array(),
                 })
                 .collect(),
         };
@@ -1266,8 +1268,14 @@ impl EmulatorApp {
             return;
         };
 
-        // Visible controller and hand models are captured too, so the API sees what the window
-        // shows.
+        // The QR codes and visible controller and hand models are captured too, so the API sees
+        // what the window shows.
+        let marker_renderer = state
+            .renderer
+            .read()
+            .callback_resources
+            .get::<Arc<Mutex<MarkerRenderer>>>()
+            .cloned();
         let controller_renderer = state
             .renderer
             .read()
@@ -1307,6 +1315,7 @@ impl EmulatorApp {
                 CaptureRequestKind::Depth => CaptureKind::Depth,
             };
 
+            let marker_lock = marker_renderer.as_ref().map(|renderer| renderer.lock());
             let controller_lock = controller_renderer.as_ref().map(|renderer| renderer.lock());
             let hand_lock = hand_renderer.as_ref().map(|renderer| renderer.lock());
 
@@ -1329,6 +1338,7 @@ impl EmulatorApp {
                 &state.device,
                 &state.queue,
                 &renderer,
+                marker_lock.as_deref(),
                 &devices,
                 &self.camera,
                 eye_width,
@@ -2147,14 +2157,6 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
         };
         let aspect_ratio = (width / divisor) / height;
 
-        if !self.show_video
-            && let Some(renderer) = resources.get::<Arc<SceneRenderer>>()
-        {
-            // Both slots are written even in single-eye mode; the draw call picks one.
-            renderer.set_view(queue, &camera, Eye::Left, aspect_ratio);
-            renderer.set_view(queue, &camera, Eye::Right, aspect_ratio);
-        }
-
         // Over the video the models must use the projection the server rendered with — the
         // advertised FOV — not the window's shape, or they drift against the video content.
         let device_aspect = if self.show_video {
@@ -2163,15 +2165,32 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             aspect_ratio
         };
 
-        // Under the video the scene follows the same rule as the device models, for the same
-        // reason: anything else drifts against the video content.
-        if self.scene_under_video
-            && let Some(renderer) = resources.get::<Arc<SceneRenderer>>()
-        {
+        // The room: the scene and the QR codes in it. Under the video it follows the same rule as
+        // the device models, for the same reason: anything else drifts against the video content.
+        let room_views = if !self.show_video {
+            let projection = Camera::projection_matrix(aspect_ratio);
+            Some([Eye::Left, Eye::Right].map(|eye| projection * camera.view_matrix(eye)))
+        } else if self.scene_under_video {
             let projection = Camera::projection_matrix(device_aspect);
+            Some(self.device_eye_views.map(|view| projection * view))
+        } else {
+            None
+        };
+        if let Some(room_views) = room_views {
+            let scene = resources.get::<Arc<SceneRenderer>>();
+            let markers = resources
+                .get::<Arc<Mutex<MarkerRenderer>>>()
+                .map(|r| r.lock());
 
-            renderer.set_view_projection(queue, Eye::Left, projection * self.device_eye_views[0]);
-            renderer.set_view_projection(queue, Eye::Right, projection * self.device_eye_views[1]);
+            // Both slots are written even in single-eye mode; the draw call picks one.
+            for (eye, view_proj) in [Eye::Left, Eye::Right].into_iter().zip(room_views) {
+                if let Some(scene) = scene {
+                    scene.set_view_projection(queue, eye, view_proj);
+                }
+                if let Some(markers) = &markers {
+                    markers.set_view_projection(queue, eye, view_proj);
+                }
+            }
         }
 
         let controllers = resources
@@ -2217,6 +2236,9 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             .then(|| resources.get::<Arc<Mutex<VideoRenderer>>>())
             .flatten();
         let scene = resources.get::<Arc<SceneRenderer>>();
+        let markers = resources
+            .get::<Arc<Mutex<MarkerRenderer>>>()
+            .map(|r| r.lock());
         let controllers = resources
             .get::<Arc<Mutex<ControllerRenderer>>>()
             .map(|r| r.lock());
@@ -2230,26 +2252,29 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             gizmos.map(|renderer| &**renderer),
         );
 
-        if video.is_none() && scene.is_none() {
+        if video.is_none() && scene.is_none() && markers.is_none() {
             return;
         }
+
+        let draw_room = |pass: &mut wgpu::RenderPass<'static>, eye: Eye| {
+            if let Some(scene) = scene {
+                scene.draw(pass, eye);
+            }
+            if let Some(markers) = &markers {
+                markers.draw(pass, eye);
+            }
+        };
 
         let draw_eye = |pass: &mut wgpu::RenderPass<'static>, eye: Eye| {
             match &video {
                 Some(video) => {
-                    if self.scene_under_video
-                        && let Some(scene) = scene
-                    {
-                        scene.draw(pass, eye);
+                    if self.scene_under_video {
+                        draw_room(pass, eye);
                     }
 
                     video.lock().draw(pass, eye);
                 }
-                None => {
-                    if let Some(scene) = scene {
-                        scene.draw(pass, eye);
-                    }
-                }
+                None => draw_room(pass, eye),
             }
 
             // Over the video too: the application draws its own controllers and hands, but the

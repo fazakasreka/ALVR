@@ -612,7 +612,7 @@ code lying face up on the centre of the rug:
 The file is written with that default only when there is none, and is yours to edit: put any
 codes in it, or none at all with `{ "markers": [] }`. It is read when the emulator starts, so
 restart it after editing, or send the same content to `POST /api/markers` to change the codes
-while it runs (that does not change the file). A file that does not parse, or has an invalid code
+while it runs. That does not change the file, so a restart brings back its codes. A file that does not parse, or has an invalid code
 in it, is reported in the log and leaves the room without codes. The emulated headset always
 supports QR code tracking, so applications see the capability whether there are codes or not.
 
@@ -628,7 +628,7 @@ and applications see it paused. `"always_seen": true` at the top of the file rep
 the time instead. The emulated headset supports both marker options, fixed size and static.
 
 To test applications that follow moving codes, give one a `motion`: it then circles its position
-horizontally, turning with it, like a code on a dog running around. The room shows it where it is,
+horizontally, turning with it. The room shows it where it is,
 so in the **Mixed** view an application's drawing should stay on it; turned away, it is not seen.
 
 ```json
@@ -664,7 +664,6 @@ runtime does: a new play area, or STAGE moving, as after a new boundary or a rec
 where to (`known`, OpenXR's `poseValid`) or not. The room stays where it is: everything the
 headset reports moves the other way. This is what applications see as ALVR's reference space
 changes; see [`alvr/openxr_layer`](../openxr_layer/README.md).
-
 
 ## HTTP API
 
@@ -807,12 +806,12 @@ it this frame:
 
 ### `POST /api/markers`
 
-Replaces every code, with the content of a `markers.json`, from the next frame. The file itself is
-not changed, so a restart brings back its codes. An invalid code (a size that is not positive, or
-`bytes_hex` that is not hexadecimal) is rejected with 400 and nothing changes.
+Replaces every code, with the content of a `markers.json`, from the next frame; see
+[Markers](#markers). An invalid code (a size that is not positive, or `bytes_hex` that is not
+hexadecimal) is rejected with 400 and nothing changes.
 
 ```sh
-curl -X POST -d '{"markers":[{"id":"CAT","position":[0,1.5,-1],"rotation_degrees":[0,0,0],"size":0.2}]}'   http://127.0.0.1:8080/api/markers
+curl -X POST -d '{"markers":[{"id":"CAT","position":[0,1.5,-1],"rotation_degrees":[0,0,0],"size":0.2}]}' http://127.0.0.1:8080/api/markers
 ```
 
 ### `GET /api/view/color`
@@ -1073,11 +1072,12 @@ a Gaussian splat capture can be added without changing the code that consumes it
 
 ## ALVR changes
 
-Three changes outside this crate, all additive and all keeping existing clients working against a
-new server. The reverse is not true: an old server cannot reach a client that moved off the
-well-known ports, which is fine because both sides of an emulator setup are under your control.
+Five changes outside this crate. The first four are additive and keep existing clients working
+against a new server; the reverse is not true: an old server cannot reach a client that moved off
+the well-known ports, which is fine because both sides of an emulator setup are under your control.
+The Playspace change is not additive: client and server must both have it.
 
-**Announcer shutdown** — `client_core/src/sockets.rs`. `AnnouncerSocket` now shuts its mdns-sd
+**Announcer shutdown** — `client_core/src/sockets.rs`. `AnnouncerSocket` shuts its mdns-sd
 daemon down on drop. Without this the daemon thread never exits and process exit hangs.
 
 **Client control port** — `sockets`, `client_core`, `server_core`. Only one process per machine can
@@ -1104,3 +1104,8 @@ last like `StreamReadyOnPort`: the headset reports what it can do
 (`ServerControlPacket::MarkerTrackingConfigs`), and the headset reports what each tracker sees,
 with the time the poses are for (`ClientControlPacket::Markers`). The server recenters the markers
 like any other pose and the driver hands them to OpenXR applications; see [Markers](#markers).
+
+**Playspace** — `packets`, `client_core`, `server_core`. `ClientControlPacket::PlayspaceSync`
+changed shape, from the play area alone to `{ area, stage_in_previous }`: with the area, the
+headset says where STAGE's new origin is in the previous one, when known, so that the server can
+follow a recenter or a new boundary; see [STAGE](#stage).

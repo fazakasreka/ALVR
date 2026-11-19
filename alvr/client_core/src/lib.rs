@@ -60,8 +60,7 @@ pub enum ClientCoreEvent {
         stream: VideoStreamKind,
     },
     RealTimeConfig(RealTimeConfig),
-    /// The marker trackers to run, replacing the previous list. Each tracker's markers go to
-    /// [`ClientCoreContext::send_markers`] with its configuration.
+    // Replaces the previous list. Each tracker's markers go to send_markers with its config
     MarkerTrackingConfigs(Vec<MarkerTrackingConfig>),
 }
 
@@ -182,8 +181,7 @@ impl ClientCoreContext {
         }
     }
 
-    /// After a new or changed STAGE space: `stage_in_previous` is where its new origin is in the
-    /// previous one, `None` if not known or new.
+    /// After a new or changed STAGE space, as in `ClientControlPacket::PlayspaceSync`.
     pub fn send_playspace(&self, area: Option<Vec2>, stage_in_previous: Option<Pose>) {
         dbg_client_core!("send_playspace");
 

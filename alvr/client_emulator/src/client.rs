@@ -8,7 +8,6 @@
 //! the application's alpha. It gets a decoder of its own, and its frames are paired with the color
 //! frames by timestamp when they are displayed.
 
-use crate::markers::MarkerSettingsFile;
 use crate::{
     camera::{Camera, IPD},
     decoder::{self, DecodedFrame, DecoderKind, VideoDecoder},
@@ -31,7 +30,7 @@ use alvr_session::{CodecType, PassthroughMode};
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::{Arc, LazyLock},
+    sync::Arc,
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -102,30 +101,34 @@ impl Default for ClientStatus {
 /// leads color by a frame or two; anything beyond this is a stream that stopped pairing up.
 const MAX_PENDING_ALPHA_FRAMES: usize = 8;
 
-/// The clock of the tracking's `poll_timestamp`, which marker times are on too.
-static TRACKING_CLOCK: LazyLock<Instant> = LazyLock::new(Instant::now);
+/// The emulated headset's STAGE space, which every pose goes out in.
+#[derive(Clone, Copy)]
+pub struct Stage {
+    /// Where it is in the room.
+    pub pose: Pose,
+    /// The size of its bounds.
+    pub area: Vec2,
+}
 
-/// Where the emulated headset's STAGE space is in the room. Every pose goes out in STAGE.
-static STAGE: RwLock<Pose> = RwLock::new(Pose::IDENTITY);
-
-/// The size of the emulated headset's STAGE until changed.
-const DEFAULT_STAGE_AREA: Vec2 = Vec2::new(4.0, 4.0);
+impl Default for Stage {
+    fn default() -> Self {
+        Self {
+            pose: Pose::IDENTITY,
+            area: Vec2::new(4.0, 4.0),
+        }
+    }
+}
 
 /// A change of the emulated headset's STAGE, as a runtime makes after a new boundary or a
-/// recenter.
+/// recenter. Reported as in `ClientControlPacket::PlayspaceSync`.
 #[derive(Clone, Copy, Debug)]
 pub struct StageChange {
     /// The new size of its bounds, or the same.
     pub area: Option<Vec2>,
     /// Where its new origin is in the previous one, or the same.
     pub moved: Option<Pose>,
-    /// Whether the runtime tells where it moved, as OpenXR's `poseValid` does.
+    /// Whether the runtime tells where it moved.
     pub known: bool,
-}
-
-/// Now on the tracking clock: what moving markers are animated by.
-pub fn tracking_time() -> Duration {
-    TRACKING_CLOCK.elapsed()
 }
 
 /// The emulated headset tracks QR codes with every option.
@@ -506,8 +509,10 @@ pub struct EmulatedClient {
     haptics: [Option<HapticsEvent>; 2],
     /// The marker trackers the server asked for.
     marker_configs: Vec<MarkerTrackingConfig>,
-    /// Of the emulated headset's STAGE.
-    stage_area: Vec2,
+    /// Shared with the tracking thread.
+    stage: Arc<RwLock<Stage>>,
+    /// The clock of the tracking's `poll_timestamp`, which marker times are on too.
+    tracking_clock: Instant,
 }
 
 impl EmulatedClient {
@@ -554,8 +559,14 @@ impl EmulatedClient {
             announced_inputs: None,
             haptics: [None; 2],
             marker_configs: Vec::new(),
-            stage_area: DEFAULT_STAGE_AREA,
+            stage: Arc::new(RwLock::new(Stage::default())),
+            tracking_clock: Instant::now(),
         }
+    }
+
+    /// Now on the tracking clock: what moving markers are animated by.
+    pub fn tracking_time(&self) -> Duration {
+        self.tracking_clock.elapsed()
     }
 
     pub fn status(&self) -> &ClientStatus {
@@ -655,16 +666,14 @@ impl EmulatedClient {
         self.announced_inputs = Some(input_ids);
     }
 
-    /// Reports the markers a headset at `head` sees now, and where, to every tracker the server
-    /// asked for. Call once per frame while streaming, as a headset reports them.
-    pub fn sync_markers(&mut self, markers: &MarkerSettingsFile, head: Pose) {
-        if !self.status.streaming {
+    /// Reports the markers seen at `timestamp` on the tracking clock, posed in the room, to every
+    /// tracker the server asked for. Call once per frame, as a headset reports them.
+    pub fn sync_markers(&self, timestamp: Duration, seen: &[MarkerData]) {
+        if !self.status.streaming || self.marker_configs.is_empty() {
             return;
         }
 
-        let timestamp = tracking_time();
-        let seen = markers.seen(head, timestamp);
-        let room_in_stage = STAGE.read().inverse();
+        let room_in_stage = self.stage.read().pose.inverse();
         for config in &self.marker_configs {
             let seen = seen
                 .iter()
@@ -677,25 +686,28 @@ impl EmulatedClient {
                     }
                     data
                 })
-                .collect::<Vec<MarkerData>>();
+                .collect();
             self.context.send_markers(*config, timestamp, seen);
         }
     }
 
-    /// Where the emulated headset's STAGE is in the room, and its size.
-    pub fn stage(&self) -> (Pose, Vec2) {
-        (*STAGE.read(), self.stage_area)
+    pub fn stage(&self) -> Stage {
+        *self.stage.read()
     }
 
     /// Changes the emulated headset's STAGE, and tells the server as a headset does.
     pub fn change_stage(&mut self, change: StageChange) {
-        if let Some(moved) = change.moved {
-            let mut stage = STAGE.write();
-            *stage = *stage * moved;
-        }
-        if let Some(area) = change.area {
-            self.stage_area = area;
-        }
+        let area = {
+            let mut stage = self.stage.write();
+            if let Some(moved) = change.moved {
+                stage.pose = stage.pose * moved;
+            }
+            if let Some(area) = change.area {
+                stage.area = area;
+            }
+
+            stage.area
+        };
         info!("STAGE changed: {change:?}");
 
         if self.status.streaming {
@@ -703,8 +715,7 @@ impl EmulatedClient {
                 None => Some(Pose::IDENTITY),
                 Some(moved) => change.known.then_some(moved),
             };
-            self.context
-                .send_playspace(Some(self.stage_area), stage_in_previous);
+            self.context.send_playspace(Some(area), stage_in_previous);
         }
     }
 
@@ -728,7 +739,8 @@ impl EmulatedClient {
                 ClientCoreEvent::StreamingStarted(config) => {
                     info!("Streaming started");
                     // As a headset does, for a STAGE new to the server
-                    self.context.send_playspace(Some(self.stage_area), None);
+                    self.context
+                        .send_playspace(Some(self.stage.read().area), None);
 
                     self.status.streaming = true;
                     self.status.view_resolution = config.negotiated_config.view_resolution;
@@ -979,7 +991,7 @@ impl EmulatedClient {
         }
 
         // In the room, where the scene is drawn
-        let stage = *STAGE.read();
+        let stage = self.stage.read().pose;
         self.displayed_views.map(|views| {
             views.map(|view| ViewParams {
                 pose: stage * view.pose,
@@ -1034,11 +1046,21 @@ impl EmulatedClient {
         let streaming = Arc::clone(&self.streaming);
         let tracking = Arc::clone(&self.tracking);
         let send_timing = Arc::clone(&self.send_timing);
+        let stage = Arc::clone(&self.stage);
+        let clock = self.tracking_clock;
 
         *send_timing.lock() = SendTracker::default();
 
         self.tracking_thread = Some(thread::spawn(move || {
-            tracking_loop(context, streaming, tracking, send_timing, refresh_rate)
+            tracking_loop(
+                context,
+                streaming,
+                tracking,
+                send_timing,
+                stage,
+                clock,
+                refresh_rate,
+            )
         }));
     }
 
@@ -1065,6 +1087,8 @@ fn tracking_loop(
     streaming: Arc<RelaxedAtomic>,
     tracking: Arc<RwLock<TrackingWindow>>,
     send_timing: Arc<Mutex<SendTracker>>,
+    stage: Arc<RwLock<Stage>>,
+    clock: Instant,
     refresh_rate: f32,
 ) {
     let interval = Duration::from_secs_f32(1.0 / (refresh_rate * TRACKING_RATE_MULTIPLIER));
@@ -1081,7 +1105,7 @@ fn tracking_loop(
         };
 
         // In STAGE, as a headset reports it: controllers and hands are relative to the head
-        let head_pose = STAGE.read().inverse()
+        let head_pose = stage.read().pose.inverse()
             * Pose {
                 orientation: tracked.head.orientation,
                 position: tracked.head.position,
@@ -1148,7 +1172,7 @@ fn tracking_loop(
         });
 
         context.send_tracking(TrackingData {
-            poll_timestamp: TRACKING_CLOCK.elapsed(),
+            poll_timestamp: clock.elapsed(),
             device_motions,
             hand_skeletons,
             face: FaceData::default(),
