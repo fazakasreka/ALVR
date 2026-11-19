@@ -392,6 +392,8 @@ fn main() {
     let mut context = None;
     let mut last_discovery: Option<Instant> = None;
     let mut recommendations = 0;
+    // Every frame's STAGE poses of each still tracked code, for how much they jitter
+    let mut poses = std::collections::BTreeMap::<String, Vec<sys::Posef>>::new();
 
     while Instant::now() < deadline {
         loop {
@@ -476,10 +478,67 @@ fn main() {
             }
         }
 
+        for (text, state, bounds) in spatial.discover(context, stage.as_raw(), time) {
+            if state == sys::SpatialEntityTrackingStateEXT::TRACKING {
+                poses.entry(text).or_default().push(bounds.center);
+            }
+        }
+
         frame_stream
             .end(time, xr::EnvironmentBlendMode::OPAQUE, &[])
             .unwrap();
     }
 
     println!("Done; {recommendations} discovery recommendation(s)");
+    println!("Jitter, as the frames saw each code in STAGE (meaningful for still codes):");
+    for (text, poses) in &poses {
+        let (position_mm, angle_degrees) = jitter(poses);
+        println!(
+            "  {text}: {} frames, position {position_mm:.2} mm, angle {angle_degrees:.2}° (standard deviations)",
+            poses.len()
+        );
+    }
+}
+
+/// The standard deviations of the positions, and of the angles from the mean orientation.
+fn jitter(poses: &[sys::Posef]) -> (f32, f32) {
+    let count = poses.len() as f32;
+    let mean = |f: &dyn Fn(&sys::Posef) -> f32| poses.iter().map(f).sum::<f32>() / count;
+    let (x, y, z) = (
+        mean(&|p| p.position.x),
+        mean(&|p| p.position.y),
+        mean(&|p| p.position.z),
+    );
+    let position = mean(&|p| {
+        (p.position.x - x).powi(2) + (p.position.y - y).powi(2) + (p.position.z - z).powi(2)
+    })
+    .sqrt();
+
+    // The mean orientation, all in one hemisphere
+    let first = poses[0].orientation;
+    let sign = |q: sys::Quaternionf| {
+        if q.x * first.x + q.y * first.y + q.z * first.z + q.w * first.w < 0.0 {
+            -1.0
+        } else {
+            1.0
+        }
+    };
+    let mut q = [
+        mean(&|p| sign(p.orientation) * p.orientation.x),
+        mean(&|p| sign(p.orientation) * p.orientation.y),
+        mean(&|p| sign(p.orientation) * p.orientation.z),
+        mean(&|p| sign(p.orientation) * p.orientation.w),
+    ];
+    let length = q.iter().map(|v| v * v).sum::<f32>().sqrt();
+    q = q.map(|v| v / length);
+    let angle = mean(&|p| {
+        let o = p.orientation;
+        let cos = (o.x * q[0] + o.y * q[1] + o.z * q[2] + o.w * q[3])
+            .abs()
+            .min(1.0);
+        (2.0 * cos.acos()).powi(2)
+    })
+    .sqrt();
+
+    (position * 1000.0, angle.to_degrees())
 }

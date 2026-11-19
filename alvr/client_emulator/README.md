@@ -609,6 +609,13 @@ code lying face up on the centre of the rug:
 }
 ```
 
+The file is written with that default only when there is none, and is yours to edit: put any
+codes in it, or none at all with `{ "markers": [] }`. It is read when the emulator starts, so
+restart it after editing, or send the same content to `POST /api/markers` to change the codes
+while it runs (that does not change the file). A file that does not parse, or has an invalid code
+in it, is reported in the log and leaves the room without codes. The emulated headset always
+supports QR code tracking, so applications see the capability whether there are codes or not.
+
 `rotation_degrees` is yaw, pitch and roll; all zero is an upright code facing +Z. `size` excludes
 the quiet zone. The drawn pattern looks like a QR code but does not decode. `id` is the text the
 code holds; give it `bytes_hex` (`"bytes_hex": "00ff7f80"`) to hold those bytes instead, as a byte
@@ -635,6 +642,15 @@ so in the **Mixed** view an application's drawing should stay on it; turned away
 ```
 
 A negative `period_seconds` circles clockwise seen from above.
+
+Detections are exact unless a code has `noise`, which makes them jitter as a headset camera's do:
+normally distributed by `position_mm` and `angle_degrees` per axis, and a share
+`outlier_probability` of them off by `outlier_mm` in a random direction. The room still shows the
+code where it is.
+
+```json
+"noise": { "position_mm": 2.0, "angle_degrees": 0.5, "outlier_probability": 0.01, "outlier_mm": 30.0 }
+```
 
 `POST /api/markers` replaces the codes while the emulator runs, and `GET /api/markers` shows them;
 see [HTTP API](#http-api).

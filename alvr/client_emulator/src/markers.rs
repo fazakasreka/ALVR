@@ -49,6 +49,76 @@ pub struct MarkerSettings {
     pub size: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub motion: Option<MarkerMotion>,
+    /// How much its detections jitter, as a headset camera's do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise: Option<MarkerNoise>,
+}
+
+/// Detection noise: normally distributed per axis, and now and then a detection far off.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct MarkerNoise {
+    /// Standard deviation of the position, per axis.
+    #[serde(default)]
+    pub position_mm: f32,
+    /// Standard deviation of the orientation, per axis.
+    #[serde(default)]
+    pub angle_degrees: f32,
+    /// Share of the detections that are off by `outlier_mm`, in a random direction.
+    #[serde(default)]
+    pub outlier_probability: f32,
+    #[serde(default)]
+    pub outlier_mm: f32,
+}
+
+impl MarkerNoise {
+    /// `pose`, as detected once. The same `seed` gives the same detection.
+    fn apply(&self, pose: Pose, seed: u64) -> Pose {
+        let mut random = Random(scramble(seed));
+
+        let mut position = pose.position
+            + Vec3::new(random.gaussian(), random.gaussian(), random.gaussian())
+                * (self.position_mm / 1000.0);
+        if random.uniform() < self.outlier_probability {
+            let direction = Vec3::new(random.gaussian(), random.gaussian(), random.gaussian())
+                .normalize_or(Vec3::X);
+            position += direction * (self.outlier_mm / 1000.0);
+        }
+        let rotation = Vec3::new(random.gaussian(), random.gaussian(), random.gaussian())
+            * self.angle_degrees.to_radians();
+
+        Pose {
+            orientation: pose.orientation * Quat::from_scaled_axis(rotation),
+            position,
+        }
+    }
+}
+
+/// The seed scrambled (splitmix64): xorshift's first numbers from similar seeds are not random.
+fn scramble(seed: u64) -> u64 {
+    let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    (z ^ (z >> 31)) | 1
+}
+
+/// xorshift64, enough for detection noise.
+struct Random(u64);
+
+impl Random {
+    /// In [0, 1).
+    fn uniform(&mut self) -> f32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 >> 40) as f32 / (1u64 << 24) as f32
+    }
+
+    /// Standard normal, by Box-Muller.
+    fn gaussian(&mut self) -> f32 {
+        let u = self.uniform().max(1e-7);
+        let v = self.uniform();
+        (-2.0 * u.ln()).sqrt() * (TAU * v).cos()
+    }
 }
 
 /// A horizontal circle around the code's position, turning the code along with it.
@@ -147,6 +217,18 @@ impl MarkerSettingsFile {
             if !(marker.size > 0.0 && marker.size.is_finite()) {
                 bail!("The size of \"{}\" is not positive", marker.id);
             }
+            if marker.noise.is_some_and(|noise| {
+                ![
+                    noise.position_mm,
+                    noise.angle_degrees,
+                    noise.outlier_probability,
+                    noise.outlier_mm,
+                ]
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0)
+            }) {
+                bail!("The noise of \"{}\" is not finite and positive", marker.id);
+            }
             if marker.motion.is_some_and(|motion| {
                 !motion.radius.is_finite() || !motion.period_seconds.is_finite()
             }) {
@@ -166,6 +248,13 @@ impl MarkerSettingsFile {
                 if !self.always_seen && !marker.is_seen_from(pose, head) {
                     return None;
                 }
+
+                let pose = match &marker.noise {
+                    Some(noise) => {
+                        noise.apply(pose, hash_string(&marker.id) ^ time.as_nanos() as u64)
+                    }
+                    None => pose,
+                };
 
                 Some(MarkerData {
                     // Validated when loaded
@@ -193,6 +282,7 @@ pub fn load_or_create(directory: &Path) -> MarkerSettingsFile {
                 rotation_degrees: [0.0, -90.0, 0.0],
                 size: 0.5,
                 motion: None,
+                noise: None,
             }],
         };
 
@@ -330,6 +420,7 @@ mod tests {
             rotation_degrees: [0.0; 3],
             size,
             motion: None,
+            noise: None,
         }
     }
 
@@ -381,6 +472,29 @@ mod tests {
             ..file
         };
         assert_eq!(always.seen(HEAD, Duration::ZERO).len(), 1);
+    }
+
+    #[test]
+    fn noise_jitters_detections() {
+        let noise = MarkerNoise {
+            position_mm: 2.0,
+            angle_degrees: 0.5,
+            outlier_probability: 0.0,
+            outlier_mm: 0.0,
+        };
+        let pose = upright([0.0, 1.5, -1.0], 0.2).pose();
+        let detections = (0..1000)
+            .map(|seed| noise.apply(pose, seed * 7919))
+            .collect::<Vec<_>>();
+        let deviation = (detections
+            .iter()
+            .map(|detection| (detection.position.x - pose.position.x).powi(2))
+            .sum::<f32>()
+            / detections.len() as f32)
+            .sqrt();
+        assert!((deviation - 0.002).abs() < 0.0003, "{deviation}");
+        // The same seed, the same detection
+        assert_eq!(noise.apply(pose, 3).position, noise.apply(pose, 3).position);
     }
 
     #[test]

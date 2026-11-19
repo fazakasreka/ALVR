@@ -40,7 +40,7 @@ app ─▶ OpenXR loader ─▶ this layer ─▶ SteamVR OpenXR runtime
 | Components | `MARKER` (the code's data: a string buffer for text, a `uint8` buffer for other bytes), `BOUNDED_2D` (centre pose and size) |
 | Features | fixed size markers, static markers; both always honoured, see below |
 | Snapshots | discovery and update snapshots, `XrSpatialFilterTrackingStateEXT` |
-| Poses | at the requested time: interpolated between the headset's poses, predicted up to 100 ms past the latest |
+| Poses | at the requested time, filtered and predicted up to 100 ms past the latest detection; see **Jitter** |
 | Entities | a context gives a code an id when it first discovers it and keeps it, so it is stable across the context's snapshots; no two contexts share an id, as the extension requires. Buffer ids come from the code's data |
 | Tracking states | `TRACKING` while the headset sees the code; `PAUSED` otherwise, while disconnected, or when nothing came for 500 ms; never `STOPPED` |
 | Data | up to 7089 bytes, the most a QR code holds; codes the headset has not decoded yet are not reported |
@@ -56,6 +56,33 @@ capability at all.
 go to the headset, which uses them for more precise poses when it supports them. The layer honours
 them either way, as the extension requires: a context with a size gets every code at that size, and
 a context for static codes gets their poses averaged over the last second instead of predicted.
+
+**Jitter.** Detections jitter by millimetres and fractions of a degree, and now and then one is off
+by centimetres. Applications ask for the display time, tens of milliseconds past the latest
+detection, so a prediction from raw detections magnifies the noise. The layer (`src/history.rs`):
+
+- filters moving codes with a One Euro filter, on position and orientation: strongly while they
+  stand still, little while they move fast. The filter's lag is made up for, and the prediction
+  uses velocities fitted over the latest 200 ms of detections, both fading out near standstill
+  so that noise is not extrapolated.
+- averages static codes without the detections far from the rest.
+- holds back a detection far from the prediction until the next one confirms it: a single wild
+  detection is ignored, a real jump is followed one detection late.
+
+With 2 mm and 0.5° of noise per axis and 1% of detections 3 cm off, at 60 Hz, 40 ms ahead
+(`cargo test -p alvr_openxr_layer jitter::report -- --nocapture`):
+
+| | Before | Now |
+|---|---|---|
+| Still code, moving context | 20.2 mm, 3.8° | 0.9 mm, 0.20° |
+| Walking at 0.5 m/s | 20.2 mm, 3.8° | 2.6 mm, 0.20° |
+| Circling (the emulator's dog) | 20.2 mm, 3.8° | 3.8 mm, 0.60° |
+| Standing, walking, stopping | 20.3 mm, 3.8° | 7.3 mm, 0.64° |
+| Still code, static context | 0.7 mm, 0.10° | 0.4 mm, 0.10° |
+
+Root mean square errors against the truth. A code that stops is still predicted on for a few
+frames, about its speed times the prediction time: no predictor can know of the stop.
+`jitter_stays_small` keeps these from getting worse.
 
 **Recentering.** ALVR recenters by moving the space it submits poses to SteamVR in, which SteamVR
 does not see: to applications, all their reference spaces move without the
@@ -126,7 +153,8 @@ Setting `DISABLE_XR_APILAYER_ALVR_MARKER_TRACKING` (any value) turns the layer o
   texts quoted, bytes in hexadecimal.
 - `cargo run -p alvr_openxr_layer --example marker_probe --release -- 15` runs a minimal OpenXR
   application (D3D11, empty frames) on SteamVR and prints the codes it gets, relative to the head
-  and to `STAGE`. The headset shows black while it runs.
+  and to `STAGE`, and at the end how much each one jittered from frame to frame. The headset shows
+  black while it runs.
 - The layer writes to the debugger output (DebugView shows it), and to a file when
   `ALVR_OPENXR_LAYER_LOG` names one.
 - `XR_LOADER_DEBUG=all` makes the OpenXR loader explain which layers it loads and why.

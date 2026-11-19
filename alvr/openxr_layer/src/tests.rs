@@ -1112,24 +1112,19 @@ fn markers_reach_the_application() {
         snapshot
     };
 
-    // The dog moves
-    let before = time;
-    time = publish(
-        &mut writer,
-        &[
-            ("dog", pose(2.0, 0.0, -2.0), 0.2),
-            ("cat", pose(-1.0, 1.0, -3.0), 0.1),
-        ],
-    );
+    // The dog jumps 1 m: a single detection that far is taken for a wild one, the next confirms it
+    let moved = [
+        ("dog", pose(2.0, 0.0, -2.0), 0.2),
+        ("cat", pose(-1.0, 1.0, -3.0), 0.1),
+    ];
+    time = publish(&mut writer, &moved);
     let updated = app.query(update_snapshot(entity, time));
     assert_eq!(updated.len(), 1);
     assert_eq!(updated[0].1, xr::SpatialEntityTrackingStateEXT::TRACKING);
+    assert!(close(updated[0].2.center.position, [1.0, -1.5, -2.0]));
+    time = publish(&mut writer, &moved);
+    let updated = app.query(update_snapshot(entity, time));
     assert!(close(updated[0].2.center.position, [2.0, -1.5, -2.0]));
-    // Where it was at the time asked for, half way between its two poses
-    let middle = xr::Time::from_nanos((before.as_nanos() + time.as_nanos()) / 2);
-    let updated = app.query(update_snapshot(entity, middle));
-    // To the performance counter's tick
-    assert!((updated[0].2.center.position.x - 1.5).abs() < 1e-3);
     // Same markers, no recommendation
     assert_eq!(app.poll_event(), None);
 
@@ -1186,9 +1181,9 @@ fn markers_reach_the_application() {
     publish(&mut writer, &[("cat", pose(-1.0, 1.0, -3.0), 0.1)]);
     time = publish(&mut writer, &[("cat", pose(-1.2, 1.0, -3.0), 0.1)]);
     let averaged = app.query(app.discover(static_context, time));
-    // Over every pose of the last second: mostly at -1, once at -1.2
+    // Over every pose of the last second but the one far from the rest
     let x = averaged[0].2.center.position.x;
-    assert!(-1.2 < x && x < -1.0, "{x}");
+    assert!((x + 1.0).abs() < 1e-4, "{x}");
     // Destroying the context destroyed its snapshots
     let destroy_snapshot: pfn::DestroySpatialSnapshotEXT = app.get(c"xrDestroySpatialSnapshotEXT");
     assert_eq!(
