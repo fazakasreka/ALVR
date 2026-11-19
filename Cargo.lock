@@ -416,6 +416,7 @@ dependencies = [
 name = "alvr_marker_ipc"
 version = "21.0.0-dev12"
 dependencies = [
+ "serde",
  "windows-sys 0.61.2",
 ]
 
@@ -436,6 +437,7 @@ name = "alvr_packets"
 version = "21.0.0-dev12"
 dependencies = [
  "alvr_common",
+ "alvr_marker_ipc",
  "alvr_session",
  "serde",
  "serde_json",
@@ -503,7 +505,6 @@ dependencies = [
  "serde_json",
  "sysinfo",
  "walkdir",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

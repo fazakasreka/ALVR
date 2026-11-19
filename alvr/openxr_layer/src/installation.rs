@@ -1,10 +1,10 @@
 //! Whether the ALVR copy the layer belongs to is one SteamVR loads.
 //!
 //! The ALVR driver registers the layer for every OpenXR application of the user. Uninstalling ALVR
-//! (an MSIX package cannot run anything when removed) or unregistering its driver from SteamVR can
-//! leave that registration behind, and the layer would still load into every application. So the
-//! layer checks that its streamer folder, the one above its own, is among SteamVR's drivers, and
-//! otherwise stays out of the way.
+//! without its uninstaller or unregistering its driver from SteamVR can leave that registration
+//! behind, and the layer would still load into every application. So the layer checks that its
+//! streamer folder, the one above its own, is among SteamVR's drivers, and otherwise stays out of
+//! the way.
 
 use std::path::{Path, PathBuf};
 

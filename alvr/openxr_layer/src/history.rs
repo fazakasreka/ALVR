@@ -15,11 +15,11 @@
 //!   the next one confirms it, so a single wild detection is ignored and a real jump is followed one
 //!   detection late.
 
-use crate::math;
-#[cfg(test)]
-use alvr_marker_ipc::marker_id;
+use crate::math::{
+    Quat, Vec3, angle, compose, conjugate, distance, dot, from_rotation_vector, inverse, length,
+    lerp, normalize, quat_mul, rotate, rotation_vector, slerp,
+};
 use alvr_marker_ipc::{Payload, Pose, Snapshot, TrackingConfig};
-use openxr_sys::Posef;
 use std::{
     collections::{HashMap, VecDeque},
     f32::consts::PI,
@@ -36,8 +36,7 @@ const MAX_EXTRAPOLATION_NS: i64 = SECOND_NS / 10;
 /// Static markers are the average of their poses over this window.
 const STATIC_WINDOW_NS: i64 = SECOND_NS;
 
-/// One Euro filter of positions: cutoff frequency at standstill, its increase per m/s, and the
-/// cutoff of the velocity.
+/// One Euro filter of positions: cutoff frequency at standstill, and its increase per m/s.
 const POSITION_MIN_CUTOFF_HZ: f32 = 1.0;
 const POSITION_BETA: f32 = 10.0;
 /// The same for orientations, per rad/s.
@@ -45,9 +44,10 @@ const ORIENTATION_MIN_CUTOFF_HZ: f32 = 1.0;
 const ORIENTATION_BETA: f32 = 2.0;
 /// Velocities are the least squares slope of the detections this far back.
 const VELOCITY_WINDOW_NS: i64 = 200_000_000;
-/// Prediction fades in between these speeds, below which the velocity is mostly noise.
-const PREDICTED_SPEED: [f32; 2] = [0.02, 0.06]; // m/s
-const PREDICTED_ANGULAR_SPEED: [f32; 2] = [0.1, 0.3]; // rad/s
+/// Prediction fades in between these speeds, in m/s, below which the velocity is mostly noise.
+const PREDICTED_SPEED: [f32; 2] = [0.02, 0.06];
+/// The same for angular speeds, in rad/s.
+const PREDICTED_ANGULAR_SPEED: [f32; 2] = [0.1, 0.3];
 /// A detection this far from the prediction is an outlier unless the next one agrees.
 const OUTLIER_DISTANCE: f32 = 0.02;
 const OUTLIER_ANGLE: f32 = 8.0 * PI / 180.0;
@@ -57,9 +57,6 @@ const STATIC_OUTLIER_DEVIATIONS: f32 = 3.0;
 const STATIC_MIN_OUTLIER_DISTANCE: f32 = 0.003;
 const STATIC_MIN_OUTLIER_ANGLE: f32 = 1.0 * PI / 180.0;
 
-type Vec3 = [f32; 3];
-type Quat = [f32; 4];
-
 #[derive(Clone, Copy, Debug)]
 struct Sample {
     time_ns: i64,
@@ -68,7 +65,8 @@ struct Sample {
     size: f32,
     /// After the One Euro filter.
     filtered: Pose,
-    /// Smoothed, in m/s and rad/s, in the space of the poses.
+    /// Fitted to the latest detections by least squares, in m/s and rad/s, in the space of the
+    /// poses.
     velocity: Vec3,
     angular_velocity: Vec3,
     /// How far behind the filtered pose trails a steady motion: the time constants of the filters.
@@ -77,11 +75,34 @@ struct Sample {
     estimate: Pose,
 }
 
+impl Sample {
+    /// A detection taken as it is, without filtering.
+    fn unfiltered(
+        time_ns: i64,
+        pose: Pose,
+        size: f32,
+        velocity: Vec3,
+        angular_velocity: Vec3,
+    ) -> Self {
+        Self {
+            time_ns,
+            pose,
+            size,
+            filtered: pose,
+            velocity,
+            angular_velocity,
+            lag: [0.0; 2],
+            estimate: pose,
+        }
+    }
+}
+
 #[derive(Default)]
 struct MarkerSamples {
     samples: VecDeque<Sample>,
-    /// A detection far from the prediction, waiting for the next one to confirm it.
-    held: Option<(i64, Pose, f32)>,
+    /// A detection far from the prediction, waiting for the next one to confirm it: its time and
+    /// pose.
+    held: Option<(i64, Pose)>,
 }
 
 struct TrackerHistory {
@@ -121,19 +142,15 @@ impl MarkerHistory {
 
     /// The space the poses are in moved: the new origin is at `new_in_previous` in the old space.
     /// The poses so far are moved into the new space, or forgotten if where it is is not known.
-    pub fn move_origin(&mut self, new_in_previous: Option<Posef>) {
+    pub fn move_origin(&mut self, new_in_previous: Option<Pose>) {
         let Some(new_in_previous) = new_in_previous else {
             self.clear();
             return;
         };
 
-        let previous_in_new = math::inverse(new_in_previous);
-        let pose = |pose: Pose| math::to_ipc(math::compose(previous_in_new, math::from_ipc(pose)));
-        let rotation = previous_in_new.orientation;
-        let vector = |v: Vec3| {
-            let o = rotation;
-            rotate([o.x, o.y, o.z, o.w], v)
-        };
+        let previous_in_new = inverse(new_in_previous);
+        let pose = |pose: Pose| compose(previous_in_new, pose);
+        let vector = |v: Vec3| rotate(previous_in_new.orientation, v);
         for marker in self
             .trackers
             .iter_mut()
@@ -146,7 +163,7 @@ impl MarkerHistory {
                 sample.velocity = vector(sample.velocity);
                 sample.angular_velocity = vector(sample.angular_velocity);
             }
-            if let Some((_, held, _)) = &mut marker.held {
+            if let Some((_, held)) = &mut marker.held {
                 *held = pose(*held);
             }
         }
@@ -252,16 +269,8 @@ impl MarkerHistory {
 impl MarkerSamples {
     fn add(&mut self, time_ns: i64, pose: Pose, size: f32) {
         let Some(&previous) = self.samples.back() else {
-            self.samples.push_back(Sample {
-                time_ns,
-                pose,
-                size,
-                filtered: pose,
-                velocity: [0.0; 3],
-                angular_velocity: [0.0; 3],
-                lag: [0.0; 2],
-                estimate: pose,
-            });
+            self.samples
+                .push_back(Sample::unfiltered(time_ns, pose, size, [0.0; 3], [0.0; 3]));
             return;
         };
         if time_ns <= previous.time_ns {
@@ -270,51 +279,46 @@ impl MarkerSamples {
 
         // Far from where it should be: wait for the next detection to agree
         let predicted = extrapolate(&previous, time_ns);
-        let far = distance(pose.position, predicted.position) > OUTLIER_DISTANCE
-            || angle(pose.orientation, predicted.orientation) > OUTLIER_ANGLE;
-        match self.held.take() {
-            None if far => {
-                self.held = Some((time_ns, pose, size));
-                return;
-            }
-            // Confirmed: a real jump, which the filter would only crawl after. Start again from
-            // the two detections.
-            Some((held_time, held_pose, _))
-                if far
-                    && distance(pose.position, held_pose.position) <= OUTLIER_DISTANCE
-                    && angle(pose.orientation, held_pose.orientation) <= OUTLIER_ANGLE =>
-            {
-                let seconds = (time_ns - held_time).max(1) as f32 / 1e9;
-                // The detections before were of another place
-                self.samples.clear();
-                self.samples.push_back(Sample {
-                    time_ns,
-                    pose,
-                    size,
-                    filtered: pose,
-                    velocity: std::array::from_fn(|i| {
+        if far(pose, predicted) {
+            match self.held.replace((time_ns, pose)) {
+                // Confirmed: a real jump, which the filter would only crawl after. Start again
+                // from the two detections.
+                Some((held_time, held_pose)) if !far(pose, held_pose) => {
+                    self.held = None;
+                    let seconds = (time_ns - held_time).max(1) as f32 / 1e9;
+                    let velocity = std::array::from_fn(|i| {
                         (pose.position[i] - held_pose.position[i]) / seconds
-                    }),
-                    angular_velocity: rotation_vector(quat_mul(
+                    });
+                    let angular_velocity = rotation_vector(quat_mul(
                         pose.orientation,
                         conjugate(held_pose.orientation),
                     ))
-                    .map(|v| v / seconds),
-                    lag: [0.0; 2],
-                    estimate: pose,
-                });
-                return;
+                    .map(|v| v / seconds);
+                    // The detections before were of another place
+                    self.samples.clear();
+                    self.samples.push_back(Sample::unfiltered(
+                        time_ns,
+                        pose,
+                        size,
+                        velocity,
+                        angular_velocity,
+                    ));
+                }
+                // Held, in place of one held before that it does not confirm
+                _ => (),
             }
-            _ => (),
+            return;
         }
+        self.held = None;
 
         let seconds = (time_ns - previous.time_ns) as f32 / 1e9;
 
-        // One Euro filter of the position, in the space of the poses
         // Of the detections: from the filtered poses, they would include the filter's lag
         let (velocity, angular_velocity) = self.velocities(time_ns, pose);
+
+        // One Euro filter of the position, in the space of the poses
         let position_cutoff = POSITION_MIN_CUTOFF_HZ + POSITION_BETA * length(velocity);
-        let position = lerp3(
+        let position = lerp(
             previous.filtered.position,
             pose.position,
             smoothing(seconds, position_cutoff),
@@ -348,13 +352,7 @@ impl MarkerSamples {
         sample.estimate = moved_on(&sample, sample.lag);
         self.samples.push_back(sample);
     }
-}
 
-fn time_constant(cutoff_hz: f32) -> f32 {
-    1.0 / (2.0 * PI * cutoff_hz)
-}
-
-impl MarkerSamples {
     /// The velocities of the detections of the latest window, ending with `pose` at `time_ns`:
     /// the least squares slopes of the positions, and of the rotations from `pose`.
     fn velocities(&self, time_ns: i64, pose: Pose) -> (Vec3, Vec3) {
@@ -404,6 +402,10 @@ impl MarkerSamples {
     }
 }
 
+fn time_constant(cutoff_hz: f32) -> f32 {
+    1.0 / (2.0 * PI * cutoff_hz)
+}
+
 /// The weight of a new value in a low-pass filter of this cutoff, `seconds` after the last one.
 fn smoothing(seconds: f32, cutoff_hz: f32) -> f32 {
     1.0 / (1.0 + time_constant(cutoff_hz) / seconds)
@@ -436,6 +438,12 @@ fn extrapolate(sample: &Sample, time_ns: i64) -> Pose {
     moved_on(sample, sample.lag.map(|lag| lag + seconds))
 }
 
+/// Whether a detection is too far from where it was expected to be taken as it is.
+fn far(pose: Pose, expected: Pose) -> bool {
+    distance(pose.position, expected.position) > OUTLIER_DISTANCE
+        || angle(pose.orientation, expected.orientation) > OUTLIER_ANGLE
+}
+
 /// 0 below the range, 1 above it, smoothly in between.
 fn fade_in(value: f32, [from, to]: [f32; 2]) -> f32 {
     let t = ((value - from) / (to - from)).clamp(0.0, 1.0);
@@ -466,7 +474,7 @@ fn interpolate(samples: &VecDeque<Sample>, time_ns: i64) -> Located {
     Located {
         pose: Pose {
             orientation: slerp(a.estimate.orientation, b.estimate.orientation, t),
-            position: lerp3(a.estimate.position, b.estimate.position, t),
+            position: lerp(a.estimate.position, b.estimate.position, t),
         },
         size: a.size + (b.size - a.size) * t,
     }
@@ -558,113 +566,17 @@ fn mean_orientation(orientations: impl Iterator<Item = Quat>) -> Quat {
     normalize(sum)
 }
 
-fn lerp3(a: Vec3, b: Vec3, t: f32) -> Vec3 {
-    std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
-}
-
-fn length(v: Vec3) -> f32 {
-    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
-}
-
-fn distance(a: Vec3, b: Vec3) -> f32 {
-    length(std::array::from_fn(|i| a[i] - b[i]))
-}
-
-fn dot(a: Quat, b: Quat) -> f32 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
-}
-
-fn normalize(q: Quat) -> Quat {
-    let length = dot(q, q).sqrt();
-    if length > 0.0 {
-        q.map(|value| value / length)
-    } else {
-        [0.0, 0.0, 0.0, 1.0]
-    }
-}
-
-/// The angle of the rotation between two orientations, in radians.
-fn angle(a: Quat, b: Quat) -> f32 {
-    2.0 * dot(a, b).abs().min(1.0).acos()
-}
-
-fn conjugate(q: Quat) -> Quat {
-    [-q[0], -q[1], -q[2], q[3]]
-}
-
-fn quat_mul(a: Quat, b: Quat) -> Quat {
-    [
-        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
-        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
-        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
-        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
-    ]
-}
-
-fn rotate(q: Quat, v: Vec3) -> Vec3 {
-    let rotated = quat_mul(quat_mul(q, [v[0], v[1], v[2], 0.0]), conjugate(q));
-    [rotated[0], rotated[1], rotated[2]]
-}
-
-/// Axis times angle, along the shorter way round.
-fn rotation_vector(q: Quat) -> Vec3 {
-    let q = if q[3] < 0.0 { q.map(|v| -v) } else { q };
-    let sin = length([q[0], q[1], q[2]]);
-    if sin < 1e-7 {
-        return [2.0 * q[0], 2.0 * q[1], 2.0 * q[2]];
-    }
-    let angle = 2.0 * sin.atan2(q[3]);
-    [q[0], q[1], q[2]].map(|v| v / sin * angle)
-}
-
-fn from_rotation_vector(v: Vec3) -> Quat {
-    let angle = length(v);
-    if angle < 1e-7 {
-        return normalize([v[0] / 2.0, v[1] / 2.0, v[2] / 2.0, 1.0]);
-    }
-    let sin = (angle / 2.0).sin() / angle;
-    [v[0] * sin, v[1] * sin, v[2] * sin, (angle / 2.0).cos()]
-}
-
-/// Spherical interpolation, along the shorter arc.
-fn slerp(a: Quat, b: Quat, t: f32) -> Quat {
-    let mut cos = dot(a, b);
-    let b = if cos < 0.0 {
-        cos = -cos;
-        b.map(|value| -value)
-    } else {
-        b
-    };
-
-    // Nearly the same rotation: linear is precise enough, and avoids dividing by ~0
-    if cos > 0.9995 {
-        return normalize(std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t));
-    }
-
-    let angle = cos.acos();
-    let sin = angle.sin();
-    let wa = ((1.0 - t) * angle).sin() / sin;
-    let wb = (t * angle).sin() / sin;
-
-    normalize(std::array::from_fn(|i| a[i] * wa + b[i] * wb))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{MOVING, MS, yaw_radians};
     use alvr_marker_ipc::{Marker, Stream};
 
-    const MOVING: TrackingConfig = TrackingConfig {
-        static_markers: false,
-        marker_size: None,
-    };
-    const MS: i64 = 1_000_000;
     /// When the dog of [`history`] was seen last.
     const END: i64 = 1000 * MS;
 
-    fn yaw(degrees: f32) -> [f32; 4] {
-        let half = degrees.to_radians() / 2.0;
-        [0.0, half.sin(), 0.0, half.cos()]
+    fn yaw(degrees: f32) -> Quat {
+        yaw_radians(degrees.to_radians())
     }
 
     /// Text, x and yaw in degrees of each marker.
@@ -728,6 +640,27 @@ mod tests {
             .pose
     }
 
+    /// The dog standing at x = 0 for half a second, and a function that has it detected at x
+    /// 16 ms after the last detection and returns where it is then.
+    fn standing_dog() -> (MarkerHistory, impl FnMut(&mut MarkerHistory, f32) -> f32) {
+        let mut time = 0;
+        let mut see = move |history: &mut MarkerHistory, x: f32| {
+            time += 16 * MS;
+            history.add(&snapshot(&[(time, &[("dog", x, 0.0)])]));
+            history
+                .locate(MOVING, dog(), At::Latest, time)
+                .unwrap()
+                .pose
+                .position[0]
+        };
+        let mut history = MarkerHistory::default();
+        for _ in 0..30 {
+            see(&mut history, 0.0);
+        }
+
+        (history, see)
+    }
+
     #[test]
     fn moving_markers_are_followed() {
         let history = history();
@@ -781,20 +714,7 @@ mod tests {
 
     #[test]
     fn single_wild_detections_are_ignored_and_jumps_followed() {
-        let mut history = MarkerHistory::default();
-        let mut time = 0;
-        let mut see = |history: &mut MarkerHistory, x: f32| {
-            time += 16 * MS;
-            history.add(&snapshot(&[(time, &[("dog", x, 0.0)])]));
-            history
-                .locate(MOVING, dog(), At::Latest, time)
-                .unwrap()
-                .pose
-                .position[0]
-        };
-        for _ in 0..30 {
-            see(&mut history, 0.0);
-        }
+        let (mut history, mut see) = standing_dog();
 
         // Once off by 10 cm: ignored
         assert!(near(see(&mut history, 0.1), 0.0, 0.001));
@@ -807,19 +727,30 @@ mod tests {
     }
 
     #[test]
+    fn wild_detections_that_disagree_are_all_ignored() {
+        let (mut history, mut see) = standing_dog();
+
+        // Off by 10 cm one way, then the other: neither confirms the other
+        assert!(near(see(&mut history, 0.1), 0.0, 0.001));
+        assert!(near(see(&mut history, -0.1), 0.0, 0.001));
+        assert!(near(see(&mut history, 0.0), 0.0, 0.001));
+
+        // The next one has to agree with the latest wild one
+        assert!(near(see(&mut history, 0.1), 0.0, 0.001));
+        assert!(near(see(&mut history, 0.3), 0.0, 0.001));
+        assert!(near(see(&mut history, 0.3), 0.3, 0.001));
+    }
+
+    #[test]
     fn poses_follow_the_origin() {
         let mut history = history();
         let before = at(&history, END);
         let middle = at(&history, 505 * MS);
 
         // The new origin is 1 m along +X: everything is 1 m nearer along X
-        history.move_origin(Some(openxr_sys::Posef {
-            orientation: openxr_sys::Quaternionf::IDENTITY,
-            position: openxr_sys::Vector3f {
-                x: 1.0,
-                y: 0.0,
-                z: 0.0,
-            },
+        history.move_origin(Some(Pose {
+            orientation: crate::math::IDENTITY,
+            position: [1.0, 0.0, 0.0],
         }));
         assert!(near(
             at(&history, END).position[0],
@@ -875,21 +806,6 @@ mod tests {
         history.add(&Snapshot::default());
         assert!(history.seen(MOVING, END).is_empty());
     }
-
-    #[test]
-    fn slerp_takes_the_shorter_arc() {
-        let a = yaw(10.0);
-        let b = yaw(30.0).map(|value| -value);
-        let middle = slerp(a, b, 0.5);
-        assert!(angle(middle, yaw(20.0)) < 1e-4);
-    }
-
-    #[test]
-    fn rotation_vectors_round_trip() {
-        let q = normalize([0.1, 0.7, -0.2, 0.6]);
-        let back = from_rotation_vector(rotation_vector(q));
-        assert!(angle(q, back) < 1e-4);
-    }
 }
 
 /// Noisy detections of codes moving in known ways, and how far from the truth an application
@@ -897,13 +813,9 @@ mod tests {
 #[cfg(test)]
 mod jitter {
     use super::*;
-    use alvr_marker_ipc::{Marker, Stream};
+    use crate::test_util::{MOVING, MS, yaw_radians};
+    use alvr_marker_ipc::{Marker, Stream, marker_id};
 
-    const MOVING: TrackingConfig = TrackingConfig {
-        static_markers: false,
-        marker_size: None,
-    };
-    const MS: i64 = 1_000_000;
     /// The headset's detections.
     const DETECTION_INTERVAL_NS: i64 = 1_000_000_000 / 60;
     const TIMING_JITTER_NS: i64 = 3 * MS;
@@ -931,29 +843,16 @@ mod jitter {
         }
     }
 
-    fn small_rotation(v: [f32; 3]) -> [f32; 4] {
-        let angle = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-        if angle < 1e-9 {
-            return [0.0, 0.0, 0.0, 1.0];
-        }
-        let s = (angle / 2.0).sin() / angle;
-        [v[0] * s, v[1] * s, v[2] * s, (angle / 2.0).cos()]
-    }
-
-    fn angle_between(a: [f32; 4], b: [f32; 4]) -> f32 {
-        angle(a, b).to_degrees()
-    }
-
     #[derive(Debug)]
-    pub struct Errors {
-        pub position_rms_mm: f32,
-        pub position_p95_mm: f32,
-        pub angle_rms_degrees: f32,
+    struct Errors {
+        position_rms_mm: f32,
+        position_p95_mm: f32,
+        angle_rms_degrees: f32,
     }
 
     /// Runs `seconds` of detections of a code whose true pose is `truth(seconds)`, located as for
     /// a moving or a static context.
-    pub fn measure(
+    fn measure(
         seed: u64,
         seconds: f32,
         truth: impl Fn(f32) -> Pose,
@@ -980,7 +879,7 @@ mod jitter {
                 position[0] += OUTLIER_DISTANCE;
             }
             let noise = std::array::from_fn(|_| (random.gaussian() * ANGLE_NOISE).to_radians());
-            let orientation = quat_mul(true_pose.orientation, small_rotation(noise));
+            let orientation = quat_mul(true_pose.orientation, from_rotation_vector(noise));
 
             history.add(&Snapshot {
                 streams: vec![Stream {
@@ -1010,12 +909,8 @@ mod jitter {
                     .locate(MOVING, marker_id("dog"), at, detected_at)
                     .unwrap();
                 let truth = truth(asked as f32 / 1e9);
-                let error = std::array::from_fn::<f32, 3, _>(|i| {
-                    located.pose.position[i] - truth.position[i]
-                });
-                position_errors
-                    .push((error[0] * error[0] + error[1] * error[1] + error[2] * error[2]).sqrt());
-                angle_errors.push(angle_between(located.pose.orientation, truth.orientation));
+                position_errors.push(distance(located.pose.position, truth.position));
+                angle_errors.push(angle(located.pose.orientation, truth.orientation).to_degrees());
             }
 
             time += DETECTION_INTERVAL_NS;
@@ -1033,43 +928,39 @@ mod jitter {
         }
     }
 
-    fn yaw(radians: f32) -> [f32; 4] {
-        [0.0, (radians / 2.0).sin(), 0.0, (radians / 2.0).cos()]
-    }
-
-    pub fn still(_: f32) -> Pose {
+    fn still(_: f32) -> Pose {
         Pose {
-            orientation: yaw(0.3),
+            orientation: yaw_radians(0.3),
             position: [0.5, 1.5, -2.0],
         }
     }
 
-    pub fn walking(t: f32) -> Pose {
+    fn walking(t: f32) -> Pose {
         Pose {
-            orientation: yaw(0.3),
+            orientation: yaw_radians(0.3),
             position: [0.5 * t, 1.5, -2.0],
         }
     }
 
-    /// The emulator's dog: around a 0.4 m circle every 6 s, turning with it.
-    pub fn circling(t: f32) -> Pose {
+    /// Around a 0.4 m circle every 6 s, turning with it.
+    fn circling(t: f32) -> Pose {
         let angle = std::f32::consts::TAU * t / 6.0;
         Pose {
-            orientation: yaw(angle),
+            orientation: yaw_radians(angle),
             position: [0.4 * angle.cos(), 1.2, -2.0 - 0.4 * angle.sin()],
         }
     }
 
     /// Stands for 1.5 s, walks at 0.5 m/s for 1 s, and stands again.
-    pub fn start_stop(t: f32) -> Pose {
+    fn start_stop(t: f32) -> Pose {
         Pose {
-            orientation: yaw(0.3),
+            orientation: yaw_radians(0.3),
             position: [0.5 * (t - 1.5).clamp(0.0, 1.0), 1.5, -2.0],
         }
     }
 
     /// The errors of five runs, averaged.
-    pub fn errors(truth: fn(f32) -> Pose, static_context: bool) -> Errors {
+    fn errors(truth: fn(f32) -> Pose, static_context: bool) -> Errors {
         let runs = (1..=5)
             .map(|seed| measure(seed * 7919, 4.0, truth, static_context))
             .collect::<Vec<_>>();
@@ -1081,7 +972,7 @@ mod jitter {
         }
     }
 
-    pub const SCENARIOS: [(&str, fn(f32) -> Pose, bool); 5] = [
+    const SCENARIOS: [(&str, fn(f32) -> Pose, bool); 5] = [
         ("still", still, false),
         ("walking", walking, false),
         ("circling", circling, false),
@@ -1089,7 +980,7 @@ mod jitter {
         ("static", still, true),
     ];
 
-    /// What applications are told stays near the truth, by about half again what it is now.
+    /// The errors applications see stay within these limits, about 1.5 times the measured ones.
     #[test]
     fn jitter_stays_small() {
         let limits = [

@@ -80,6 +80,7 @@ impl Default for Pose {
 
 /// What the headset can do with markers.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Capabilities {
     pub qr_codes: bool,
     /// Honours [`TrackingConfig::marker_size`].
@@ -88,8 +89,10 @@ pub struct Capabilities {
     pub static_markers: bool,
 }
 
-/// How the headset tracks markers for a spatial context: its marker options.
+/// How the headset tracks markers for a spatial context: its marker options. The headset runs one
+/// tracker per configuration.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TrackingConfig {
     /// The markers do not move (XrSpatialMarkerStaticOptimizationEXT).
     pub static_markers: bool,
@@ -109,6 +112,7 @@ impl TrackingConfig {
 
 /// What a QR code holds, as the headset decoded it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Payload {
     Text(String),
     /// Byte mode data that is not text.
@@ -189,9 +193,9 @@ pub struct Stream {
 /// How ALVR recentering moved the space the poses are in, which is what SteamVR's OpenXR runtime
 /// calls STAGE. SteamVR does not see it: for applications, all their reference spaces moved.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Origin {
-    /// Changes since the driver started.
-    pub changes: u64,
+pub struct OriginChange {
+    /// Changes so far.
+    pub count: u64,
     /// When the latest change took effect, see [`now_ns`].
     pub changed_ns: i64,
     /// The new origin in the space before the latest change, when known.
@@ -207,7 +211,7 @@ pub struct Snapshot {
     pub generation: u64,
     /// Of the headset connected last.
     pub capabilities: Capabilities,
-    pub origin: Origin,
+    pub origin: OriginChange,
     /// One per tracker the headset runs, each configuration supported by the headset.
     pub streams: Vec<Stream>,
 }
@@ -274,6 +278,12 @@ impl MessageWriter {
 
     fn f32(&mut self, value: f32) {
         self.0.extend(value.to_le_bytes());
+    }
+
+    fn pose(&mut self, pose: &Pose) {
+        for &value in pose.orientation.iter().chain(&pose.position) {
+            self.f32(value);
+        }
     }
 
     fn config(&mut self, config: &TrackingConfig) {
@@ -356,14 +366,11 @@ fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
     );
 
     let origin = &snapshot.origin;
-    writer.u64(origin.changes);
+    writer.u64(origin.count);
     writer.i64(origin.changed_ns);
     writer.u32(origin.pose_in_previous.is_some().into());
     writer.u32(origin.moved.into());
-    let pose = origin.pose_in_previous.unwrap_or_default();
-    for &value in pose.orientation.iter().chain(&pose.position) {
-        writer.f32(value);
-    }
+    writer.pose(&origin.pose_in_previous.unwrap_or_default());
 
     writer.u32(snapshot.streams.len() as u32);
     for stream in &snapshot.streams {
@@ -372,9 +379,7 @@ fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
         writer.u32(stream.markers.len() as u32);
         for marker in &stream.markers {
             writer.u64(marker.id);
-            for &value in marker.pose.orientation.iter().chain(&marker.pose.position) {
-                writer.f32(value);
-            }
+            writer.pose(&marker.pose);
             writer.f32(marker.size);
             let bytes = marker.payload.as_bytes();
             writer.u32(match marker.payload {
@@ -406,13 +411,13 @@ fn decode_snapshot(message: &[u8]) -> Option<Snapshot> {
         static_markers: capability_bits & CAPABILITY_STATIC_MARKERS != 0,
     };
 
-    let changes = reader.u64()?;
+    let count = reader.u64()?;
     let changed_ns = reader.i64()?;
     let has_pose = reader.u32()? != 0;
     let moved = reader.u32()? != 0;
     let pose = reader.pose()?;
-    let origin = Origin {
-        changes,
+    let origin = OriginChange {
+        count,
         changed_ns,
         pose_in_previous: has_pose.then_some(pose),
         moved,
@@ -585,12 +590,12 @@ impl Server {
         self.pipe.send(encode_snapshot(&self.snapshot));
     }
 
-    pub fn origin(&self) -> Origin {
+    pub fn origin(&self) -> OriginChange {
         self.snapshot.origin
     }
 
     /// Sent with the next [`Server::publish`].
-    pub fn set_origin(&mut self, origin: Origin) {
+    pub fn set_origin(&mut self, origin: OriginChange) {
         self.snapshot.origin = origin;
     }
 }
@@ -635,7 +640,7 @@ impl Client {
 
     /// The latest state, or `None` while the driver is not running. Never blocks, except for
     /// waiting briefly for the first snapshot right after connecting.
-    pub fn read(&mut self) -> Option<Snapshot> {
+    pub fn read(&mut self) -> Option<&Snapshot> {
         if self.connection.is_none() {
             self.try_connect();
         }
@@ -644,7 +649,7 @@ impl Client {
             self.disconnect();
         }
 
-        self.snapshot.clone()
+        self.snapshot.as_ref()
     }
 
     /// Every snapshot received since the last call, oldest first, so that no pose is missed.
@@ -786,8 +791,8 @@ mod tests {
                 fixed_size_markers: false,
                 static_markers: true,
             },
-            origin: Origin {
-                changes: 3,
+            origin: OriginChange {
+                count: 3,
                 changed_ns: 456,
                 pose_in_previous: Some(pose(0.5)),
                 moved: true,
@@ -804,7 +809,7 @@ mod tests {
 
         // Not known where the new origin is
         let unknown = Snapshot {
-            origin: Origin {
+            origin: OriginChange {
                 pose_in_previous: None,
                 moved: false,
                 ..snapshot.origin
@@ -917,11 +922,11 @@ mod tests {
             Server::start_named(name, |_| ()).unwrap()
         }
 
-        fn wait_for(client: &mut Client, condition: impl Fn(&Option<Snapshot>) -> bool) {
+        fn wait_for(client: &mut Client, condition: impl Fn(Option<&Snapshot>) -> bool) {
             let start = Instant::now();
             loop {
                 let snapshot = client.read();
-                if condition(&snapshot) {
+                if condition(snapshot) {
                     return;
                 }
                 assert!(start.elapsed() < Duration::from_secs(5), "{snapshot:?}");
@@ -929,10 +934,8 @@ mod tests {
             }
         }
 
-        fn marker_count(snapshot: &Option<Snapshot>) -> usize {
-            snapshot
-                .as_ref()
-                .map_or(0, |s| s.streams.iter().map(|s| s.markers.len()).sum())
+        fn marker_count(snapshot: Option<&Snapshot>) -> usize {
+            snapshot.map_or(0, |s| s.streams.iter().map(|s| s.markers.len()).sum())
         }
 
         #[test]
@@ -942,7 +945,7 @@ mod tests {
 
             // The first read already has the current state
             let mut client = Client::new_named(&name);
-            assert_eq!(client.read(), Some(Snapshot::default()));
+            assert_eq!(client.read(), Some(&Snapshot::default()));
 
             server.publish(
                 FLAG_CLIENT_CONNECTED,
@@ -953,7 +956,7 @@ mod tests {
                 ],
             );
             wait_for(&mut client, |snapshot| marker_count(snapshot) == 2);
-            let snapshot = client.read().unwrap();
+            let snapshot = client.read().unwrap().clone();
             assert_eq!(snapshot.flags, FLAG_CLIENT_CONNECTED);
             assert_eq!(snapshot.capabilities, ALL);
             assert_eq!(snapshot.streams[0].config, STATIC);
@@ -967,7 +970,7 @@ mod tests {
 
             // A client connecting later gets the same state at once
             let mut late = Client::new_named(&name);
-            assert_eq!(late.read(), Some(snapshot));
+            assert_eq!(late.read(), Some(&snapshot));
         }
 
         #[test]
@@ -1050,10 +1053,10 @@ mod tests {
                 receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
                 Vec::new()
             );
-            wait_for(&mut client, Option::is_none);
+            wait_for(&mut client, |snapshot| snapshot.is_none());
 
             let _server = Server::start_named(&name, on_requests).unwrap();
-            wait_for(&mut client, Option::is_some);
+            wait_for(&mut client, |snapshot| snapshot.is_some());
             assert_eq!(
                 receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
                 vec![SIZED]
@@ -1070,7 +1073,7 @@ mod tests {
             assert!(client.read().is_some());
 
             drop(server);
-            wait_for(&mut client, Option::is_none);
+            wait_for(&mut client, |snapshot| snapshot.is_none());
             assert!(!client.is_connected());
 
             let mut server = start(&name);
@@ -1134,7 +1137,7 @@ mod tests {
             // Others still get the latest markers, and the server shuts down
             let mut client = Client::new_named(&name);
             wait_for(&mut client, |snapshot| {
-                snapshot.as_ref().is_some_and(|s| {
+                snapshot.is_some_and(|s| {
                     s.streams[0].markers.first().map(|m| m.pose) == Some(pose(199.0))
                 })
             });

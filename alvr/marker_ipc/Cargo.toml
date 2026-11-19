@@ -8,6 +8,7 @@ license.workspace = true
 
 # Kept free of other ALVR crates: the OpenXR API layer links this into every OpenXR application.
 [dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

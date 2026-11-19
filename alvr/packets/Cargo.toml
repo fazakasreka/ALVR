@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 alvr_common.workspace = true
+alvr_marker_ipc = { path = "../marker_ipc", features = ["serde"] }
 alvr_session.workspace = true
 
 serde = { version = "1", features = ["derive"] }

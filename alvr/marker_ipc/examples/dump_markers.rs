@@ -27,7 +27,7 @@ fn main() -> ExitCode {
                 let origin = &snapshot.origin;
                 println!(
                     "  origin: {} change(s), the latest {:.1} s ago, {}",
-                    origin.changes,
+                    origin.count,
                     (now_ns() - origin.changed_ns) as f64 / 1e9,
                     match &origin.pose_in_previous {
                         Some(pose) => format!(

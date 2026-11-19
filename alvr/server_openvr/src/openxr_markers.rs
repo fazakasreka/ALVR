@@ -9,13 +9,12 @@
 //! OpenXR times convert to, the way the head pose is: the head pose submitted to SteamVR now is
 //! the one for the headset time `poll_timestamp + motion-to-photon latency`.
 
-use alvr_common::{info, parking_lot::Mutex, warn};
+use alvr_common::{Pose, info, parking_lot::Mutex, warn};
 use alvr_filesystem as afs;
 use alvr_marker_ipc::{
-    Capabilities, FLAG_CLIENT_CONNECTED, Marker, Origin, Payload, Pose, Server, Stream,
-    TrackingConfig, now_ns,
+    self as ipc, Capabilities, FLAG_CLIENT_CONNECTED, Marker, Server, Stream, TrackingConfig,
+    now_ns,
 };
-use alvr_packets::{MarkerCapabilities, MarkerPayload, MarkerTrackingConfig};
 use alvr_server_core::{MarkerStream, OriginChange};
 use std::time::Duration;
 
@@ -30,25 +29,20 @@ struct State {
     streams: Vec<MarkerStream>,
     /// Performance counter time minus headset time, in nanoseconds.
     clock_offset_ns: Option<f64>,
-    /// The latest origin change of the server's tracking.
-    tracking_origin: OriginChange,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 /// What OpenXR applications ask for, kept for a server context created after they asked.
-static REQUESTED: Mutex<Vec<MarkerTrackingConfig>> = Mutex::new(Vec::new());
+static REQUESTED: Mutex<Vec<TrackingConfig>> = Mutex::new(Vec::new());
 
 /// `on_requests` gets the tracker configurations OpenXR applications ask for, whenever they
 /// change.
 pub fn start(
     layout: &afs::Layout,
     enabled: bool,
-    on_requests: impl Fn(Vec<MarkerTrackingConfig>) + Send + Sync + 'static,
+    on_requests: impl Fn(Vec<TrackingConfig>) + Send + Sync + 'static,
 ) {
-    #[cfg(windows)]
-    registration::register(layout, enabled);
-    #[cfg(not(windows))]
-    let _ = layout;
+    alvr_server_io::register_openxr_layer(layout, enabled);
 
     if !enabled {
         return;
@@ -56,7 +50,6 @@ pub fn start(
 
     let server = match Server::start(move |configs| {
         info!("OpenXR applications ask for marker trackers {configs:?}");
-        let configs = configs.into_iter().map(from_ipc_config).collect::<Vec<_>>();
         *REQUESTED.lock() = configs.clone();
         on_requests(configs);
     }) {
@@ -73,12 +66,11 @@ pub fn start(
         capabilities: Capabilities::default(),
         streams: Vec::new(),
         clock_offset_ns: None,
-        tracking_origin: OriginChange::default(),
     });
 }
 
 /// The tracker configurations OpenXR applications ask for.
-pub fn requested_configs() -> Vec<MarkerTrackingConfig> {
+pub fn requested_configs() -> Vec<TrackingConfig> {
     REQUESTED.lock().clone()
 }
 
@@ -98,13 +90,9 @@ pub fn set_client_connected(connected: bool) {
     }
 }
 
-pub fn set_capabilities(capabilities: MarkerCapabilities) {
+pub fn set_capabilities(capabilities: Capabilities) {
     if let Some(state) = &mut *STATE.lock() {
-        state.capabilities = Capabilities {
-            qr_codes: capabilities.qr_codes,
-            fixed_size_markers: capabilities.fixed_size_markers,
-            static_markers: capabilities.static_markers,
-        };
+        state.capabilities = capabilities;
         publish(state);
     }
 }
@@ -124,24 +112,13 @@ pub fn report_head_pose_time(headset_time: Duration) {
 /// submitted to SteamVR in. `origin` says how recentering moved that space.
 pub fn set_markers(streams: Vec<MarkerStream>, origin: OriginChange) {
     if let Some(state) = &mut *STATE.lock() {
-        if origin.count != state.tracking_origin.count {
-            // Where the new origin is, is known only for a single step from the last one seen
-            let follows = origin.count == state.tracking_origin.count + 1;
-            state.tracking_origin = origin;
-            let previous = state.server.origin();
-            state.server.set_origin(Origin {
-                changes: previous.changes + 1,
+        if origin.count != state.server.origin().count {
+            state.server.set_origin(ipc::OriginChange {
+                count: origin.count,
                 // The poses being submitted to SteamVR are already in the new space
                 changed_ns: now_ns(),
-                pose_in_previous: origin
-                    .pose_in_previous
-                    .filter(|_| follows)
-                    .map(|pose| Pose {
-                        orientation: pose.orientation.to_array(),
-                        position: pose.position.to_array(),
-                    }),
-                // Changes missed in between may have moved it
-                moved: origin.moved || !follows,
+                pose_in_previous: origin.pose_in_previous.map(to_ipc_pose),
+                moved: origin.moved,
             });
         }
         state.streams = streams;
@@ -149,17 +126,10 @@ pub fn set_markers(streams: Vec<MarkerStream>, origin: OriginChange) {
     }
 }
 
-fn from_ipc_config(config: TrackingConfig) -> MarkerTrackingConfig {
-    MarkerTrackingConfig {
-        static_markers: config.static_markers,
-        marker_size: config.marker_size,
-    }
-}
-
-fn to_ipc_config(config: MarkerTrackingConfig) -> TrackingConfig {
-    TrackingConfig {
-        static_markers: config.static_markers,
-        marker_size: config.marker_size,
+fn to_ipc_pose(pose: Pose) -> ipc::Pose {
+    ipc::Pose {
+        orientation: pose.orientation.to_array(),
+        position: pose.position.to_array(),
     }
 }
 
@@ -174,7 +144,7 @@ fn publish(state: &mut State) {
         .streams
         .iter()
         .map(|stream| Stream {
-            config: to_ipc_config(stream.config),
+            config: stream.config,
             time_ns: match state.clock_offset_ns {
                 Some(offset) => (stream.timestamp.as_nanos() as f64 + offset) as i64,
                 // No tracking yet to tell the clocks apart
@@ -185,14 +155,8 @@ fn publish(state: &mut State) {
                 .iter()
                 .map(|marker| {
                     Marker::with_payload(
-                        match &marker.payload {
-                            MarkerPayload::Text(text) => Payload::Text(text.clone()),
-                            MarkerPayload::Bytes(bytes) => Payload::Bytes(bytes.clone()),
-                        },
-                        Pose {
-                            orientation: marker.pose.orientation.to_array(),
-                            position: marker.pose.position.to_array(),
-                        },
+                        marker.payload.clone(),
+                        to_ipc_pose(marker.pose),
                         marker.size,
                     )
                 })
@@ -201,238 +165,4 @@ fn publish(state: &mut State) {
         .collect();
 
     state.server.publish(flags, state.capabilities, streams);
-}
-
-#[cfg(windows)]
-mod registration {
-    //! The layer is registered for the current user under
-    //! HKCU\Software\Khronos\OpenXR\1\ApiLayers\Implicit, as a value named after the manifest
-    //! path: 0 enables it, anything else disables it. Packaged (AppContainer) applications read
-    //! neither that key nor the streamer folder unless ALL APPLICATION PACKAGES is granted read
-    //! access to them, so that is done too.
-
-    use super::*;
-    use std::{ffi::OsStr, os::windows::ffi::OsStrExt, path::Path, ptr};
-    use windows_sys::Win32::{
-        Foundation::{ERROR_SUCCESS, LocalFree},
-        Security::{
-            ACL,
-            Authorization::{
-                ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
-                SE_FILE_OBJECT, SE_REGISTRY_KEY, SetEntriesInAclW, SetNamedSecurityInfoW,
-                TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
-            },
-            CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
-            PSECURITY_DESCRIPTOR, PSID,
-        },
-        Storage::FileSystem::{FILE_GENERIC_EXECUTE, FILE_GENERIC_READ},
-        System::Registry::{
-            HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE,
-            RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegEnumValueW, RegSetValueExW,
-        },
-    };
-
-    const IMPLICIT_LAYERS_KEY: &str = r"Software\Khronos\OpenXR\1\ApiLayers\Implicit";
-    const ALL_APPLICATION_PACKAGES: &str = "S-1-15-2-1";
-
-    fn wide(text: &OsStr) -> Vec<u16> {
-        text.encode_wide().chain([0]).collect()
-    }
-
-    pub fn register(layout: &afs::Layout, enabled: bool) {
-        let manifest = layout.openxr_layer_manifest();
-        if !manifest.exists() {
-            info!(
-                "No OpenXR layer at {}, OpenXR applications will not get markers",
-                manifest.display()
-            );
-            return;
-        }
-
-        if let Err(e) = set_registry_value(&manifest, enabled) {
-            warn!("Cannot register the OpenXR marker layer: {e}");
-            return;
-        }
-        if let Err(e) = grant_app_packages_access(
-            &layout.openxr_layer_dir(),
-            SE_FILE_OBJECT,
-            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
-        ) {
-            warn!("Packaged OpenXR applications cannot load the marker layer: {e}");
-        }
-
-        info!(
-            "OpenXR marker layer {} ({})",
-            if enabled { "enabled" } else { "disabled" },
-            manifest.display()
-        );
-    }
-
-    fn set_registry_value(manifest: &Path, enabled: bool) -> Result<(), String> {
-        let mut key: HKEY = ptr::null_mut();
-        let status = unsafe {
-            RegCreateKeyExW(
-                HKEY_CURRENT_USER,
-                wide(OsStr::new(IMPLICIT_LAYERS_KEY)).as_ptr(),
-                0,
-                ptr::null(),
-                REG_OPTION_NON_VOLATILE,
-                KEY_READ | KEY_WRITE,
-                ptr::null(),
-                &mut key,
-                ptr::null_mut(),
-            )
-        };
-        if status != ERROR_SUCCESS {
-            return Err(format!("cannot open {IMPLICIT_LAYERS_KEY}: error {status}"));
-        }
-
-        let result = (|| {
-            // Another ALVR copy (an older install, a development build) registered under another
-            // path would load the layer a second time, from a folder that may not match the
-            // running driver
-            let file_name = manifest.file_name().unwrap_or_default();
-            for value in value_names(key) {
-                let path = Path::new(&value);
-                if path != manifest
-                    && path
-                        .file_name()
-                        .is_some_and(|name| name.eq_ignore_ascii_case(file_name))
-                {
-                    info!("Unregistering the OpenXR layer at {value}");
-                    unsafe { RegDeleteValueW(key, wide(OsStr::new(&value)).as_ptr()) };
-                }
-            }
-
-            let disabled = u32::from(!enabled);
-            let status = unsafe {
-                RegSetValueExW(
-                    key,
-                    wide(manifest.as_os_str()).as_ptr(),
-                    0,
-                    REG_DWORD,
-                    (&raw const disabled).cast(),
-                    size_of::<u32>() as u32,
-                )
-            };
-            if status != ERROR_SUCCESS {
-                return Err(format!("cannot write the registry value: error {status}"));
-            }
-
-            Ok(())
-        })();
-
-        unsafe { RegCloseKey(key) };
-        result?;
-
-        let key_path = format!(r"CURRENT_USER\{IMPLICIT_LAYERS_KEY}");
-        grant_app_packages_access(Path::new(&key_path), SE_REGISTRY_KEY, KEY_READ)
-    }
-
-    fn value_names(key: HKEY) -> Vec<String> {
-        let mut names = Vec::new();
-        let mut buffer = vec![0u16; 32768];
-        for index in 0.. {
-            let mut length = buffer.len() as u32;
-            let status = unsafe {
-                RegEnumValueW(
-                    key,
-                    index,
-                    buffer.as_mut_ptr(),
-                    &mut length,
-                    ptr::null(),
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                )
-            };
-            if status != ERROR_SUCCESS {
-                break;
-            }
-            names.push(String::from_utf16_lossy(&buffer[..length as usize]));
-        }
-
-        names
-    }
-
-    // Adds an inheritable ACE granting `access` to ALL APPLICATION PACKAGES. Does nothing if
-    // the object already grants it.
-    fn grant_app_packages_access(
-        object: &Path,
-        object_type: i32,
-        access: u32,
-    ) -> Result<(), String> {
-        let object = wide(object.as_os_str());
-
-        let mut sid: PSID = ptr::null_mut();
-        if unsafe {
-            ConvertStringSidToSidW(
-                wide(OsStr::new(ALL_APPLICATION_PACKAGES)).as_ptr(),
-                &mut sid,
-            )
-        } == 0
-        {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-
-        let mut old_acl: *mut ACL = ptr::null_mut();
-        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-        let mut new_acl: *mut ACL = ptr::null_mut();
-
-        let result = (|| unsafe {
-            let status = GetNamedSecurityInfoW(
-                object.as_ptr(),
-                object_type,
-                DACL_SECURITY_INFORMATION,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                &mut old_acl,
-                ptr::null_mut(),
-                &mut descriptor,
-            );
-            if status != ERROR_SUCCESS {
-                return Err(format!("cannot read the permissions: error {status}"));
-            }
-
-            let entry = EXPLICIT_ACCESS_W {
-                grfAccessPermissions: access,
-                grfAccessMode: GRANT_ACCESS,
-                grfInheritance: CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
-                Trustee: TRUSTEE_W {
-                    pMultipleTrustee: ptr::null_mut(),
-                    MultipleTrusteeOperation: 0,
-                    TrusteeForm: TRUSTEE_IS_SID,
-                    TrusteeType: TRUSTEE_IS_WELL_KNOWN_GROUP,
-                    ptstrName: sid.cast(),
-                },
-            };
-            let status = SetEntriesInAclW(1, &entry, old_acl, &mut new_acl);
-            if status != ERROR_SUCCESS {
-                return Err(format!("cannot build the permissions: error {status}"));
-            }
-
-            let status = SetNamedSecurityInfoW(
-                object.as_ptr(),
-                object_type,
-                DACL_SECURITY_INFORMATION,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                new_acl,
-                ptr::null(),
-            );
-            if status != ERROR_SUCCESS {
-                return Err(format!("cannot write the permissions: error {status}"));
-            }
-
-            Ok(())
-        })();
-
-        unsafe {
-            LocalFree(new_acl.cast());
-            LocalFree(descriptor);
-            LocalFree(sid);
-        }
-
-        result
-    }
 }

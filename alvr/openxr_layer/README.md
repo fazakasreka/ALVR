@@ -69,16 +69,16 @@ detection, so a prediction from raw detections magnifies the noise. The layer (`
 - holds back a detection far from the prediction until the next one confirms it: a single wild
   detection is ignored, a real jump is followed one detection late.
 
-With 2 mm and 0.5° of noise per axis and 1% of detections 3 cm off, at 60 Hz, 40 ms ahead
-(`cargo test -p alvr_openxr_layer jitter::report -- --nocapture`):
+The errors applications see, with 2 mm and 0.5° of noise per axis and 1% of detections 3 cm
+off, at 60 Hz, 40 ms ahead (`cargo test -p alvr_openxr_layer jitter::report -- --nocapture`):
 
-| | Before | Now |
-|---|---|---|
-| Still code, moving context | 20.2 mm, 3.8° | 0.9 mm, 0.20° |
-| Walking at 0.5 m/s | 20.2 mm, 3.8° | 2.6 mm, 0.20° |
-| Circling (the emulator's dog) | 20.2 mm, 3.8° | 3.8 mm, 0.60° |
-| Standing, walking, stopping | 20.3 mm, 3.8° | 7.3 mm, 0.64° |
-| Still code, static context | 0.7 mm, 0.10° | 0.4 mm, 0.10° |
+| | RMS error |
+|---|---|
+| Still code, moving context | 0.9 mm, 0.20° |
+| Walking at 0.5 m/s | 2.6 mm, 0.20° |
+| Circling | 3.8 mm, 0.60° |
+| Standing, walking, stopping | 7.3 mm, 0.64° |
+| Still code, static context | 0.4 mm, 0.10° |
 
 Root mean square errors against the truth. A code that stops is still predicted on for a few
 frames, about its speed times the prediction time: no predictor can know of the stop.
@@ -107,9 +107,9 @@ session but `VIEW`, in every application, marker extensions or not:
 
 Sessions created after a move do not get its event.
 
-**Coexistence.** The layer first creates the instance with the extensions the application asked
-for. If the runtime accepts them, it implements them itself and the layer steps aside. An
-application that enables none of the extensions talks to the runtime directly, but for
+**Coexistence.** The layer asks the runtime which extensions it implements and leaves those to it.
+If the runtime cannot list them, the layer finds out by trying. An application that enables none
+of the extensions talks to the runtime directly, but for
 `xrCreateSession`, `xrDestroySession` and `xrPollEvent`, which report recentering, and
 `XR_KHR_win32_convert_performance_counter_time`, which the layer enables on the runtime for the
 change times.
@@ -117,11 +117,11 @@ change times.
 ## Conformance
 
 The OpenXR CTS (1.1.65) passes `XR_EXT_spatial_marker_tracking-qr-code`, also with invalid handle and
-type validation, through SteamVR, the driver and the client emulator, and skips the Micro QR, ArUco
-and AprilTag tests as unsupported. Build `conformance_cli` from
+type validation, through SteamVR and the driver, and skips the Micro QR, ArUco and AprilTag tests
+as unsupported. Build `conformance_cli` from
 [OpenXR-CTS](https://github.com/KhronosGroup/OpenXR-CTS) (`cmake --build build --target
-conformance_cli`; keep the build path short on Windows) and, with a headset or the emulator
-streaming, run from its output folder:
+conformance_cli`; keep the build path short on Windows) and, with a headset streaming, run from
+its output folder:
 
 ```sh
 conformance_cli.exe "XR_EXT_spatial_marker_tracking-qr-code" -G D3D11 -H -T
@@ -146,8 +146,8 @@ processes, including their AppContainers, which may only read from it. The layer
 created by its own user.
 
 Unregistering the driver from SteamVR (in the dashboard, or by another ALVR copy taking over) also
-removes the layer's registration. Where that cannot happen, as when an MSIX package is removed, the
-layer finds its streamer folder is no longer among SteamVR's drivers and stays out of the way: it
+removes the layer's registration. Where that cannot happen, as when ALVR is uninstalled without its
+uninstaller, the layer finds its streamer folder is no longer among SteamVR's drivers and stays out of the way: it
 only provides the extensions the loader advertises, without any QR code, so that applications
 enabling them still start, and leaves everything else to the runtime.
 
@@ -173,12 +173,9 @@ Setting `DISABLE_XR_APILAYER_ALVR_MARKER_TRACKING` (any value) turns the layer o
 - 64-bit applications only.
 - QR codes only: the headset detects no other marker type.
 - A runtime without `XR_KHR_win32_convert_performance_counter_time` gets the latest poses, whatever
-  the requested time. SteamVR has it.
+  the requested time, and no recentering is reported. SteamVR has it.
 - No `xrEnumerateSpatialCapabilities` result until a headset has connected, so an application that
   starts SteamVR itself may need to query again once the headset is up.
-- Without `XR_KHR_win32_convert_performance_counter_time` on the runtime, recentering is not
-  reported. SteamVR has it.
-- A code moved in one jump, which only the emulator does, is predicted past where it lands for
-  about a frame, as if it kept moving.
+- A code that jumps is predicted past where it lands for about a frame, as if it kept moving.
 - The layer provides both spatial extensions together: on a runtime with `XR_EXT_spatial_entity` but
   not `XR_EXT_spatial_marker_tracking`, the runtime's own spatial entities are hidden.

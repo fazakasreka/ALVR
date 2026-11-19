@@ -1277,7 +1277,7 @@ Currently this cannot be reliably estimated automatically. The correct value sho
     pub button_mapping_config: AutomaticButtonMappingConfig,
 }
 
-#[derive(SettingsSchema, Serialize, Deserialize, Clone)]
+#[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq)]
 pub enum RecenteringMode {
     Stage,
     LocalFloor,

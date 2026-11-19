@@ -1,6 +1,7 @@
 //! Which marker trackers the headset runs: one per configuration OpenXR applications ask for,
 //! each without the options the headset does not support.
 
+use crate::{ServerCoreEvent, tracking::TrackingManager};
 use alvr_common::parking_lot::Mutex;
 use alvr_packets::{MarkerCapabilities, MarkerData, MarkerTrackingConfig, ServerControlPacket};
 use alvr_sockets::ControlSocketSender;
@@ -26,6 +27,7 @@ pub struct MarkerTracking {
     /// Last sent to the headset.
     sent: Option<Vec<MarkerTrackingConfig>>,
     control_sender: Option<ControlSender>,
+    streams: Vec<MarkerStream>, // client's reference space, one per running tracker
 }
 
 impl MarkerTracking {
@@ -51,8 +53,7 @@ impl MarkerTracking {
     }
 
     pub fn connect(&mut self, control_sender: ControlSender) {
-        self.capabilities = None;
-        self.sent = None;
+        self.disconnect();
         self.control_sender = Some(control_sender);
     }
 
@@ -60,34 +61,88 @@ impl MarkerTracking {
         self.capabilities = None;
         self.sent = None;
         self.control_sender = None;
+        self.streams.clear();
     }
 
-    pub fn set_capabilities(&mut self, capabilities: MarkerCapabilities) {
+    /// Returns whether markers of trackers the headset no longer runs were dropped.
+    pub fn set_capabilities(&mut self, capabilities: MarkerCapabilities) -> bool {
         self.capabilities = Some(capabilities);
-        self.send_configs();
+        self.send_configs()
     }
 
-    /// Replaces what OpenXR applications ask for.
-    pub fn set_requested(&mut self, configs: Vec<MarkerTrackingConfig>) {
+    /// Replaces what OpenXR applications ask for. Returns whether markers of trackers the headset
+    /// no longer runs were dropped.
+    pub fn set_requested(&mut self, configs: Vec<MarkerTrackingConfig>) -> bool {
         self.requested = configs;
-        self.send_configs();
+        self.send_configs()
     }
 
-    fn send_configs(&mut self) {
-        let (Some(configs), Some(sender)) = (self.configs(), &self.control_sender) else {
-            return;
-        };
-        if self.sent.as_ref() == Some(&configs) {
-            return;
+    /// Replaces the markers of the stream's tracker. Returns false, ignoring them, for a tracker
+    /// the headset should not run, such as one it was just told to stop.
+    pub fn set_stream(&mut self, stream: MarkerStream) -> bool {
+        if !self
+            .configs()
+            .is_some_and(|configs| configs.contains(&stream.config))
+        {
+            return false;
         }
 
-        if sender
-            .lock()
-            .send(&ServerControlPacket::MarkerTrackingConfigs(configs.clone()))
-            .is_ok()
+        match self
+            .streams
+            .iter_mut()
+            .find(|existing| existing.config == stream.config)
+        {
+            Some(existing) => *existing = stream,
+            None => self.streams.push(stream),
+        }
+
+        true
+    }
+
+    /// Every tracker's markers, recentered, and how recentering moved the space they are in.
+    pub fn event(&self, tracking_manager: &TrackingManager) -> ServerCoreEvent {
+        ServerCoreEvent::Markers {
+            streams: self
+                .streams
+                .iter()
+                .map(|stream| MarkerStream {
+                    markers: stream
+                        .markers
+                        .iter()
+                        .map(|marker| MarkerData {
+                            pose: tracking_manager.recenter_pose(marker.pose),
+                            ..marker.clone()
+                        })
+                        .collect(),
+                    ..stream.clone()
+                })
+                .collect(),
+            origin: tracking_manager.origin_change(),
+        }
+    }
+
+    /// Sends the trackers to run if they changed, and drops the markers of the others. Returns
+    /// whether any were dropped.
+    fn send_configs(&mut self) -> bool {
+        let Some(configs) = self.configs() else {
+            return false;
+        };
+
+        let stream_count = self.streams.len();
+        self.streams
+            .retain(|stream| configs.contains(&stream.config));
+
+        if let Some(sender) = &self.control_sender
+            && self.sent.as_ref() != Some(&configs)
+            && sender
+                .lock()
+                .send(&ServerControlPacket::MarkerTrackingConfigs(configs.clone()))
+                .is_ok()
         {
             self.sent = Some(configs);
         }
+
+        self.streams.len() != stream_count
     }
 }
 
@@ -99,15 +154,24 @@ mod tests {
         static_markers: false,
         marker_size: Some(0.15),
     };
+    const ALL: MarkerCapabilities = MarkerCapabilities {
+        qr_codes: true,
+        fixed_size_markers: true,
+        static_markers: true,
+    };
+
+    fn stream(config: MarkerTrackingConfig) -> MarkerStream {
+        MarkerStream {
+            config,
+            timestamp: Duration::ZERO,
+            markers: Vec::new(),
+        }
+    }
 
     #[test]
     fn only_requested_trackers_run() {
         let mut tracking = MarkerTracking::default();
-        tracking.set_capabilities(MarkerCapabilities {
-            qr_codes: true,
-            fixed_size_markers: true,
-            static_markers: true,
-        });
+        tracking.set_capabilities(ALL);
         assert_eq!(tracking.configs(), Some(vec![]));
 
         tracking.set_requested(vec![SIZED]);
@@ -120,11 +184,7 @@ mod tests {
         tracking.set_requested(vec![SIZED]);
         assert_eq!(tracking.configs(), None);
 
-        tracking.set_capabilities(MarkerCapabilities {
-            qr_codes: true,
-            fixed_size_markers: true,
-            static_markers: true,
-        });
+        tracking.set_capabilities(ALL);
         assert_eq!(tracking.configs(), Some(vec![SIZED]));
     }
 
@@ -149,5 +209,18 @@ mod tests {
         let mut tracking = MarkerTracking::default();
         tracking.set_capabilities(MarkerCapabilities::default());
         assert_eq!(tracking.configs(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn markers_follow_the_trackers() {
+        let mut tracking = MarkerTracking::default();
+        tracking.set_capabilities(ALL);
+        assert!(!tracking.set_stream(stream(SIZED)));
+
+        tracking.set_requested(vec![SIZED]);
+        assert!(tracking.set_stream(stream(SIZED)));
+        assert!(!tracking.set_requested(vec![SIZED]));
+        assert!(tracking.set_requested(Vec::new()));
+        assert!(tracking.streams.is_empty());
     }
 }

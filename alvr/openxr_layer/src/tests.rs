@@ -1,9 +1,13 @@
 //! The layer driven the way the OpenXR loader and an application drive it, on top of a fake
 //! runtime that, like SteamVR, implements none of the extensions but the time conversion.
 
-use crate::{LAYER_NAME, TIME_EXTENSION, xrNegotiateLoaderApiLayerInterface};
+use crate::{
+    LAYER_NAME, TIME_EXTENSION, math,
+    test_util::{MOVING, close},
+    void_fn, xrNegotiateLoaderApiLayerInterface,
+};
 use alvr_marker_ipc::{
-    Capabilities, FLAG_CLIENT_CONNECTED, Marker, Origin, Payload, Pose, Server, Stream,
+    Capabilities, FLAG_CLIENT_CONNECTED, Marker, OriginChange, Payload, Pose, Server, Stream,
     TrackingConfig, now_ns, ns_to_performance_counter, performance_counter_to_ns,
 };
 use openxr_sys::{self as xr, Handle, loader, pfn};
@@ -23,7 +27,7 @@ pub fn pipe_name() -> String {
     format!("ALVR_Markers_layer_test_{}", std::process::id())
 }
 
-// The layer's state is global, so tests run one at a time
+/// The layer's state is global, so tests run one at a time.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 fn serial() -> MutexGuard<'static, ()> {
@@ -201,7 +205,7 @@ unsafe extern "system" fn runtime_locate_space(
 ) -> xr::Result {
     let pose = match (space.into_raw(), base.into_raw()) {
         (STAGE, LOCAL) => STAGE_IN_LOCAL,
-        (LOCAL, STAGE) => crate::math::inverse(STAGE_IN_LOCAL),
+        (LOCAL, STAGE) => math::to_xr(math::inverse(math::from_xr(STAGE_IN_LOCAL))),
         _ => return xr::Result::ERROR_HANDLE_INVALID,
     };
     unsafe {
@@ -212,6 +216,8 @@ unsafe extern "system" fn runtime_locate_space(
     xr::Result::SUCCESS
 }
 
+// OpenXR times are performance counter nanoseconds here.
+
 unsafe extern "system" fn runtime_convert_counter(
     _: xr::Instance,
     counter: *const i64,
@@ -221,7 +227,6 @@ unsafe extern "system" fn runtime_convert_counter(
     xr::Result::SUCCESS
 }
 
-/// OpenXR times are performance counter nanoseconds here.
 unsafe extern "system" fn runtime_convert_time(
     _: xr::Instance,
     time: xr::Time,
@@ -236,33 +241,32 @@ unsafe extern "system" fn runtime_get_instance_proc_addr(
     name: *const c_char,
     function: *mut Option<pfn::VoidFunction>,
 ) -> xr::Result {
-    macro_rules! f {
-        ($f:expr, $ty:ty) => {
-            unsafe { mem::transmute::<$ty, pfn::VoidFunction>($f as $ty) }
-        };
-    }
     let found = match unsafe { CStr::from_ptr(name) }.to_bytes() {
-        b"xrDestroyInstance" => f!(runtime_destroy_instance, pfn::DestroyInstance),
-        b"xrGetSystem" => f!(runtime_get_system, pfn::GetSystem),
-        b"xrPollEvent" => f!(runtime_poll_event, pfn::PollEvent),
-        b"xrCreateSession" => f!(runtime_create_session, pfn::CreateSession),
-        b"xrDestroySession" => f!(runtime_destroy_session, pfn::DestroySession),
-        b"xrCreateReferenceSpace" => f!(runtime_create_reference_space, pfn::CreateReferenceSpace),
-        b"xrDestroySpace" => f!(runtime_destroy_space, pfn::DestroySpace),
-        b"xrLocateSpace" => f!(runtime_locate_space, pfn::LocateSpace),
-        b"xrEnumerateReferenceSpaces" => f!(
+        b"xrDestroyInstance" => void_fn!(runtime_destroy_instance, pfn::DestroyInstance),
+        b"xrGetSystem" => void_fn!(runtime_get_system, pfn::GetSystem),
+        b"xrPollEvent" => void_fn!(runtime_poll_event, pfn::PollEvent),
+        b"xrCreateSession" => void_fn!(runtime_create_session, pfn::CreateSession),
+        b"xrDestroySession" => void_fn!(runtime_destroy_session, pfn::DestroySession),
+        b"xrCreateReferenceSpace" => {
+            void_fn!(runtime_create_reference_space, pfn::CreateReferenceSpace)
+        }
+        b"xrDestroySpace" => void_fn!(runtime_destroy_space, pfn::DestroySpace),
+        b"xrLocateSpace" => void_fn!(runtime_locate_space, pfn::LocateSpace),
+        b"xrEnumerateReferenceSpaces" => void_fn!(
             runtime_enumerate_reference_spaces,
             pfn::EnumerateReferenceSpaces
         ),
-        b"xrConvertWin32PerformanceCounterToTimeKHR" => f!(
+        b"xrConvertWin32PerformanceCounterToTimeKHR" => void_fn!(
             runtime_convert_counter,
             pfn::ConvertWin32PerformanceCounterToTimeKHR
         ),
-        b"xrEnumerateInstanceExtensionProperties" if LISTS_EXTENSIONS.load(Ordering::SeqCst) => f!(
-            runtime_enumerate_extensions,
-            pfn::EnumerateInstanceExtensionProperties
-        ),
-        b"xrConvertTimeToWin32PerformanceCounterKHR" => f!(
+        b"xrEnumerateInstanceExtensionProperties" if LISTS_EXTENSIONS.load(Ordering::SeqCst) => {
+            void_fn!(
+                runtime_enumerate_extensions,
+                pfn::EnumerateInstanceExtensionProperties
+            )
+        }
+        b"xrConvertTimeToWin32PerformanceCounterKHR" => void_fn!(
             runtime_convert_time,
             pfn::ConvertTimeToWin32PerformanceCounterKHR
         ),
@@ -360,10 +364,6 @@ fn pose(x: f32, y: f32, z: f32) -> Pose {
     }
 }
 
-const MOVING: TrackingConfig = TrackingConfig {
-    static_markers: false,
-    marker_size: None,
-};
 const STATIC: TrackingConfig = TrackingConfig {
     static_markers: true,
     marker_size: None,
@@ -503,6 +503,18 @@ impl App {
         session
     }
 
+    /// Whether neither the layer nor the runtime has the function.
+    fn is_unsupported(&self, name: &CStr) -> bool {
+        let mut function = None;
+        let result = unsafe { (self.gipa)(self.instance, name.as_ptr(), &mut function) };
+        result == xr::Result::ERROR_FUNCTION_UNSUPPORTED
+    }
+
+    fn destroy_session(&self, session: xr::Session) {
+        let destroy_session: pfn::DestroySession = self.get(c"xrDestroySession");
+        assert_eq!(unsafe { destroy_session(session) }, xr::Result::SUCCESS);
+    }
+
     fn destroy(self) {
         let destroy_instance: pfn::DestroyInstance = self.get(c"xrDestroyInstance");
         assert_eq!(
@@ -511,12 +523,30 @@ impl App {
         );
     }
 
-    /// What xrCreateSpatialContextAsyncEXT says to these configurations.
+    fn poll_future(&self, future: xr::FutureEXT) -> Result<xr::FutureStateEXT, xr::Result> {
+        let poll: pfn::PollFutureEXT = self.get(c"xrPollFutureEXT");
+        let info = xr::FuturePollInfoEXT {
+            ty: xr::FuturePollInfoEXT::TYPE,
+            next: ptr::null(),
+            future,
+        };
+        let mut result = xr::FuturePollResultEXT {
+            ty: xr::FuturePollResultEXT::TYPE,
+            next: ptr::null_mut(),
+            state: xr::FutureStateEXT::PENDING,
+        };
+        match unsafe { poll(self.instance, &info, &mut result) } {
+            xr::Result::SUCCESS => Ok(result.state),
+            error => Err(error),
+        }
+    }
+
+    /// Starts creating a context with these configurations.
     fn try_create_context(
         &self,
         session: xr::Session,
         configs: &[*const xr::SpatialCapabilityConfigurationBaseHeaderEXT],
-    ) -> xr::Result {
+    ) -> Result<xr::FutureEXT, xr::Result> {
         let create: pfn::CreateSpatialContextAsyncEXT = self.get(c"xrCreateSpatialContextAsyncEXT");
         let info = xr::SpatialContextCreateInfoEXT {
             ty: xr::SpatialContextCreateInfoEXT::TYPE,
@@ -529,7 +559,10 @@ impl App {
             },
         };
         let mut future = xr::FutureEXT::from_raw(0);
-        unsafe { create(session, &info, &mut future) }
+        match unsafe { create(session, &info, &mut future) } {
+            xr::Result::SUCCESS => Ok(future),
+            error => Err(error),
+        }
     }
 
     fn capabilities(&self) -> Vec<xr::SpatialCapabilityEXT> {
@@ -562,10 +595,8 @@ impl App {
         config: TrackingConfig,
     ) -> Result<xr::SpatialContextEXT, xr::Result> {
         let marker_size = config.marker_size;
-        let create: pfn::CreateSpatialContextAsyncEXT = self.get(c"xrCreateSpatialContextAsyncEXT");
         let complete: pfn::CreateSpatialContextCompleteEXT =
             self.get(c"xrCreateSpatialContextCompleteEXT");
-        let poll: pfn::PollFutureEXT = self.get(c"xrPollFutureEXT");
 
         let size = xr::SpatialMarkerSizeEXT {
             ty: xr::SpatialMarkerSizeEXT::TYPE,
@@ -588,35 +619,8 @@ impl App {
             enabled_component_count: components.len() as u32,
             enabled_components: components.as_ptr(),
         };
-        let configs = [&raw const config];
-        let info = xr::SpatialContextCreateInfoEXT {
-            ty: xr::SpatialContextCreateInfoEXT::TYPE,
-            next: ptr::null(),
-            capability_config_count: 1,
-            capability_configs: configs.as_ptr(),
-        };
-
-        let mut future = xr::FutureEXT::from_raw(0);
-        let result = unsafe { create(session, &info, &mut future) };
-        if result != xr::Result::SUCCESS {
-            return Err(result);
-        }
-
-        let poll_info = xr::FuturePollInfoEXT {
-            ty: xr::FuturePollInfoEXT::TYPE,
-            next: ptr::null(),
-            future,
-        };
-        let mut poll_result = xr::FuturePollResultEXT {
-            ty: xr::FuturePollResultEXT::TYPE,
-            next: ptr::null_mut(),
-            state: xr::FutureStateEXT::PENDING,
-        };
-        assert_eq!(
-            unsafe { poll(self.instance, &poll_info, &mut poll_result) },
-            xr::Result::SUCCESS
-        );
-        assert_eq!(poll_result.state, xr::FutureStateEXT::READY);
+        let future = self.try_create_context(session, &[&raw const config])?;
+        assert_eq!(self.poll_future(future), Ok(xr::FutureStateEXT::READY));
 
         let mut completion = xr::CreateSpatialContextCompletionEXT {
             ty: xr::CreateSpatialContextCompletionEXT::TYPE,
@@ -652,10 +656,19 @@ impl App {
         tracking_state: Option<xr::SpatialEntityTrackingStateEXT>,
     ) -> xr::SpatialSnapshotEXT {
         let future = self.start_discovery(context, components, tracking_state);
+        self.complete_discovery(context, future, time).unwrap()
+    }
+
+    /// Completes a discovery started with `start_discovery`, in LOCAL.
+    fn complete_discovery(
+        &self,
+        context: xr::SpatialContextEXT,
+        future: xr::FutureEXT,
+        time: xr::Time,
+    ) -> Result<xr::SpatialSnapshotEXT, xr::Result> {
         let complete: pfn::CreateSpatialDiscoverySnapshotCompleteEXT =
             self.get(c"xrCreateSpatialDiscoverySnapshotCompleteEXT");
-
-        let completion_info = xr::CreateSpatialDiscoverySnapshotCompletionInfoEXT {
+        let info = xr::CreateSpatialDiscoverySnapshotCompletionInfoEXT {
             ty: xr::CreateSpatialDiscoverySnapshotCompletionInfoEXT::TYPE,
             next: ptr::null(),
             base_space: xr::Space::from_raw(LOCAL),
@@ -668,13 +681,41 @@ impl App {
             future_result: xr::Result::ERROR_RUNTIME_FAILURE,
             snapshot: xr::SpatialSnapshotEXT::NULL,
         };
+        match unsafe { complete(context, &info, &mut completion) } {
+            xr::Result::SUCCESS => {
+                assert_eq!(completion.future_result, xr::Result::SUCCESS);
+                Ok(completion.snapshot)
+            }
+            error => Err(error),
+        }
+    }
+
+    /// An update snapshot of the entities, in LOCAL.
+    fn update(
+        &self,
+        context: xr::SpatialContextEXT,
+        entities: &[xr::SpatialEntityEXT],
+        time: xr::Time,
+    ) -> xr::SpatialSnapshotEXT {
+        let update: pfn::CreateSpatialUpdateSnapshotEXT =
+            self.get(c"xrCreateSpatialUpdateSnapshotEXT");
+        let info = xr::SpatialUpdateSnapshotCreateInfoEXT {
+            ty: xr::SpatialUpdateSnapshotCreateInfoEXT::TYPE,
+            next: ptr::null(),
+            entity_count: entities.len() as u32,
+            entities: entities.as_ptr(),
+            component_type_count: 0,
+            component_types: ptr::null(),
+            base_space: xr::Space::from_raw(LOCAL),
+            time,
+        };
+        let mut snapshot = xr::SpatialSnapshotEXT::NULL;
         assert_eq!(
-            unsafe { complete(context, &completion_info, &mut completion) },
+            unsafe { update(context, &info, &mut snapshot) },
             xr::Result::SUCCESS
         );
-        assert_eq!(completion.future_result, xr::Result::SUCCESS);
 
-        completion.snapshot
+        snapshot
     }
 
     fn start_discovery(
@@ -864,7 +905,7 @@ impl App {
         Ok(bytes)
     }
 
-    fn poll_event(&self) -> Option<xr::SpatialContextEXT> {
+    fn poll_event(&self) -> Option<xr::EventDataBuffer> {
         let poll: pfn::PollEvent = self.get(c"xrPollEvent");
         let mut event = xr::EventDataBuffer {
             ty: xr::StructureType::EVENT_DATA_BUFFER,
@@ -873,20 +914,28 @@ impl App {
         };
         match unsafe { poll(self.instance, &mut event) } {
             xr::Result::EVENT_UNAVAILABLE => None,
-            xr::Result::SUCCESS => {
-                assert_eq!(event.ty, xr::EventDataSpatialDiscoveryRecommendedEXT::TYPE);
-                let event = unsafe {
-                    &*(&raw const event).cast::<xr::EventDataSpatialDiscoveryRecommendedEXT>()
-                };
-                Some(event.spatial_context)
-            }
+            xr::Result::SUCCESS => Some(event),
             result => panic!("{result:?}"),
         }
     }
-}
 
-fn close(a: xr::Vector3f, b: [f32; 3]) -> bool {
-    (a.x - b[0]).abs() < 1e-5 && (a.y - b[1]).abs() < 1e-5 && (a.z - b[2]).abs() < 1e-5
+    /// The context of the next event, which must be a discovery recommendation.
+    fn discovery_recommendation(&self) -> Option<xr::SpatialContextEXT> {
+        let event = self.poll_event()?;
+        assert_eq!(event.ty, xr::EventDataSpatialDiscoveryRecommendedEXT::TYPE);
+        let event =
+            unsafe { &*(&raw const event).cast::<xr::EventDataSpatialDiscoveryRecommendedEXT>() };
+
+        Some(event.spatial_context)
+    }
+
+    /// The next event, which must be a reference space change.
+    fn space_change(&self) -> Option<xr::EventDataReferenceSpaceChangePending> {
+        let event = self.poll_event()?;
+        assert_eq!(event.ty, xr::EventDataReferenceSpaceChangePending::TYPE);
+
+        Some(unsafe { *(&raw const event).cast::<xr::EventDataReferenceSpaceChangePending>() })
+    }
 }
 
 #[test]
@@ -1003,8 +1052,8 @@ fn markers_reach_the_application() {
     expect_requests(&requests, &[MOVING]);
 
     // A new context gets a discovery recommendation, once
-    assert_eq!(app.poll_event(), Some(context));
-    assert_eq!(app.poll_event(), None);
+    assert_eq!(app.discovery_recommendation(), Some(context));
+    assert_eq!(app.discovery_recommendation(), None);
 
     let snapshot = app.discover(context, time);
     let mut entities = app.query(snapshot);
@@ -1015,8 +1064,14 @@ fn markers_reach_the_application() {
     assert_ne!(dog.0, cat.0);
     assert_eq!(dog.1, xr::SpatialEntityTrackingStateEXT::TRACKING);
     // In the application's space, the stage is 1.5 m lower
-    assert!(close(dog.2.center.position, [1.0, -1.5, -2.0]));
-    assert!(close(cat.2.center.position, [-1.0, -0.5, -3.0]));
+    assert!(close(
+        math::from_xr(dog.2.center).position,
+        [1.0, -1.5, -2.0]
+    ));
+    assert!(close(
+        math::from_xr(cat.2.center).position,
+        [-1.0, -0.5, -3.0]
+    ));
     assert_eq!(dog.2.extents.width, 0.2);
     assert_eq!(dog.3.capability, qr);
     assert_eq!(dog.3.data.buffer_type, xr::SpatialBufferTypeEXT::STRING);
@@ -1092,47 +1147,33 @@ fn markers_reach_the_application() {
         xr::Result::SUCCESS
     );
 
-    let update: pfn::CreateSpatialUpdateSnapshotEXT = app.get(c"xrCreateSpatialUpdateSnapshotEXT");
-    let update_snapshot = |entity: xr::SpatialEntityEXT, time: xr::Time| {
-        let info = xr::SpatialUpdateSnapshotCreateInfoEXT {
-            ty: xr::SpatialUpdateSnapshotCreateInfoEXT::TYPE,
-            next: ptr::null(),
-            entity_count: 1,
-            entities: &entity,
-            component_type_count: 0,
-            component_types: ptr::null(),
-            base_space: xr::Space::from_raw(LOCAL),
-            time,
-        };
-        let mut snapshot = xr::SpatialSnapshotEXT::NULL;
-        assert_eq!(
-            unsafe { update(context, &info, &mut snapshot) },
-            xr::Result::SUCCESS
-        );
-        snapshot
-    };
-
     // The dog jumps 1 m: a single detection that far is taken for a wild one, the next confirms it
     let moved = [
         ("dog", pose(2.0, 0.0, -2.0), 0.2),
         ("cat", pose(-1.0, 1.0, -3.0), 0.1),
     ];
     time = publish(&mut writer, &moved);
-    let updated = app.query(update_snapshot(entity, time));
+    let updated = app.query(app.update(context, &[entity], time));
     assert_eq!(updated.len(), 1);
     assert_eq!(updated[0].1, xr::SpatialEntityTrackingStateEXT::TRACKING);
-    assert!(close(updated[0].2.center.position, [1.0, -1.5, -2.0]));
+    assert!(close(
+        math::from_xr(updated[0].2.center).position,
+        [1.0, -1.5, -2.0]
+    ));
     time = publish(&mut writer, &moved);
-    let updated = app.query(update_snapshot(entity, time));
-    assert!(close(updated[0].2.center.position, [2.0, -1.5, -2.0]));
+    let updated = app.query(app.update(context, &[entity], time));
+    assert!(close(
+        math::from_xr(updated[0].2.center).position,
+        [2.0, -1.5, -2.0]
+    ));
     // Same markers, no recommendation
-    assert_eq!(app.poll_event(), None);
+    assert_eq!(app.discovery_recommendation(), None);
 
     // The headset loses sight of it
     time = publish(&mut writer, &[("cat", pose(-1.0, 1.0, -3.0), 0.1)]);
-    let updated = app.query(update_snapshot(entity, time));
+    let updated = app.query(app.update(context, &[entity], time));
     assert_eq!(updated[0].1, xr::SpatialEntityTrackingStateEXT::PAUSED);
-    assert_eq!(app.poll_event(), Some(context));
+    assert_eq!(app.discovery_recommendation(), Some(context));
 
     // In a context that only enables markers, no entity has bounds
     let markers_only = app
@@ -1195,11 +1236,10 @@ fn markers_reach_the_application() {
     // The driver stops
     drop(writer);
     assert!(app.capabilities().is_empty());
-    let updated = app.query(update_snapshot(entity, time));
+    let updated = app.query(app.update(context, &[entity], time));
     assert_eq!(updated[0].1, xr::SpatialEntityTrackingStateEXT::PAUSED);
 
-    let destroy_session: pfn::DestroySession = app.get(c"xrDestroySession");
-    assert_eq!(unsafe { destroy_session(session) }, xr::Result::SUCCESS);
+    app.destroy_session(session);
     assert_eq!(runtime().as_ref().unwrap().destroyed_spaces, [STAGE]);
     // Its contexts went with it
     assert_eq!(
@@ -1207,8 +1247,7 @@ fn markers_reach_the_application() {
         xr::Result::ERROR_HANDLE_INVALID
     );
 
-    let destroy_instance: pfn::DestroyInstance = app.get(c"xrDestroyInstance");
-    assert_eq!(unsafe { destroy_instance(instance) }, xr::Result::SUCCESS);
+    app.destroy();
 }
 
 #[test]
@@ -1223,8 +1262,7 @@ fn a_runtime_that_does_not_list_its_extensions_is_tried() {
         runtime().as_ref().unwrap().enabled_extensions,
         [TIME_EXTENSION.to_str().unwrap()]
     );
-    let destroy_instance: pfn::DestroyInstance = get(gipa, instance, c"xrDestroyInstance");
-    assert_eq!(unsafe { destroy_instance(instance) }, xr::Result::SUCCESS);
+    App { gipa, instance }.destroy();
 }
 
 #[test]
@@ -1232,28 +1270,19 @@ fn applications_without_the_extensions_go_straight_to_the_runtime() {
     let _serial = serial();
     let (result, instance, gipa) = create_instance(&[]);
     assert_eq!(result, xr::Result::SUCCESS);
+    let app = App { gipa, instance };
 
     // The runtime's own functions, but those the layer reports recentering with
-    let locate: pfn::LocateSpace = get(gipa, instance, c"xrLocateSpace");
+    let locate: pfn::LocateSpace = app.get(c"xrLocateSpace");
     assert_eq!(
         locate as usize,
         runtime_locate_space as pfn::LocateSpace as usize
     );
-    let poll: pfn::PollEvent = get(gipa, instance, c"xrPollEvent");
+    let poll: pfn::PollEvent = app.get(c"xrPollEvent");
     assert_ne!(poll as usize, runtime_poll_event as pfn::PollEvent as usize);
+    assert!(app.is_unsupported(c"xrCreateSpatialContextAsyncEXT"));
 
-    let mut function = None;
-    let result = unsafe {
-        gipa(
-            instance,
-            c"xrCreateSpatialContextAsyncEXT".as_ptr(),
-            &mut function,
-        )
-    };
-    assert_eq!(result, xr::Result::ERROR_FUNCTION_UNSUPPORTED);
-
-    let destroy_instance: pfn::DestroyInstance = get(gipa, instance, c"xrDestroyInstance");
-    assert_eq!(unsafe { destroy_instance(instance) }, xr::Result::SUCCESS);
+    app.destroy();
 }
 
 #[test]
@@ -1261,35 +1290,16 @@ fn xr_ext_future_alone_is_provided_too() {
     let _serial = serial();
     let (result, instance, gipa) = create_instance(&[c"XR_EXT_future"]);
     assert_eq!(result, xr::Result::SUCCESS);
+    let app = App { gipa, instance };
 
-    let poll: pfn::PollFutureEXT = get(gipa, instance, c"xrPollFutureEXT");
-    let info = xr::FuturePollInfoEXT {
-        ty: xr::FuturePollInfoEXT::TYPE,
-        next: ptr::null(),
-        future: xr::FutureEXT::from_raw(1),
-    };
-    let mut poll_result = xr::FuturePollResultEXT {
-        ty: xr::FuturePollResultEXT::TYPE,
-        next: ptr::null_mut(),
-        state: xr::FutureStateEXT::PENDING,
-    };
     assert_eq!(
-        unsafe { poll(instance, &info, &mut poll_result) },
-        xr::Result::ERROR_FUTURE_INVALID_EXT
+        app.poll_future(xr::FutureEXT::from_raw(1)),
+        Err(xr::Result::ERROR_FUTURE_INVALID_EXT)
     );
     // Spatial entities were not asked for
-    let mut function = None;
-    let result = unsafe {
-        gipa(
-            instance,
-            c"xrCreateSpatialContextAsyncEXT".as_ptr(),
-            &mut function,
-        )
-    };
-    assert_eq!(result, xr::Result::ERROR_FUNCTION_UNSUPPORTED);
+    assert!(app.is_unsupported(c"xrCreateSpatialContextAsyncEXT"));
 
-    let destroy_instance: pfn::DestroyInstance = get(gipa, instance, c"xrDestroyInstance");
-    assert_eq!(unsafe { destroy_instance(instance) }, xr::Result::SUCCESS);
+    app.destroy();
 }
 
 /// The rules of XR_EXT_spatial_entity and XR_EXT_spatial_marker_tracking that a conformance test
@@ -1332,12 +1342,10 @@ fn the_spatial_entity_rules_are_followed() {
         };
         assert_eq!(
             app.try_create_context(session, &[&raw const valid]),
-            xr::Result::ERROR_SPATIAL_CAPABILITY_UNSUPPORTED_EXT
+            Err(xr::Result::ERROR_SPATIAL_CAPABILITY_UNSUPPORTED_EXT)
         );
 
-        let mut function = None;
-        let result = unsafe { gipa(instance, c"xrPollFutureEXT".as_ptr(), &mut function) };
-        assert_eq!(result, xr::Result::ERROR_FUNCTION_UNSUPPORTED);
+        assert!(app.is_unsupported(c"xrPollFutureEXT"));
         app.destroy();
     }
 
@@ -1377,19 +1385,19 @@ fn the_spatial_entity_rules_are_followed() {
     let unknown_component = config(&unknown);
     assert_eq!(
         app.try_create_context(session, &[]),
-        xr::Result::ERROR_SPATIAL_CAPABILITY_CONFIGURATION_INVALID_EXT
+        Err(xr::Result::ERROR_SPATIAL_CAPABILITY_CONFIGURATION_INVALID_EXT)
     );
     assert_eq!(
         app.try_create_context(session, &[&raw const no_components]),
-        xr::Result::ERROR_SPATIAL_CAPABILITY_CONFIGURATION_INVALID_EXT
+        Err(xr::Result::ERROR_SPATIAL_CAPABILITY_CONFIGURATION_INVALID_EXT)
     );
     assert_eq!(
         app.try_create_context(session, &[&raw const valid, &raw const valid]),
-        xr::Result::ERROR_SPATIAL_CAPABILITY_CONFIGURATION_INVALID_EXT
+        Err(xr::Result::ERROR_SPATIAL_CAPABILITY_CONFIGURATION_INVALID_EXT)
     );
     assert_eq!(
         app.try_create_context(session, &[&raw const unknown_component]),
-        xr::Result::ERROR_VALIDATION_FAILURE
+        Err(xr::Result::ERROR_VALIDATION_FAILURE)
     );
 
     let first = app
@@ -1423,24 +1431,9 @@ fn the_spatial_entity_rules_are_followed() {
 
     // A discovery is completed on the context it was started on
     let future = app.start_discovery(first, &[], None);
-    let complete: pfn::CreateSpatialDiscoverySnapshotCompleteEXT =
-        app.get(c"xrCreateSpatialDiscoverySnapshotCompleteEXT");
-    let completion_info = xr::CreateSpatialDiscoverySnapshotCompletionInfoEXT {
-        ty: xr::CreateSpatialDiscoverySnapshotCompletionInfoEXT::TYPE,
-        next: ptr::null(),
-        base_space: xr::Space::from_raw(LOCAL),
-        time,
-        future,
-    };
-    let mut completion = xr::CreateSpatialDiscoverySnapshotCompletionEXT {
-        ty: xr::CreateSpatialDiscoverySnapshotCompletionEXT::TYPE,
-        next: ptr::null_mut(),
-        future_result: xr::Result::ERROR_RUNTIME_FAILURE,
-        snapshot: xr::SpatialSnapshotEXT::NULL,
-    };
     assert_eq!(
-        unsafe { complete(second, &completion_info, &mut completion) },
-        xr::Result::ERROR_HANDLE_INVALID
+        app.complete_discovery(second, future, time),
+        Err(xr::Result::ERROR_HANDLE_INVALID)
     );
     // Cancelled, it is gone: the layer answers for its own futures
     let cancel: pfn::CancelFutureEXT = app.get(c"xrCancelFutureEXT");
@@ -1453,24 +1446,13 @@ fn the_spatial_entity_rules_are_followed() {
         unsafe { cancel(instance, &cancel_info) },
         xr::Result::SUCCESS
     );
-    let poll: pfn::PollFutureEXT = app.get(c"xrPollFutureEXT");
-    let poll_info = xr::FuturePollInfoEXT {
-        ty: xr::FuturePollInfoEXT::TYPE,
-        next: ptr::null(),
-        future,
-    };
-    let mut poll_result = xr::FuturePollResultEXT {
-        ty: xr::FuturePollResultEXT::TYPE,
-        next: ptr::null_mut(),
-        state: xr::FutureStateEXT::PENDING,
-    };
     assert_eq!(
-        unsafe { poll(instance, &poll_info, &mut poll_result) },
-        xr::Result::ERROR_FUTURE_INVALID_EXT
+        app.poll_future(future),
+        Err(xr::Result::ERROR_FUTURE_INVALID_EXT)
     );
     assert_eq!(
-        unsafe { complete(first, &completion_info, &mut completion) },
-        xr::Result::ERROR_FUTURE_INVALID_EXT
+        app.complete_discovery(first, future, time),
+        Err(xr::Result::ERROR_FUTURE_INVALID_EXT)
     );
 
     // A discovery of some components has only their data
@@ -1544,7 +1526,10 @@ fn the_spatial_entity_rules_are_followed() {
         xr::Result::SUCCESS
     );
     assert_eq!(query_result.entity_id_count_output, 1);
-    assert!(close(bounds[0].center.position, [1.0, -1.5, -2.0]));
+    assert!(close(
+        math::from_xr(bounds[0].center).position,
+        [1.0, -1.5, -2.0]
+    ));
 
     // One entity twice in an update snapshot is the same both times
     let mut dog = xr::SpatialEntityEXT::NULL;
@@ -1555,24 +1540,7 @@ fn the_spatial_entity_rules_are_followed() {
             xr::Result::SUCCESS
         );
     }
-    let update: pfn::CreateSpatialUpdateSnapshotEXT = app.get(c"xrCreateSpatialUpdateSnapshotEXT");
-    let entities = [dog, dog_again];
-    let update_info = xr::SpatialUpdateSnapshotCreateInfoEXT {
-        ty: xr::SpatialUpdateSnapshotCreateInfoEXT::TYPE,
-        next: ptr::null(),
-        entity_count: 2,
-        entities: entities.as_ptr(),
-        component_type_count: 0,
-        component_types: ptr::null(),
-        base_space: xr::Space::from_raw(LOCAL),
-        time,
-    };
-    let mut update_snapshot = xr::SpatialSnapshotEXT::NULL;
-    assert_eq!(
-        unsafe { update(first, &update_info, &mut update_snapshot) },
-        xr::Result::SUCCESS
-    );
-    let updated = app.query(update_snapshot);
+    let updated = app.query(app.update(first, &[dog, dog_again], time));
     assert_eq!(updated.len(), 2);
     assert!(updated.iter().all(|entity| entity.0 == first_ids[0]
         && entity.1 == xr::SpatialEntityTrackingStateEXT::TRACKING));
@@ -1638,48 +1606,30 @@ fn recentering_is_reported() {
     let app = App { gipa, instance };
 
     // Changes before the session are not its own
-    writer.set_origin(Origin {
-        changes: 3,
+    writer.set_origin(OriginChange {
+        count: 3,
         changed_ns: now_ns(),
         pose_in_previous: None,
         moved: true,
     });
     publish(&mut writer, &[]);
     let session = app.create_session();
-    let poll: pfn::PollEvent = app.get(c"xrPollEvent");
-    let poll_space_event = || {
-        let mut event = xr::EventDataBuffer {
-            ty: xr::StructureType::EVENT_DATA_BUFFER,
-            next: ptr::null(),
-            varying: [0; 4000],
-        };
-        match unsafe { poll(instance, &mut event) } {
-            xr::Result::EVENT_UNAVAILABLE => None,
-            xr::Result::SUCCESS => {
-                assert_eq!(event.ty, xr::EventDataReferenceSpaceChangePending::TYPE);
-                Some(unsafe {
-                    *(&raw const event).cast::<xr::EventDataReferenceSpaceChangePending>()
-                })
-            }
-            result => panic!("{result:?}"),
-        }
-    };
 
-    assert!(poll_space_event().is_none());
+    assert!(app.space_change().is_none());
 
     // The origin moves 1 m along +X
     let changed_ns = now_ns();
-    writer.set_origin(Origin {
-        changes: 4,
+    writer.set_origin(OriginChange {
+        count: 4,
         changed_ns,
         pose_in_previous: Some(pose(1.0, 0.0, 0.0)),
         moved: true,
     });
     publish(&mut writer, &[]);
     let mut events = (0..2)
-        .map(|_| poll_space_event().unwrap())
+        .map(|_| app.space_change().unwrap())
         .collect::<Vec<_>>();
-    assert!(poll_space_event().is_none());
+    assert!(app.space_change().is_none());
     events.sort_by_key(|event| event.reference_space_type.into_raw());
     let [local, stage] = events[..] else {
         unreachable!()
@@ -1692,28 +1642,28 @@ fn recentering_is_reported() {
         // To the performance counter's tick
         assert!((event.change_time.as_nanos() - changed_ns).abs() < 1000);
         assert!(close(
-            event.pose_in_previous_space.position,
+            math::from_xr(event.pose_in_previous_space).position,
             [1.0, 0.0, 0.0]
         ));
     }
 
     // A change missed, or a driver restarted: where the origin went is not known
-    writer.set_origin(Origin {
-        changes: 6,
+    writer.set_origin(OriginChange {
+        count: 6,
         changed_ns: now_ns(),
         pose_in_previous: Some(pose(1.0, 0.0, 0.0)),
         moved: true,
     });
     publish(&mut writer, &[]);
     for _ in 0..2 {
-        assert_eq!(poll_space_event().unwrap().pose_valid, xr::FALSE);
+        assert_eq!(app.space_change().unwrap().pose_valid, xr::FALSE);
     }
-    assert!(poll_space_event().is_none());
+    assert!(app.space_change().is_none());
 
     // Two moves before the application polls are one to it
-    for (changes, x) in [(7, 1.0), (8, 0.5)] {
-        writer.set_origin(Origin {
-            changes,
+    for (count, x) in [(7, 1.0), (8, 0.5)] {
+        writer.set_origin(OriginChange {
+            count,
             changed_ns: now_ns(),
             pose_in_previous: Some(pose(x, 0.0, 0.0)),
             moved: true,
@@ -1721,33 +1671,32 @@ fn recentering_is_reported() {
         publish(&mut writer, &[]);
     }
     for _ in 0..2 {
-        let event = poll_space_event().unwrap();
+        let event = app.space_change().unwrap();
         assert_eq!(event.pose_valid, xr::TRUE);
         assert!(close(
-            event.pose_in_previous_space.position,
+            math::from_xr(event.pose_in_previous_space).position,
             [1.5, 0.0, 0.0]
         ));
     }
-    assert!(poll_space_event().is_none());
+    assert!(app.space_change().is_none());
 
     // Only the bounds changed: STAGE alone, where it was
-    writer.set_origin(Origin {
-        changes: 9,
+    writer.set_origin(OriginChange {
+        count: 9,
         changed_ns: now_ns(),
         pose_in_previous: Some(pose(0.0, 0.0, 0.0)),
         moved: false,
     });
     publish(&mut writer, &[]);
-    let event = poll_space_event().unwrap();
+    let event = app.space_change().unwrap();
     assert_eq!(event.reference_space_type, xr::ReferenceSpaceType::STAGE);
     assert_eq!(event.pose_valid, xr::TRUE);
     assert!(close(
-        event.pose_in_previous_space.position,
+        math::from_xr(event.pose_in_previous_space).position,
         [0.0, 0.0, 0.0]
     ));
-    assert!(poll_space_event().is_none());
+    assert!(app.space_change().is_none());
 
-    let destroy_session: pfn::DestroySession = app.get(c"xrDestroySession");
-    assert_eq!(unsafe { destroy_session(session) }, xr::Result::SUCCESS);
+    app.destroy_session(session);
     app.destroy();
 }

@@ -1,4 +1,4 @@
-//! Marker sharing is only implemented on Windows so far.
+//! Marker sharing is only implemented on Windows.
 
 use std::{io, sync::LazyLock, time::Instant};
 

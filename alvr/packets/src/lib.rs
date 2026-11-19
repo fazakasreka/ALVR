@@ -17,6 +17,11 @@ use std::{
     time::Duration,
 };
 
+pub use alvr_marker_ipc::{
+    Capabilities as MarkerCapabilities, Payload as MarkerPayload,
+    TrackingConfig as MarkerTrackingConfig,
+};
+
 pub const TRACKING: u16 = 0;
 pub const HAPTICS: u16 = 1;
 pub const AUDIO: u16 = 2;
@@ -191,9 +196,7 @@ pub enum ServerControlPacket {
     RealTimeConfig(RealTimeConfig),
     Reserved(String),
     ReservedBuffer(Vec<u8>),
-    /// The marker trackers the headset should run, replacing the previous list. Each is
-    /// supported by the headset as reported in [`ClientControlPacket::MarkerCapabilities`].
-    MarkerTrackingConfigs(Vec<MarkerTrackingConfig>),
+    MarkerTrackingConfigs(Vec<MarkerTrackingConfig>), // replaces the previous list
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -215,72 +218,14 @@ pub struct ButtonEntry {
     pub value: ButtonValue,
 }
 
-/// What a QR code holds, as the headset decoded it.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum MarkerPayload {
-    Text(String),
-    /// Byte mode data that is not text.
-    Bytes(Vec<u8>),
-}
-
-impl MarkerPayload {
-    pub fn text(&self) -> Option<&str> {
-        match self {
-            Self::Text(text) => Some(text),
-            Self::Bytes(_) => None,
-        }
-    }
-}
-
-impl std::fmt::Display for MarkerPayload {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Text(text) => write!(f, "{text:?}"),
-            Self::Bytes(bytes) => {
-                write!(f, "0x")?;
-                bytes.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
-            }
-        }
-    }
-}
-
 /// A QR code the headset decoded. Codes it has not decoded yet are not reported.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MarkerData {
     pub payload: MarkerPayload,
-    pub pose: Pose, // Centre of the marker; +Y towards its top edge, +Z out of its face
-    pub size: f32,  // Edge length in metres
-}
-
-/// How the headset tracks QR codes for the applications that asked for it this way: the marker
-/// options of an OpenXR spatial context. The headset runs one tracker per configuration it is
-/// sent.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
-pub struct MarkerTrackingConfig {
-    /// The codes do not move (XrSpatialMarkerStaticOptimizationEXT).
-    pub static_markers: bool,
-    /// Every code has this edge length in metres (XrSpatialMarkerSizeEXT).
-    pub marker_size: Option<f32>,
-}
-
-impl MarkerTrackingConfig {
-    /// Without the options the headset does not support, which it would ignore.
-    pub fn supported_by(self, capabilities: &MarkerCapabilities) -> Self {
-        Self {
-            static_markers: self.static_markers && capabilities.static_markers,
-            marker_size: self.marker_size.filter(|_| capabilities.fixed_size_markers),
-        }
-    }
-}
-
-/// What the headset can do with markers.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
-pub struct MarkerCapabilities {
-    pub qr_codes: bool,
-    /// Honours [`MarkerTrackingConfig::marker_size`].
-    pub fixed_size_markers: bool,
-    /// Honours [`MarkerTrackingConfig::static_markers`].
-    pub static_markers: bool,
+    /// Centre of the marker; +Y towards its top edge, +Z out of its face.
+    pub pose: Pose,
+    /// Edge length in metres.
+    pub size: f32,
 }
 
 #[derive(Serialize, Deserialize)]

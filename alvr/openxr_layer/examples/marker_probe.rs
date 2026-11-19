@@ -6,6 +6,7 @@
 //!
 //! While it runs, the headset shows black: the probe submits empty frames.
 
+use alvr_marker_ipc::Payload;
 use openxr::{self as xr, sys, sys::Handle};
 use std::{
     ffi::CStr,
@@ -230,22 +231,24 @@ impl Spatial {
             buffer_id: buffer.buffer_id,
         };
 
-        match buffer.buffer_type {
+        let payload = match buffer.buffer_type {
             sys::SpatialBufferTypeEXT::STRING => {
                 let text = read_buffer(self.fns.get_spatial_buffer_string, snapshot, &info);
-                format!(
-                    "{:?}",
-                    unsafe { CStr::from_ptr(text.as_ptr()) }.to_string_lossy()
+                Payload::Text(
+                    unsafe { CStr::from_ptr(text.as_ptr()) }
+                        .to_string_lossy()
+                        .into(),
                 )
             }
-            sys::SpatialBufferTypeEXT::UINT8 => {
-                let bytes = read_buffer(self.fns.get_spatial_buffer_uint8, snapshot, &info);
-                bytes
-                    .iter()
-                    .fold("0x".to_owned(), |text, byte| format!("{text}{byte:02x}"))
-            }
-            other => format!("(not decoded, {other:?})"),
-        }
+            sys::SpatialBufferTypeEXT::UINT8 => Payload::Bytes(read_buffer(
+                self.fns.get_spatial_buffer_uint8,
+                snapshot,
+                &info,
+            )),
+            other => return format!("(not decoded, {other:?})"),
+        };
+
+        payload.to_string()
     }
 }
 

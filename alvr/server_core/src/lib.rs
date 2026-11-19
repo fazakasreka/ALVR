@@ -107,13 +107,10 @@ pub enum ServerCoreEvent {
     ShutdownPending,
     RestartPending,
     ProximityState(bool),
-    /// Every marker tracker the headset runs, with poses already recentered, and how recentering
-    /// moved the space poses are submitted in. Sent whenever one of them updates.
     Markers {
-        streams: Vec<MarkerStream>,
+        streams: Vec<MarkerStream>, // recentered, one per tracker the headset runs
         origin: OriginChange,
     },
-    /// Of the headset that connected.
     MarkerCapabilities(MarkerCapabilities),
 }
 
@@ -135,6 +132,14 @@ pub struct ConnectionContext {
     alpha_video_channel_sender: Mutex<Option<SyncSender<VideoPacket>>>,
     haptics_sender: Mutex<Option<StreamSender<Haptics>>>,
     marker_tracking: Mutex<MarkerTracking>,
+}
+
+impl ConnectionContext {
+    /// Takes the locked tracking manager, so that origin changes are sent in order.
+    fn send_markers(&self, tracking_manager: &TrackingManager) {
+        let event = self.marker_tracking.lock().event(tracking_manager);
+        self.events_sender.send(event).ok();
+    }
 }
 
 pub fn create_recording_file(connection_context: &ConnectionContext, settings: &Settings) {
@@ -362,25 +367,8 @@ impl ServerCoreContext {
         dbg_server_core!("set_requested_marker_configs");
 
         let ctx = &self.connection_context;
-        let running = {
-            let mut marker_tracking = ctx.marker_tracking.lock();
-            marker_tracking.set_requested(configs);
-            marker_tracking.configs()
-        };
-
-        // The trackers the headset no longer runs see nothing
-        if let Some(running) = running {
-            let mut tracking_manager = ctx.tracking_manager.write();
-            let before = tracking_manager.recentered_marker_streams().len();
-            tracking_manager.retain_marker_streams(&running);
-            if tracking_manager.recentered_marker_streams().len() != before {
-                ctx.events_sender
-                    .send(ServerCoreEvent::Markers {
-                        streams: tracking_manager.recentered_marker_streams(),
-                        origin: tracking_manager.origin_change(),
-                    })
-                    .ok();
-            }
+        if ctx.marker_tracking.lock().set_requested(configs) {
+            ctx.send_markers(&ctx.tracking_manager.read());
         }
     }
 

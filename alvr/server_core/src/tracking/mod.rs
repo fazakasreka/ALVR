@@ -7,7 +7,7 @@ pub use face::*;
 pub use vmc::*;
 
 use crate::{
-    ConnectionContext, MarkerStream, SESSION_MANAGER, ServerCoreEvent,
+    ConnectionContext, SESSION_MANAGER, ServerCoreEvent,
     connection::STREAMING_RECV_TIMEOUT,
     hand_gestures::{self, HAND_GESTURE_BUTTON_SET, HandGestureManager},
     input_mapping::ButtonMappingManager,
@@ -18,7 +18,7 @@ use alvr_common::{
     inputs as inp,
 };
 use alvr_events::{EventType, TrackingEvent};
-use alvr_packets::{MarkerTrackingConfig, TrackingData};
+use alvr_packets::TrackingData;
 use alvr_session::{
     BodyTrackingConfig, HeadsetConfig, RecenteringMode, Settings, VMCConfig,
     settings_schema::Switch,
@@ -64,12 +64,10 @@ pub struct TrackingManager {
     last_head_pose: Pose,             // client's reference space
     inverse_recentering_origin: Pose, // client's reference space
     origin_change: OriginChange,
-    /// Of the client's STAGE, as given to SteamVR.
-    stage_area: Option<Vec2>,
+    stage_area: Option<Vec2>, // client's STAGE, as given to SteamVR
     device_motions_history: HashMap<u64, VecDeque<(Duration, DeviceMotion)>>,
     hand_skeletons_history: [VecDeque<(Duration, [Pose; 26])>; 2],
     max_history_size: usize,
-    marker_streams: Vec<MarkerStream>, // client's reference space, one per tracker
 }
 
 impl TrackingManager {
@@ -82,59 +80,23 @@ impl TrackingManager {
             device_motions_history: HashMap::new(),
             hand_skeletons_history: [VecDeque::new(), VecDeque::new()],
             max_history_size,
-            marker_streams: Vec::new(),
         }
     }
 
-    /// Replaces the markers of the stream's tracker.
-    pub fn set_marker_stream(&mut self, stream: MarkerStream) {
-        match self
-            .marker_streams
-            .iter_mut()
-            .find(|existing| existing.config == stream.config)
-        {
-            Some(existing) => *existing = stream,
-            None => self.marker_streams.push(stream),
-        }
-    }
-
-    /// Forgets the trackers the headset no longer runs.
-    pub fn retain_marker_streams(&mut self, configs: &[MarkerTrackingConfig]) {
-        self.marker_streams
-            .retain(|stream| configs.contains(&stream.config));
-    }
-
-    pub fn recentered_marker_streams(&self) -> Vec<MarkerStream> {
-        self.marker_streams
-            .iter()
-            .map(|stream| MarkerStream {
-                markers: stream
-                    .markers
-                    .iter()
-                    .map(|marker| alvr_packets::MarkerData {
-                        pose: self.recenter_pose(marker.pose),
-                        ..marker.clone()
-                    })
-                    .collect(),
-                ..stream.clone()
-            })
-            .collect()
-    }
-
-    /// `client_change` is where the client's new origin is in its previous one, if known.
+    /// `stage_in_previous` is where the client's new origin is in its previous one, if known.
     fn change_origin(
         &mut self,
         inverse_origin: Pose,
-        client_change: Option<Pose>,
+        stage_in_previous: Option<Pose>,
         bounds_changed: bool,
     ) {
         let previous = self.inverse_recentering_origin;
         self.inverse_recentering_origin = inverse_origin;
 
-        // A point at c in the client's new space is at client_change * c in its previous one, so
-        // at previous * client_change * c then, and at inverse_origin * c now
+        // A point at c in the client's new space is at stage_in_previous * c in its previous one,
+        // so at previous * stage_in_previous * c then, and at inverse_origin * c now
         let pose_in_previous =
-            client_change.map(|change| previous * change * inverse_origin.inverse());
+            stage_in_previous.map(|change| previous * change * inverse_origin.inverse());
         let moved = pose_in_previous.is_none_or(|pose| {
             pose.position.length() >= 1e-4 || pose.orientation.angle_between(Quat::IDENTITY) >= 1e-4
         });
@@ -159,27 +121,29 @@ impl TrackingManager {
         self.origin_change
     }
 
-    /// For a new connection: its origin is a change from the last one, to somewhere not known.
-    pub fn after_origin_changes(mut self, count: u64) -> Self {
+    /// For a new connection: its origin is a change from the last one, the `previous_count`th, to
+    /// somewhere not known.
+    pub fn continuing_from(mut self, previous_count: u64) -> Self {
         self.origin_change = OriginChange {
-            count: count + 1,
+            count: previous_count + 1,
             pose_in_previous: None,
             moved: true,
         };
         self
     }
 
-    /// Moves the origin as `recentering_mode` puts it. `client_change` is where the client's new
-    /// origin is in its previous one: the identity when its space stayed, `None` when not known.
+    /// Moves the origin as `recentering_mode` puts it. `stage_in_previous` is where the client's
+    /// new origin is in its previous one: the identity when its space stayed, `None` when not
+    /// known.
     pub fn recenter(
         &mut self,
         recentering_mode: &RecenteringMode,
-        client_change: Option<Pose>,
+        stage_in_previous: Option<Pose>,
         bounds_changed: bool,
     ) {
         // The last head pose is still in the client's previous space: where it is in the new one,
         // when known, for the modes that recenter on the head
-        if let Some(change) = client_change {
+        if let Some(change) = stage_in_previous {
             self.last_head_pose = change.inverse() * self.last_head_pose;
         }
 
@@ -216,7 +180,7 @@ impl TrackingManager {
                 orientation,
             }
             .inverse(),
-            client_change,
+            stage_in_previous,
             bounds_changed,
         );
     }
@@ -652,7 +616,7 @@ mod tests {
 
     #[test]
     fn recentering_says_where_the_new_origin_is() {
-        let mut manager = TrackingManager::new(10).after_origin_changes(4);
+        let mut manager = TrackingManager::new(10).continuing_from(4);
         assert_eq!(manager.origin_change().count, 5);
         assert!(manager.origin_change().pose_in_previous.is_none());
 
@@ -685,13 +649,13 @@ mod tests {
 
         // The client's STAGE moves 1 m along X and turns: the same point in the room is somewhere
         // else in the client's new space
-        let client_change = Pose {
+        let stage_in_previous = Pose {
             position: Vec3::new(1.0, 0.0, 0.0),
             orientation: Quat::from_rotation_y(0.7),
         };
         let before = manager.recenter_pose(point());
-        let point_in_new_client_space = client_change.inverse() * point();
-        manager.recenter(&RecenteringMode::Stage, Some(client_change), false);
+        let point_in_new_client_space = stage_in_previous.inverse() * point();
+        manager.recenter(&RecenteringMode::Stage, Some(stage_in_previous), false);
         assert_change(
             &manager,
             before,
@@ -706,15 +670,15 @@ mod tests {
         };
         manager.last_head_pose = head;
         let before = manager.recenter_pose(point_in_new_client_space);
-        let point_in_newer_client_space = client_change.inverse() * point_in_new_client_space;
-        manager.recenter(&RecenteringMode::LocalFloor, Some(client_change), false);
+        let point_in_newer_client_space = stage_in_previous.inverse() * point_in_new_client_space;
+        manager.recenter(&RecenteringMode::LocalFloor, Some(stage_in_previous), false);
         assert_change(
             &manager,
             before,
             manager.recenter_pose(point_in_newer_client_space),
         );
         // The origin is under the head, where it is in the client's new space
-        let head_now = manager.recenter_pose(client_change.inverse() * head);
+        let head_now = manager.recenter_pose(stage_in_previous.inverse() * head);
         assert!(head_now.position.x.abs() < 1e-5 && head_now.position.z.abs() < 1e-5);
         assert!((head_now.position.y - 1.6).abs() < 1e-5);
 
@@ -742,20 +706,5 @@ mod tests {
         // Neither moved nor resized
         manager.recenter(&RecenteringMode::Stage, KEPT, false);
         assert_eq!(manager.origin_change().count, 1);
-    }
-
-    #[test]
-    fn marker_streams_follow_the_trackers() {
-        let config = MarkerTrackingConfig::default();
-        let mut manager = TrackingManager::new(10);
-        manager.set_marker_stream(MarkerStream {
-            config,
-            timestamp: Duration::ZERO,
-            markers: Vec::new(),
-        });
-        assert_eq!(manager.recentered_marker_streams().len(), 1);
-
-        manager.retain_marker_streams(&[]);
-        assert!(manager.recentered_marker_streams().is_empty());
     }
 }

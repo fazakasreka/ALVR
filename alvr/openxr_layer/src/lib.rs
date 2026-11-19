@@ -29,14 +29,18 @@ mod history;
 mod installation;
 mod log;
 mod math;
+mod session;
 mod spatial;
+#[cfg(test)]
+mod test_util;
 #[cfg(test)]
 mod tests;
 
-use alvr_marker_ipc::{Capabilities, Client, Origin};
+use alvr_marker_ipc::{self as ipc, Capabilities, Client};
 use history::MarkerHistory;
 use log::log;
 use openxr_sys::{self as xr, Handle, loader, pfn};
+use session::OriginChange;
 use std::{
     collections::{HashMap, HashSet},
     ffi::{CStr, CString, c_char},
@@ -46,19 +50,32 @@ use std::{
 
 const LAYER_NAME: &CStr = c"XR_APILAYER_ALVR_marker_tracking";
 
+const SPATIAL_ENTITY_EXTENSION: &CStr = c"XR_EXT_spatial_entity";
 const MARKER_TRACKING_EXTENSION: &CStr = c"XR_EXT_spatial_marker_tracking";
-const SPATIAL_EXTENSIONS: [&CStr; 2] = [c"XR_EXT_spatial_entity", MARKER_TRACKING_EXTENSION];
+const SPATIAL_EXTENSIONS: [&CStr; 2] = [SPATIAL_ENTITY_EXTENSION, MARKER_TRACKING_EXTENSION];
 const FUTURE_EXTENSION: &CStr = c"XR_EXT_future";
-/// Enabled on the runtime too when the layer provides the spatial extensions, to answer for the
-/// times applications ask for.
 const TIME_EXTENSION: &CStr = c"XR_KHR_win32_convert_performance_counter_time";
 
 macro_rules! void_fn {
     ($f:expr, $ty:ty) => {
-        unsafe { mem::transmute::<$ty, pfn::VoidFunction>($f as $ty) }
+        unsafe { ::std::mem::transmute::<$ty, pfn::VoidFunction>($f as $ty) }
     };
 }
 pub(crate) use void_fn;
+
+/// A function of the runtime (or the next layer), if it has it.
+unsafe fn load_fn<T>(
+    gipa: pfn::GetInstanceProcAddr,
+    instance: xr::Instance,
+    name: &CStr,
+) -> Option<T> {
+    let mut function = None;
+    if unsafe { gipa(instance, name.as_ptr(), &mut function) } != xr::Result::SUCCESS {
+        return None;
+    }
+
+    function.map(|function| unsafe { mem::transmute_copy(&function) })
+}
 
 /// Runtime functions the layer calls itself.
 #[derive(Clone, Copy)]
@@ -73,11 +90,13 @@ struct Downstream {
     destroy_space: pfn::DestroySpace,
     locate_space: pfn::LocateSpace,
     enumerate_reference_spaces: pfn::EnumerateReferenceSpaces,
-    // Only when the runtime implements XR_EXT_future
+    /// Only when the runtime implements XR_EXT_future.
     poll_future: Option<pfn::PollFutureEXT>,
+    /// Only when the runtime implements XR_EXT_future.
     cancel_future: Option<pfn::CancelFutureEXT>,
-    // Only when XR_KHR_win32_convert_performance_counter_time is enabled
+    /// Only when XR_KHR_win32_convert_performance_counter_time is enabled.
     convert_time: Option<pfn::ConvertTimeToWin32PerformanceCounterKHR>,
+    /// Only when XR_KHR_win32_convert_performance_counter_time is enabled.
     convert_counter: Option<pfn::ConvertWin32PerformanceCounterToTimeKHR>,
 }
 
@@ -87,62 +106,49 @@ impl Downstream {
         instance: xr::Instance,
         has_time_extension: bool,
     ) -> Option<Self> {
-        unsafe fn get<T: Copy>(
-            gipa: pfn::GetInstanceProcAddr,
-            instance: xr::Instance,
-            name: &CStr,
-        ) -> Option<T> {
-            let mut function = None;
-            if unsafe { gipa(instance, name.as_ptr(), &mut function) } != xr::Result::SUCCESS {
-                return None;
-            }
-
-            function.map(|function| unsafe { mem::transmute_copy(&function) })
-        }
-
         unsafe {
             Some(Self {
                 get_instance_proc_addr: gipa,
-                destroy_instance: get(gipa, instance, c"xrDestroyInstance")?,
-                get_system: get(gipa, instance, c"xrGetSystem")?,
-                poll_event: get(gipa, instance, c"xrPollEvent")?,
-                create_session: get(gipa, instance, c"xrCreateSession")?,
-                destroy_session: get(gipa, instance, c"xrDestroySession")?,
-                create_reference_space: get(gipa, instance, c"xrCreateReferenceSpace")?,
-                destroy_space: get(gipa, instance, c"xrDestroySpace")?,
-                locate_space: get(gipa, instance, c"xrLocateSpace")?,
-                enumerate_reference_spaces: get(gipa, instance, c"xrEnumerateReferenceSpaces")?,
-                poll_future: get(gipa, instance, c"xrPollFutureEXT"),
-                cancel_future: get(gipa, instance, c"xrCancelFutureEXT"),
-                convert_time: if has_time_extension {
-                    get(gipa, instance, c"xrConvertTimeToWin32PerformanceCounterKHR")
-                } else {
-                    None
-                },
-                convert_counter: if has_time_extension {
-                    get(gipa, instance, c"xrConvertWin32PerformanceCounterToTimeKHR")
-                } else {
-                    None
-                },
+                destroy_instance: load_fn(gipa, instance, c"xrDestroyInstance")?,
+                get_system: load_fn(gipa, instance, c"xrGetSystem")?,
+                poll_event: load_fn(gipa, instance, c"xrPollEvent")?,
+                create_session: load_fn(gipa, instance, c"xrCreateSession")?,
+                destroy_session: load_fn(gipa, instance, c"xrDestroySession")?,
+                create_reference_space: load_fn(gipa, instance, c"xrCreateReferenceSpace")?,
+                destroy_space: load_fn(gipa, instance, c"xrDestroySpace")?,
+                locate_space: load_fn(gipa, instance, c"xrLocateSpace")?,
+                enumerate_reference_spaces: load_fn(gipa, instance, c"xrEnumerateReferenceSpaces")?,
+                poll_future: load_fn(gipa, instance, c"xrPollFutureEXT"),
+                cancel_future: load_fn(gipa, instance, c"xrCancelFutureEXT"),
+                convert_time: has_time_extension
+                    .then(|| load_fn(gipa, instance, c"xrConvertTimeToWin32PerformanceCounterKHR"))
+                    .flatten(),
+                convert_counter: has_time_extension
+                    .then(|| load_fn(gipa, instance, c"xrConvertWin32PerformanceCounterToTimeKHR"))
+                    .flatten(),
             })
         }
     }
 }
 
+/// The functions the layer implements for an instance.
+#[derive(Clone, Copy, Default)]
+struct Hooks {
+    /// Of XR_EXT_spatial_entity and XR_EXT_spatial_marker_tracking.
+    spatial: bool,
+    /// Of XR_EXT_future, for the layer's futures, also when the runtime implements it.
+    future: bool,
+    /// xrCreateSession, xrDestroySession and xrPollEvent, which report recentering and recommend
+    /// spatial discoveries.
+    session: bool,
+}
+
 struct InstanceData {
     downstream: Downstream,
-    /// XR_EXT_spatial_entity and XR_EXT_spatial_marker_tracking are implemented by the layer.
-    provides_spatial: bool,
-    /// XR_EXT_future is implemented by the layer.
-    provides_future: bool,
-    /// The application enabled XR_EXT_spatial_marker_tracking, not only XR_EXT_spatial_entity.
-    marker_tracking_enabled: bool,
-    /// The application enabled XR_EXT_future, whoever implements it.
-    future_enabled: bool,
-    /// The ALVR copy of the layer is a registered SteamVR driver: recentering is reported. A layer
-    /// left registered by an uninstalled ALVR only provides the extensions the loader advertises,
-    /// without any QR code, and is otherwise out of the way.
-    alvr_registered: bool,
+    hooks: Hooks,
+    /// The application enabled XR_EXT_spatial_marker_tracking, and the ALVR copy of the layer is a
+    /// registered SteamVR driver.
+    qr_codes: bool,
     /// The systems xrGetSystem returned, the ones the spatial functions accept.
     systems: HashSet<u64>,
 }
@@ -153,9 +159,7 @@ struct Markers {
     was_connected: bool,
     history: MarkerHistory,
     /// The origin the driver sent last.
-    origin: Option<Origin>,
-    /// Origin changes not yet handed to the sessions.
-    origin_changes: Vec<spatial::OriginChange>,
+    origin: Option<ipc::OriginChange>,
 }
 
 impl Default for Markers {
@@ -165,27 +169,29 @@ impl Default for Markers {
             was_connected: false,
             history: MarkerHistory::default(),
             origin: None,
-            origin_changes: Vec::new(),
         }
     }
 }
 
 impl Markers {
     /// Takes in what the driver sent. Returns what the headset connected last can do, or `None`
-    /// while the driver is not running.
-    fn refresh(&mut self) -> Option<Capabilities> {
-        let snapshot = self.client.read();
+    /// while the driver is not running, and how the origin changed since the last call.
+    fn refresh(&mut self) -> (Option<Capabilities>, Vec<OriginChange>) {
+        let capabilities = self.client.read().map(|snapshot| snapshot.capabilities);
+        let mut changes = Vec::new();
         for received in self.client.take_received() {
             // Before the snapshot's poses, which are in the new space already
-            if let Some(change) = self.origin_change(received.origin) {
+            if let Some(previous) = self.origin.replace(received.origin)
+                && let Some(change) = OriginChange::between(previous, received.origin)
+            {
                 if change.moved {
                     self.history.move_origin(change.pose_in_previous);
                 }
-                self.origin_changes.push(change);
+                changes.push(change);
             }
             self.history.add(&received);
         }
-        if snapshot.is_none() {
+        if capabilities.is_none() {
             self.history.clear();
         }
 
@@ -202,27 +208,7 @@ impl Markers {
             );
         }
 
-        snapshot.map(|snapshot| snapshot.capabilities)
-    }
-
-    /// How the space the poses are in moved since the last origin the driver sent, if it did.
-    fn origin_change(&mut self, origin: Origin) -> Option<spatial::OriginChange> {
-        let previous = self.origin.replace(origin)?;
-        if origin.changes == previous.changes {
-            return None;
-        }
-
-        // A step from the last change seen, or else (a missed one, a restarted driver) unknown
-        let follows = origin.changes == previous.changes + 1;
-        Some(spatial::OriginChange {
-            changed_ns: origin.changed_ns,
-            pose_in_previous: origin
-                .pose_in_previous
-                .filter(|_| follows)
-                .map(math::from_ipc),
-            // A missed change may have moved it
-            moved: origin.moved || !follows,
-        })
+        (capabilities, changes)
     }
 }
 
@@ -236,7 +222,7 @@ use tests::pipe_name;
 #[derive(Default)]
 struct State {
     instances: HashMap<u64, InstanceData>,
-    sessions: HashMap<u64, spatial::SessionData>,
+    sessions: HashMap<u64, session::SessionData>,
     contexts: HashMap<u64, spatial::ContextData>,
     snapshots: HashMap<u64, spatial::SnapshotData>,
     entities: HashMap<u64, spatial::EntityData>,
@@ -247,17 +233,44 @@ struct State {
     next_handle: u64,
 }
 
+/// In every handle and future of the layer: recognisable in a debugger, and tells the layer's
+/// futures apart from the runtime's.
+const HANDLE_PREFIX: u64 = 0x414C_5652_0000_0000;
+
+/// Futures and handles of the layer have this in their upper half.
+fn is_layer_handle(handle: u64) -> bool {
+    handle >> 32 == HANDLE_PREFIX >> 32
+}
+
 impl State {
     /// A value for a handle or future the layer creates. Never 0, and never reused.
     fn new_handle(&mut self) -> u64 {
         self.next_handle += 1;
         HANDLE_PREFIX | self.next_handle
     }
-}
 
-/// In every handle and future of the layer: recognisable in a debugger, and tells the layer's
-/// futures apart from the runtime's.
-const HANDLE_PREFIX: u64 = 0x414C_5652_0000_0000;
+    fn downstream(&self, instance: u64) -> Option<Downstream> {
+        self.instances.get(&instance).map(|data| data.downstream)
+    }
+
+    /// The runtime's xrDestroyInstance.
+    fn remove_instance(&mut self, instance: u64) -> Option<pfn::DestroyInstance> {
+        let data = self.instances.remove(&instance)?;
+
+        let sessions = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.instance == instance)
+            .map(|(&handle, _)| handle)
+            .collect::<Vec<_>>();
+        for session in sessions {
+            self.remove_session(session);
+        }
+        self.futures.retain(|_, future| future.instance != instance);
+
+        Some(data.downstream.destroy_instance)
+    }
+}
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(Mutex::default);
 
@@ -299,6 +312,56 @@ pub unsafe extern "system" fn xrNegotiateLoaderApiLayerInterface(
     xr::Result::SUCCESS
 }
 
+/// What the layer implements for an instance, and whether it enables the time conversion on the
+/// runtime for it.
+#[derive(Clone, Copy)]
+struct Plan {
+    provides_spatial: bool,
+    provides_future: bool,
+    add_time: bool,
+}
+
+impl Plan {
+    /// What the runtime implements itself is left to it.
+    fn new(
+        wants: impl Fn(&CStr) -> bool,
+        alvr_registered: bool,
+        runtime_has: impl Fn(&CStr) -> bool,
+    ) -> Self {
+        let provides_spatial = SPATIAL_EXTENSIONS.into_iter().any(&wants)
+            && !SPATIAL_EXTENSIONS.into_iter().all(&runtime_has);
+        let provides_future = wants(FUTURE_EXTENSION) && !runtime_has(FUTURE_EXTENSION);
+        // Without it, markers are located at their latest pose, and recentering is not reported
+        let add_time = (provides_spatial || alvr_registered)
+            && !wants(TIME_EXTENSION)
+            && runtime_has(TIME_EXTENSION);
+
+        Self {
+            provides_spatial,
+            provides_future,
+            add_time,
+        }
+    }
+
+    /// The extensions to enable on the runtime, from the ones the application asked for.
+    fn extensions_for_runtime(&self, requested: &[*const c_char]) -> Vec<*const c_char> {
+        let provided = |name: &CStr| {
+            (self.provides_spatial && SPATIAL_EXTENSIONS.contains(&name))
+                || (self.provides_future && name == FUTURE_EXTENSION)
+        };
+        let mut names = requested
+            .iter()
+            .copied()
+            .filter(|&name| !provided(unsafe { CStr::from_ptr(name) }))
+            .collect::<Vec<_>>();
+        if self.add_time {
+            names.push(TIME_EXTENSION.as_ptr());
+        }
+
+        names
+    }
+}
+
 unsafe extern "system" fn create_api_layer_instance(
     info: *const xr::InstanceCreateInfo,
     layer_info: *const loader::ApiLayerCreateInfo,
@@ -336,33 +399,17 @@ unsafe extern "system" fn create_api_layer_instance(
         }
         .to_vec()
     };
-    let is_spatial =
-        |name: *const c_char| SPATIAL_EXTENSIONS.contains(&unsafe { CStr::from_ptr(name) });
-    let is_future = |name: *const c_char| unsafe { CStr::from_ptr(name) } == FUTURE_EXTENSION;
-    let wants_spatial = requested.iter().any(|&name| is_spatial(name));
-    let wants_future = requested.iter().any(|&name| is_future(name));
-    let wants_marker_tracking = requested
-        .iter()
-        .any(|&name| unsafe { CStr::from_ptr(name) } == MARKER_TRACKING_EXTENSION);
-    let wants_time = requested
-        .iter()
-        .any(|&name| unsafe { CStr::from_ptr(name) } == TIME_EXTENSION);
+    let wants = |extension: &CStr| {
+        requested
+            .iter()
+            .any(|&name| unsafe { CStr::from_ptr(name) } == extension)
+    };
     let alvr_registered = installation::alvr_is_registered();
     if !alvr_registered {
-        log!("ALVR is not registered with SteamVR: recentering is not reported");
+        log!("ALVR is not registered with SteamVR: no QR codes, and recentering is not reported");
     }
 
-    let create = |strip_spatial: bool, strip_future: bool, add_time: bool| {
-        let mut names = requested
-            .iter()
-            .copied()
-            .filter(|&name| {
-                !(strip_spatial && is_spatial(name)) && !(strip_future && is_future(name))
-            })
-            .collect::<Vec<_>>();
-        if add_time {
-            names.push(TIME_EXTENSION.as_ptr());
-        }
+    let create = |names: &[*const c_char]| {
         let mut info = *info;
         info.enabled_extension_count = names.len() as u32;
         info.enabled_extension_names = if names.is_empty() {
@@ -374,68 +421,68 @@ unsafe extern "system" fn create_api_layer_instance(
         unsafe { next_create(&info, &next_layer_info, instance) }
     };
 
-    // What the runtime implements itself is left to it. The runtime is asked what it implements
-    // rather than tried with the extensions: SteamVR asserts when an instance is created again
-    // after a failed attempt, which stops applications in a debugger.
-    let (provides_spatial, provides_future, add_time, result) =
-        match unsafe { runtime_extensions(next_gipa) } {
-            Some(available) => {
-                let has = |name: &CStr| available.iter().any(|ext| ext.as_c_str() == name);
-                let provides_spatial =
-                    wants_spatial && !SPATIAL_EXTENSIONS.iter().all(|&name| has(name));
-                let provides_future = wants_future && !has(FUTURE_EXTENSION);
-                // Without it, markers are located at their latest pose, and reference space
-                // changes are not reported
-                let add_time =
-                    (provides_spatial || alvr_registered) && !wants_time && has(TIME_EXTENSION);
-
-                let result = create(provides_spatial, provides_future, add_time);
-                (provides_spatial, provides_future, add_time, result)
+    // The runtime is asked what it implements rather than tried with the extensions: SteamVR
+    // asserts when an instance is created again after a failed attempt, which stops applications
+    // in a debugger.
+    let (plan, result) = match unsafe { runtime_extensions(next_gipa) } {
+        Some(available) => {
+            let plan = Plan::new(wants, alvr_registered, |name| {
+                available.iter().any(|ext| ext.as_c_str() == name)
+            });
+            (plan, create(&plan.extensions_for_runtime(&requested)))
+        }
+        // Found out by trying, then: each refusal is put down to the first extension in this
+        // order that the runtime may lack
+        None => {
+            let mut lacking = Vec::new();
+            loop {
+                let plan = Plan::new(wants, alvr_registered, |name| !lacking.contains(&name));
+                let names = plan.extensions_for_runtime(&requested);
+                let result = create(&names);
+                let suspect = [
+                    SPATIAL_ENTITY_EXTENSION,
+                    MARKER_TRACKING_EXTENSION,
+                    FUTURE_EXTENSION,
+                    TIME_EXTENSION,
+                ]
+                .into_iter()
+                .find(|&extension| {
+                    !lacking.contains(&extension)
+                        && names
+                            .iter()
+                            .any(|&name| unsafe { CStr::from_ptr(name) } == extension)
+                });
+                match suspect {
+                    Some(extension) if result == xr::Result::ERROR_EXTENSION_NOT_PRESENT => {
+                        lacking.push(extension);
+                    }
+                    _ => break (plan, result),
+                }
             }
-            // Found out by trying, then
-            None => {
-                let mut provides_spatial = false;
-                let mut provides_future = false;
-                let mut add_time = false;
-                let mut result = create(false, false, false);
-                if result == xr::Result::ERROR_EXTENSION_NOT_PRESENT && wants_spatial {
-                    provides_spatial = true;
-                    add_time = !wants_time;
-                    result = create(true, false, add_time);
-                }
-                if result == xr::Result::ERROR_EXTENSION_NOT_PRESENT && wants_future {
-                    provides_future = true;
-                    result = create(provides_spatial, true, add_time);
-                }
-                if result == xr::Result::ERROR_EXTENSION_NOT_PRESENT && add_time {
-                    add_time = false;
-                    result = create(provides_spatial, provides_future, false);
-                }
-                (provides_spatial, provides_future, add_time, result)
-            }
-        };
+        }
+    };
     if result != xr::Result::SUCCESS {
         return result;
     }
 
     let instance = unsafe { *instance };
     let Some(downstream) =
-        (unsafe { Downstream::load(next_gipa, instance, wants_time || add_time) })
+        (unsafe { Downstream::load(next_gipa, instance, wants(TIME_EXTENSION) || plan.add_time) })
     else {
         log!("The runtime lacks core functions");
-        let mut destroy = None;
-        unsafe { next_gipa(instance, c"xrDestroyInstance".as_ptr(), &mut destroy) };
-        if let Some(destroy) = destroy {
-            let destroy: pfn::DestroyInstance = unsafe { mem::transmute(destroy) };
+        if let Some(destroy) =
+            unsafe { load_fn::<pfn::DestroyInstance>(next_gipa, instance, c"xrDestroyInstance") }
+        {
             unsafe { destroy(instance) };
         }
         return xr::Result::ERROR_RUNTIME_FAILURE;
     };
 
-    if provides_spatial {
+    let wants_spatial = SPATIAL_EXTENSIONS.into_iter().any(wants);
+    if plan.provides_spatial {
         log!(
             "Providing XR_EXT_spatial_entity and XR_EXT_spatial_marker_tracking{}",
-            if provides_future {
+            if plan.provides_future {
                 ", and XR_EXT_future"
             } else {
                 ""
@@ -451,11 +498,12 @@ unsafe extern "system" fn create_api_layer_instance(
         instance.into_raw(),
         InstanceData {
             downstream,
-            provides_spatial,
-            provides_future,
-            marker_tracking_enabled: wants_marker_tracking,
-            future_enabled: wants_future,
-            alvr_registered,
+            hooks: Hooks {
+                spatial: plan.provides_spatial,
+                future: (plan.provides_spatial || plan.provides_future) && wants(FUTURE_EXTENSION),
+                session: plan.provides_spatial || alvr_registered,
+            },
+            qr_codes: wants(MARKER_TRACKING_EXTENSION) && alvr_registered,
             systems: HashSet::new(),
         },
     );
@@ -466,18 +514,13 @@ unsafe extern "system" fn create_api_layer_instance(
 /// The instance extensions of the runtime and the layers after this one, or `None` if they cannot
 /// be listed.
 unsafe fn runtime_extensions(next_gipa: pfn::GetInstanceProcAddr) -> Option<Vec<CString>> {
-    let mut function = None;
-    let result = unsafe {
-        next_gipa(
+    let enumerate: pfn::EnumerateInstanceExtensionProperties = unsafe {
+        load_fn(
+            next_gipa,
             xr::Instance::NULL,
-            c"xrEnumerateInstanceExtensionProperties".as_ptr(),
-            &mut function,
+            c"xrEnumerateInstanceExtensionProperties",
         )
-    };
-    if result != xr::Result::SUCCESS {
-        return None;
-    }
-    let enumerate: pfn::EnumerateInstanceExtensionProperties = unsafe { mem::transmute(function?) };
+    }?;
 
     let mut count = 0;
     let result = unsafe { enumerate(ptr::null(), 0, &mut count, ptr::null_mut()) };
@@ -517,43 +560,31 @@ unsafe extern "system" fn get_instance_proc_addr(
     }
     let name_str = unsafe { CStr::from_ptr(name) };
 
-    let (next, reports_recentering, provides_spatial, provides_future, future_enabled) = {
+    let (next, hooks) = {
         let state = state();
         match state.instances.get(&instance.into_raw()) {
-            Some(data) => (
-                data.downstream.get_instance_proc_addr,
-                data.alvr_registered,
-                data.provides_spatial,
-                data.provides_future,
-                data.future_enabled,
-            ),
+            Some(data) => (data.downstream.get_instance_proc_addr, data.hooks),
             None => match state.last_get_instance_proc_addr {
-                Some(next) => (next, false, false, false, false),
+                Some(next) => (next, Hooks::default()),
                 None => return xr::Result::ERROR_HANDLE_INVALID,
             },
         }
     };
 
+    let hooked: [(bool, fn(&CStr) -> Option<pfn::VoidFunction>); 3] = [
+        (hooks.spatial, spatial::function),
+        (hooks.future, spatial::future_function),
+        (hooks.session, session::function),
+    ];
     let ours = match name_str.to_bytes() {
         b"xrGetInstanceProcAddr" => {
             Some(void_fn!(get_instance_proc_addr, pfn::GetInstanceProcAddr))
         }
         b"xrDestroyInstance" => Some(void_fn!(destroy_instance, pfn::DestroyInstance)),
-        b"xrGetSystem" if provides_spatial => Some(void_fn!(get_system, pfn::GetSystem)),
-        // For every application, to report ALVR recentering
-        b"xrCreateSession" | b"xrDestroySession" | b"xrPollEvent" if reports_recentering => {
-            spatial::function(name_str)
-        }
-        _ if provides_spatial => spatial::function(name_str),
-        _ => None,
-    }
-    // The layer's futures go through the layer even when the runtime implements XR_EXT_future,
-    // but only for applications that enabled it
-    .or_else(|| {
-        ((provides_spatial || provides_future) && future_enabled)
-            .then(|| spatial::future_function(name_str))
-            .flatten()
-    });
+        _ => hooked
+            .into_iter()
+            .find_map(|(hooked, function)| hooked.then(|| function(name_str)).flatten()),
+    };
     if let Some(ours) = ours {
         unsafe { *function = Some(ours) };
         return xr::Result::SUCCESS;
@@ -562,63 +593,16 @@ unsafe extern "system" fn get_instance_proc_addr(
     unsafe { next(instance, name, function) }
 }
 
-/// Remembers the systems of the instance, which the spatial functions are called with.
-unsafe extern "system" fn get_system(
-    instance: xr::Instance,
-    info: *const xr::SystemGetInfo,
-    system: *mut xr::SystemId,
-) -> xr::Result {
-    let Some(downstream) = state()
-        .instances
-        .get(&instance.into_raw())
-        .map(|data| data.downstream)
-    else {
-        return xr::Result::ERROR_HANDLE_INVALID;
-    };
-
-    let result = unsafe { (downstream.get_system)(instance, info, system) };
-    if result == xr::Result::SUCCESS
-        && let Some(data) = state().instances.get_mut(&instance.into_raw())
-    {
-        data.systems.insert(unsafe { *system }.into_raw());
-    }
-
-    result
-}
-
 unsafe extern "system" fn destroy_instance(instance: xr::Instance) -> xr::Result {
     let destroy = {
         let mut state = state();
-        let Some((destroy, provided_spatial)) = state.remove_instance(instance.into_raw()) else {
+        let Some(destroy) = state.remove_instance(instance.into_raw()) else {
             return xr::Result::ERROR_HANDLE_INVALID;
         };
-        // Applications that did not use the layer never talk to the driver
-        if provided_spatial {
-            state.sync_requests();
-        }
+        state.sync_requests();
         destroy
     };
 
-    // The runtime destroys the stage spaces the layer created along with the instance
+    // The runtime destroys the reference spaces the layer created along with the instance
     unsafe { destroy(instance) }
-}
-
-impl State {
-    /// The runtime's xrDestroyInstance, and whether the layer provided the spatial extensions.
-    fn remove_instance(&mut self, instance: u64) -> Option<(pfn::DestroyInstance, bool)> {
-        let data = self.instances.remove(&instance)?;
-
-        let sessions = self
-            .sessions
-            .iter()
-            .filter(|(_, session)| session.instance == instance)
-            .map(|(&handle, _)| handle)
-            .collect::<Vec<_>>();
-        for session in sessions {
-            self.remove_session(session);
-        }
-        self.futures.retain(|_, future| future.instance != instance);
-
-        Some((data.downstream.destroy_instance, data.provides_spatial))
-    }
 }

@@ -13,19 +13,20 @@
 //! gets their poses averaged, and one with a marker size gets that size.
 
 use crate::{
-    Downstream, State,
-    history::{At, Located},
-    log, math, state, void_fn,
+    State,
+    history::{At, Located, MarkerHistory},
+    is_layer_handle, log, math,
+    session::locate,
+    state, void_fn,
 };
 use alvr_marker_ipc::{
-    Capabilities, Payload, TrackingConfig, now_ns, ns_to_performance_counter,
-    performance_counter_to_ns,
+    Capabilities, Payload, Pose, TrackingConfig, now_ns, performance_counter_to_ns,
 };
 use openxr_sys::{self as xr, Handle, pfn};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     ffi::{CStr, c_char, c_void},
-    mem, ptr, slice,
+    ptr, slice,
 };
 
 const QR_COMPONENTS: [xr::SpatialComponentTypeEXT; 2] = [
@@ -45,66 +46,6 @@ const QR_FEATURES: [xr::SpatialCapabilityFeatureEXT; 2] = [
     xr::SpatialCapabilityFeatureEXT::MARKER_TRACKING_STATIC_MARKERS,
 ];
 
-pub(crate) struct SessionData {
-    pub instance: u64,
-    /// Reference spaces of the layer's own, at their natural origins, created when first needed.
-    spaces: Vec<(xr::ReferenceSpaceType, xr::Space)>,
-    /// The reference space types of the session, once asked for.
-    reference_space_types: Option<Vec<xr::ReferenceSpaceType>>,
-    /// Origin changes not yet reported.
-    origin_changes: VecDeque<OriginChange>,
-    /// Reference space change events ready for xrPollEvent.
-    space_events: VecDeque<SpaceEvent>,
-}
-
-/// An XrEventDataReferenceSpaceChangePending of the session.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct SpaceEvent {
-    reference_space_type: xr::ReferenceSpaceType,
-    change_time: xr::Time,
-    /// Where the new origin is in the previous space, when known.
-    pose_in_previous_space: Option<xr::Posef>,
-}
-
-impl SessionData {
-    fn new(instance: u64) -> Self {
-        Self {
-            instance,
-            spaces: Vec::new(),
-            reference_space_types: None,
-            origin_changes: VecDeque::new(),
-            space_events: VecDeque::new(),
-        }
-    }
-}
-
-/// ALVR moved the space it submits poses to SteamVR in: for applications, every reference space
-/// but VIEW moved by as much.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct OriginChange {
-    /// When it took effect, on the performance counter clock.
-    pub changed_ns: i64,
-    /// Where the new origin of STAGE is in the previous STAGE, when known.
-    pub pose_in_previous: Option<xr::Posef>,
-    /// False when only the bounds of STAGE changed.
-    pub moved: bool,
-}
-
-impl OriginChange {
-    /// This change, then `next`.
-    fn then(self, next: Self) -> Self {
-        Self {
-            changed_ns: next.changed_ns,
-            pose_in_previous: self
-                .pose_in_previous
-                .zip(next.pose_in_previous)
-                .map(|(first, second)| math::compose(first, second)),
-            moved: self.moved || next.moved,
-        }
-    }
-}
-
-#[derive(Clone)]
 pub(crate) struct ContextData {
     session: u64,
     components: Vec<xr::SpatialComponentTypeEXT>,
@@ -157,9 +98,7 @@ enum FutureKind {
 
 pub(crate) fn function(name: &CStr) -> Option<pfn::VoidFunction> {
     Some(match name.to_bytes() {
-        b"xrCreateSession" => void_fn!(create_session, pfn::CreateSession),
-        b"xrDestroySession" => void_fn!(destroy_session, pfn::DestroySession),
-        b"xrPollEvent" => void_fn!(poll_event, pfn::PollEvent),
+        b"xrGetSystem" => void_fn!(get_system, pfn::GetSystem),
         b"xrEnumerateSpatialCapabilitiesEXT" => {
             void_fn!(enumerate_capabilities, pfn::EnumerateSpatialCapabilitiesEXT)
         }
@@ -236,30 +175,6 @@ pub(crate) fn future_function(name: &CStr) -> Option<pfn::VoidFunction> {
     })
 }
 
-/// The reference space types of the session, from the runtime.
-unsafe fn reference_space_types(
-    downstream: &Downstream,
-    session: u64,
-) -> Vec<xr::ReferenceSpaceType> {
-    let session = xr::Session::from_raw(session);
-    let mut count = 0;
-    if unsafe { (downstream.enumerate_reference_spaces)(session, 0, &mut count, ptr::null_mut()) }
-        != xr::Result::SUCCESS
-    {
-        return Vec::new();
-    }
-    let mut types = vec![xr::ReferenceSpaceType::VIEW; count as usize];
-    if unsafe {
-        (downstream.enumerate_reference_spaces)(session, count, &mut count, types.as_mut_ptr())
-    } != xr::Result::SUCCESS
-    {
-        return Vec::new();
-    }
-    types.truncate(count as usize);
-
-    types
-}
-
 /// The two-call idiom: reports the count, and fills `output` when its capacity allows.
 unsafe fn write_array<T: Copy>(
     items: &[T],
@@ -296,19 +211,28 @@ unsafe fn read_array<'a, T>(items: *const T, count: u32) -> Result<&'a [T], xr::
     }
 }
 
-/// Component types to filter by: valid values, all enabled in the context.
-unsafe fn read_component_filter<'a>(
-    context: &ContextData,
-    items: *const xr::SpatialComponentTypeEXT,
-    count: u32,
-) -> Result<&'a [xr::SpatialComponentTypeEXT], xr::Result> {
-    let components = unsafe { read_array(items, count) }?;
-    if !components
+/// Fails for component types the extensions do not define.
+fn check_known(components: &[xr::SpatialComponentTypeEXT]) -> Result<(), xr::Result> {
+    if components
         .iter()
         .all(|component| KNOWN_COMPONENTS.contains(component))
     {
-        return Err(xr::Result::ERROR_VALIDATION_FAILURE);
+        Ok(())
+    } else {
+        Err(xr::Result::ERROR_VALIDATION_FAILURE)
     }
+}
+
+/// The components whose data a snapshot of the context is to have: the ones of the filter, valid
+/// values all enabled in the context, or all of the context's for an empty filter. Every QR code
+/// has every component, so none is left out for having none of these.
+unsafe fn read_component_filter(
+    context: &ContextData,
+    items: *const xr::SpatialComponentTypeEXT,
+    count: u32,
+) -> Result<Vec<xr::SpatialComponentTypeEXT>, xr::Result> {
+    let components = unsafe { read_array(items, count) }?;
+    check_known(components)?;
     if !components
         .iter()
         .all(|component| context.components.contains(component))
@@ -316,7 +240,11 @@ unsafe fn read_component_filter<'a>(
         return Err(xr::Result::ERROR_SPATIAL_COMPONENT_NOT_ENABLED_EXT);
     }
 
-    Ok(components)
+    Ok(if components.is_empty() {
+        context.components.clone()
+    } else {
+        components.to_vec()
+    })
 }
 
 /// The tracking state an `XrSpatialFilterTrackingStateEXT` in the chain filters by.
@@ -344,11 +272,6 @@ unsafe fn tracking_state_filter(
     Ok(filter)
 }
 
-/// Futures and handles of the layer have this in their upper half.
-fn is_layer_handle(handle: u64) -> bool {
-    handle >> 32 == crate::HANDLE_PREFIX >> 32
-}
-
 /// The structures chained to `next`, as (type, pointer) pairs.
 unsafe fn chain(mut next: *const c_void) -> Vec<(xr::StructureType, *const c_void)> {
     let mut structs = Vec::new();
@@ -361,34 +284,92 @@ unsafe fn chain(mut next: *const c_void) -> Vec<(xr::StructureType, *const c_voi
     structs
 }
 
-impl State {
-    fn downstream(&self, instance: u64) -> Option<Downstream> {
-        self.instances.get(&instance).map(|data| data.downstream)
+impl ContextData {
+    /// The tracker the headset runs for the context's options, and the codes it sees: their
+    /// marker ids and data.
+    fn seen(
+        &self,
+        history: &MarkerHistory,
+        capabilities: &Capabilities,
+        now: i64,
+    ) -> (TrackingConfig, Vec<(u64, Payload)>) {
+        let tracker = self.config.supported_by(capabilities);
+        (tracker, history.seen(tracker, now))
     }
 
+    /// A code the context discovered, in a snapshot whose base space has STAGE at `stage`.
+    fn snapshot_entity(
+        &self,
+        marker: u64,
+        payload: Payload,
+        located: Option<Located>,
+        stage: Option<Pose>,
+    ) -> SnapshotEntity {
+        let id = self.entity_ids[&marker];
+        let (Some(located), Some(stage)) = (located, stage) else {
+            return SnapshotEntity::paused(id, marker);
+        };
+
+        // As the extension requires: every code has the size the application gave
+        let size = self.config.marker_size.unwrap_or(located.size);
+
+        SnapshotEntity {
+            id,
+            marker,
+            state: xr::SpatialEntityTrackingStateEXT::TRACKING,
+            bounds: xr::SpatialBounded2DDataEXT {
+                center: math::to_xr(math::compose(stage, located.pose)),
+                extents: xr::Extent2Df {
+                    width: size,
+                    height: size,
+                },
+            },
+            payload: Some(payload),
+        }
+    }
+}
+
+impl SnapshotEntity {
+    /// Out of the headset's sight, or the headset is not connected: it may come back.
+    fn paused(id: u64, marker: u64) -> Self {
+        Self {
+            id,
+            marker,
+            state: xr::SpatialEntityTrackingStateEXT::PAUSED,
+            bounds: xr::SpatialBounded2DDataEXT::default(),
+            payload: None,
+        }
+    }
+}
+
+impl FutureKind {
+    /// The session a context is being created for.
+    fn session(&self) -> Option<u64> {
+        match self {
+            Self::Context { session, .. } => Some(*session),
+            Self::Discovery { .. } => None,
+        }
+    }
+
+    /// The context a discovery snapshot is being created for.
+    fn context(&self) -> Option<u64> {
+        match self {
+            Self::Context { .. } => None,
+            Self::Discovery { context, .. } => Some(*context),
+        }
+    }
+}
+
+impl State {
     /// Whether the application enabled QR codes on the instance and the headset tracks them, as
     /// far as the driver knows.
     fn qr_codes_available(&mut self, instance: u64) -> bool {
         self.instances
             .get(&instance)
-            .is_some_and(|data| data.marker_tracking_enabled && data.alvr_registered)
+            .is_some_and(|data| data.qr_codes)
             && self
                 .refresh_markers()
                 .is_some_and(|capabilities| capabilities.qr_codes)
-    }
-
-    /// Takes in what the driver sent, and hands origin changes to the sessions there are now.
-    /// Returns what the headset connected last can do, or `None` while the driver is not running.
-    pub(crate) fn refresh_markers(&mut self) -> Option<Capabilities> {
-        let capabilities = self.markers.refresh();
-        for change in self.markers.origin_changes.drain(..) {
-            log!("ALVR recentered: {change:?}");
-            for session in self.sessions.values_mut() {
-                session.origin_changes.push_back(change);
-            }
-        }
-
-        capabilities
     }
 
     /// Tells the driver the marker options of the application's spatial contexts, also the ones
@@ -423,8 +404,6 @@ impl State {
         };
         let context = &self.contexts[&context];
         let instance = self.sessions[&context.session].instance;
-        // The tracker the headset runs for these options
-        let tracker = context.config.supported_by(&capabilities);
 
         let at = if context.config.static_markers {
             At::Static
@@ -434,9 +413,8 @@ impl State {
         };
         let now = now_ns();
         let history = &self.markers.history;
-        history
-            .seen(tracker, now)
-            .into_iter()
+        let (tracker, seen) = context.seen(history, &capabilities, now);
+        seen.into_iter()
             .map(|(id, payload)| {
                 let located = history.locate(tracker, id, at, now);
                 (id, payload, located)
@@ -446,7 +424,7 @@ impl State {
 
     /// `time` on the clock of the marker times.
     fn performance_counter_time(&self, instance: u64, time: xr::Time) -> Option<i64> {
-        let convert = self.instances.get(&instance)?.downstream.convert_time?;
+        let convert = self.downstream(instance)?.convert_time?;
         let mut counter = 0;
         let result = unsafe { convert(xr::Instance::from_raw(instance), time, &mut counter) };
 
@@ -455,7 +433,7 @@ impl State {
 
     fn check_instance(&self, instance: xr::Instance, system: xr::SystemId) -> xr::Result {
         match self.instances.get(&instance.into_raw()) {
-            Some(data) if data.provides_spatial => {
+            Some(data) if data.hooks.spatial => {
                 if data.systems.contains(&system.into_raw()) {
                     xr::Result::SUCCESS
                 } else {
@@ -466,9 +444,8 @@ impl State {
         }
     }
 
-    pub(crate) fn remove_session(&mut self, session: u64) -> Option<SessionData> {
-        let data = self.sessions.remove(&session)?;
-
+    /// Removes the contexts of a session, and the ones being created for it.
+    pub(crate) fn remove_session_contexts(&mut self, session: u64) {
         let contexts = self
             .contexts
             .iter()
@@ -478,11 +455,8 @@ impl State {
         for context in contexts {
             self.remove_context(context);
         }
-        self.futures.retain(|_, future| {
-            !matches!(future.kind, FutureKind::Context { session: s, .. } if s == session)
-        });
-
-        Some(data)
+        self.futures
+            .retain(|_, future| future.kind.session() != Some(session));
     }
 
     fn remove_context(&mut self, context: u64) -> bool {
@@ -493,11 +467,71 @@ impl State {
         self.snapshots
             .retain(|_, snapshot| snapshot.context != context);
         self.entities.retain(|_, entity| entity.context != context);
-        self.futures.retain(|_, future| {
-            !matches!(future.kind, FutureKind::Discovery { context: c, .. } if c == context)
-        });
+        self.futures
+            .retain(|_, future| future.kind.context() != Some(context));
 
         true
+    }
+
+    /// The layer's answer for a future of its own: whether it is pending for `instance`. `None`
+    /// for the runtime's futures.
+    fn layer_future(&self, instance: u64, future: u64) -> Option<Result<(), xr::Result>> {
+        is_layer_handle(future).then(|| match self.futures.get(&future) {
+            Some(data) if data.instance == instance => Ok(()),
+            // Completed, cancelled, or of another instance
+            _ => Err(xr::Result::ERROR_FUTURE_INVALID_EXT),
+        })
+    }
+
+    /// Checks that `future` is pending, of the kind `started_on` gives the handle the operation
+    /// was started on for, and that the operation is completed with that handle, `owner`.
+    fn check_future(
+        &self,
+        future: u64,
+        owner: u64,
+        started_on: fn(&FutureKind) -> Option<u64>,
+    ) -> Result<(), xr::Result> {
+        match self
+            .futures
+            .get(&future)
+            .and_then(|data| started_on(&data.kind))
+        {
+            Some(started_on) if started_on == owner => Ok(()),
+            Some(_) => Err(xr::Result::ERROR_HANDLE_INVALID),
+            None => Err(xr::Result::ERROR_FUTURE_INVALID_EXT),
+        }
+    }
+
+    /// Removes the future of a context being created for `session`.
+    fn take_context_future(
+        &mut self,
+        future: u64,
+        session: u64,
+    ) -> Result<ContextData, xr::Result> {
+        self.check_future(future, session, FutureKind::session)?;
+        match self.futures.remove(&future).map(|data| data.kind) {
+            Some(FutureKind::Context { context, .. }) => Ok(context),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Removes the future of a discovery that `check_future` accepted: the components and the
+    /// tracking state the snapshot is filtered by.
+    fn take_discovery_future(
+        &mut self,
+        future: u64,
+    ) -> (
+        Vec<xr::SpatialComponentTypeEXT>,
+        Option<xr::SpatialEntityTrackingStateEXT>,
+    ) {
+        match self.futures.remove(&future).map(|data| data.kind) {
+            Some(FutureKind::Discovery {
+                components,
+                tracking_state,
+                ..
+            }) => (components, tracking_state),
+            _ => unreachable!(),
+        }
     }
 
     /// The pose of the runtime's STAGE space, which marker poses are in, in `base_space`.
@@ -507,7 +541,7 @@ impl State {
         session: u64,
         base_space: xr::Space,
         time: xr::Time,
-    ) -> Result<Option<xr::Posef>, xr::Result> {
+    ) -> Result<Option<Pose>, xr::Result> {
         let instance = self.sessions[&session].instance;
         let downstream = self
             .downstream(instance)
@@ -517,222 +551,12 @@ impl State {
             return Ok(None);
         };
 
-        let mut location = xr::SpaceLocation {
-            ty: xr::SpaceLocation::TYPE,
-            next: ptr::null_mut(),
-            location_flags: xr::SpaceLocationFlags::EMPTY,
-            pose: xr::Posef::IDENTITY,
-        };
-        let result = unsafe { (downstream.locate_space)(stage, base_space, time, &mut location) };
-        if result != xr::Result::SUCCESS {
-            return Err(result);
-        }
-
-        let valid =
-            xr::SpaceLocationFlags::ORIENTATION_VALID | xr::SpaceLocationFlags::POSITION_VALID;
-        Ok(location
-            .location_flags
-            .contains(valid)
-            .then_some(location.pose))
-    }
-
-    /// The layer's own reference space of the type, at its natural origin.
-    fn reference_space(&mut self, session: u64, ty: xr::ReferenceSpaceType) -> Option<xr::Space> {
-        let data = self.sessions.get(&session)?;
-        if let Some(&(_, space)) = data.spaces.iter().find(|(t, _)| *t == ty) {
-            return Some(space);
-        }
-        let downstream = self.downstream(data.instance)?;
-
-        let info = xr::ReferenceSpaceCreateInfo {
-            ty: xr::ReferenceSpaceCreateInfo::TYPE,
-            next: ptr::null(),
-            reference_space_type: ty,
-            pose_in_reference_space: xr::Posef::IDENTITY,
-        };
-        let mut space = xr::Space::NULL;
-        let result = unsafe {
-            (downstream.create_reference_space)(xr::Session::from_raw(session), &info, &mut space)
-        };
-        if result != xr::Result::SUCCESS {
-            log!("Cannot create a {ty:?} space: {result:?}");
-            return None;
-        }
-        self.sessions.get_mut(&session)?.spaces.push((ty, space));
-
-        Some(space)
-    }
-
-    /// A reference space change event for a session of `instance`, if one is due.
-    fn take_space_event(
-        &mut self,
-        instance: u64,
-    ) -> Option<xr::EventDataReferenceSpaceChangePending> {
-        self.refresh_markers();
-
-        let sessions = self
-            .sessions
-            .iter()
-            .filter(|(_, data)| data.instance == instance)
-            .map(|(&session, _)| session)
-            .collect::<Vec<_>>();
-        for session in sessions {
-            loop {
-                let data = self.sessions.get_mut(&session)?;
-                if let Some(event) = data.space_events.pop_front() {
-                    return Some(xr::EventDataReferenceSpaceChangePending {
-                        ty: xr::EventDataReferenceSpaceChangePending::TYPE,
-                        next: ptr::null(),
-                        session: xr::Session::from_raw(session),
-                        reference_space_type: event.reference_space_type,
-                        change_time: event.change_time,
-                        pose_valid: event.pose_in_previous_space.is_some().into(),
-                        pose_in_previous_space: event
-                            .pose_in_previous_space
-                            .unwrap_or(xr::Posef::IDENTITY),
-                    });
-                }
-                // Changes the application has not heard of yet are one change to it
-                let mut change = data.origin_changes.pop_front()?;
-                while let Some(next) = data.origin_changes.pop_front() {
-                    change = change.then(next);
-                }
-                let events = self.space_events(session, change);
-                self.sessions.get_mut(&session)?.space_events.extend(events);
-            }
-        }
-
-        None
-    }
-
-    /// The events for an origin change: one per reference space type of the session but VIEW,
-    /// each with where its new origin is in its previous self.
-    fn space_events(&mut self, session: u64, change: OriginChange) -> Vec<SpaceEvent> {
-        let instance = self.sessions[&session].instance;
-        let Some(downstream) = self.downstream(instance) else {
-            return Vec::new();
-        };
-        // The layer's times are the performance counter's; without the conversion, there is no
-        // change time to report
-        let Some(convert) = downstream.convert_counter else {
-            return Vec::new();
-        };
-        let counter = ns_to_performance_counter(change.changed_ns);
-        let mut change_time = xr::Time::from_nanos(0);
-        if unsafe { convert(xr::Instance::from_raw(instance), &counter, &mut change_time) }
-            != xr::Result::SUCCESS
-        {
-            return Vec::new();
-        }
-
-        let types = match &self.sessions[&session].reference_space_types {
-            Some(types) => types.clone(),
-            None => {
-                let types = unsafe { reference_space_types(&downstream, session) };
-                self.sessions
-                    .get_mut(&session)
-                    .unwrap()
-                    .reference_space_types = Some(types.clone());
-                types
-            }
-        };
-
-        types
-            .into_iter()
-            // Only STAGE has bounds
-            .filter(|&ty| {
-                ty != xr::ReferenceSpaceType::VIEW
-                    && (change.moved || ty == xr::ReferenceSpaceType::STAGE)
-            })
-            .map(|ty| {
-                // The spaces of SteamVR keep their poses relative to each other: each moved like
-                // STAGE, seen from its own origin
-                let pose = change.pose_in_previous.and_then(|stage_change| {
-                    if ty == xr::ReferenceSpaceType::STAGE {
-                        return Some(stage_change);
-                    }
-                    let space = self.reference_space(session, ty)?;
-                    let stage = self.reference_space(session, xr::ReferenceSpaceType::STAGE)?;
-                    let mut location = xr::SpaceLocation {
-                        ty: xr::SpaceLocation::TYPE,
-                        next: ptr::null_mut(),
-                        location_flags: xr::SpaceLocationFlags::EMPTY,
-                        pose: xr::Posef::IDENTITY,
-                    };
-                    let result = unsafe {
-                        (downstream.locate_space)(space, stage, change_time, &mut location)
-                    };
-                    let valid = xr::SpaceLocationFlags::ORIENTATION_VALID
-                        | xr::SpaceLocationFlags::POSITION_VALID;
-                    (result == xr::Result::SUCCESS && location.location_flags.contains(valid)).then(
-                        || {
-                            let in_stage = location.pose;
-                            math::compose(
-                                math::inverse(in_stage),
-                                math::compose(stage_change, in_stage),
-                            )
-                        },
-                    )
-                });
-
-                SpaceEvent {
-                    reference_space_type: ty,
-                    change_time,
-                    pose_in_previous_space: pose,
-                }
-            })
-            .collect()
-    }
-
-    fn snapshot_entity(
-        context: &ContextData,
-        marker: u64,
-        payload: Payload,
-        located: Option<Located>,
-        stage: Option<xr::Posef>,
-    ) -> SnapshotEntity {
-        let id = context.entity_ids[&marker];
-        let (Some(located), Some(stage)) = (located, stage) else {
-            return SnapshotEntity {
-                id,
-                marker,
-                state: xr::SpatialEntityTrackingStateEXT::PAUSED,
-                bounds: xr::SpatialBounded2DDataEXT::default(),
-                payload: None,
-            };
-        };
-
-        let [x, y, z, w] = located.pose.orientation;
-        let [px, py, pz] = located.pose.position;
-        let pose = xr::Posef {
-            orientation: xr::Quaternionf { x, y, z, w },
-            position: xr::Vector3f {
-                x: px,
-                y: py,
-                z: pz,
-            },
-        };
-        // As the extension requires: every code has the size the application gave
-        let size = context.config.marker_size.unwrap_or(located.size);
-
-        SnapshotEntity {
-            id,
-            marker,
-            state: xr::SpatialEntityTrackingStateEXT::TRACKING,
-            bounds: xr::SpatialBounded2DDataEXT {
-                center: math::compose(stage, pose),
-                extents: xr::Extent2Df {
-                    width: size,
-                    height: size,
-                },
-            },
-            payload: Some(payload),
-        }
+        Ok(unsafe { locate(&downstream, stage, base_space, time) }?.map(math::from_xr))
     }
 
     /// A context of `instance` to recommend a discovery for, when the codes its tracker sees have
     /// changed since its last recommendation.
-    fn take_discovery_recommendation(&mut self, instance: u64) -> Option<u64> {
+    pub(crate) fn take_discovery_recommendation(&mut self, instance: u64) -> Option<u64> {
         let capabilities = self.refresh_markers().unwrap_or_default();
         let now = now_ns();
 
@@ -745,14 +569,8 @@ impl State {
                 continue;
             }
 
-            let tracker = context.config.supported_by(&capabilities);
-            let mut ids = self
-                .markers
-                .history
-                .seen(tracker, now)
-                .into_iter()
-                .map(|(id, _)| id)
-                .collect::<Vec<_>>();
+            let (_, seen) = context.seen(&self.markers.history, &capabilities, now);
+            let mut ids = seen.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
             ids.sort_unstable();
 
             if context.announced.as_ref() != Some(&ids) {
@@ -765,83 +583,24 @@ impl State {
     }
 }
 
-unsafe extern "system" fn create_session(
+/// Remembers the systems of the instance, which the spatial functions are called with.
+unsafe extern "system" fn get_system(
     instance: xr::Instance,
-    info: *const xr::SessionCreateInfo,
-    session: *mut xr::Session,
+    info: *const xr::SystemGetInfo,
+    system: *mut xr::SystemId,
 ) -> xr::Result {
     let Some(downstream) = state().downstream(instance.into_raw()) else {
         return xr::Result::ERROR_HANDLE_INVALID;
     };
 
-    let result = unsafe { (downstream.create_session)(instance, info, session) };
-    if result.into_raw() >= 0 {
-        state().sessions.insert(
-            unsafe { *session }.into_raw(),
-            SessionData::new(instance.into_raw()),
-        );
+    let result = unsafe { (downstream.get_system)(instance, info, system) };
+    if result == xr::Result::SUCCESS
+        && let Some(data) = state().instances.get_mut(&instance.into_raw())
+    {
+        data.systems.insert(unsafe { *system }.into_raw());
     }
 
     result
-}
-
-unsafe extern "system" fn destroy_session(session: xr::Session) -> xr::Result {
-    let (data, downstream) = {
-        let mut state = state();
-        let Some(data) = state.remove_session(session.into_raw()) else {
-            return xr::Result::ERROR_HANDLE_INVALID;
-        };
-        state.sync_requests();
-        let Some(downstream) = state.downstream(data.instance) else {
-            return xr::Result::ERROR_HANDLE_INVALID;
-        };
-        (data, downstream)
-    };
-
-    for (_, space) in data.spaces {
-        unsafe { (downstream.destroy_space)(space) };
-    }
-
-    unsafe { (downstream.destroy_session)(session) }
-}
-
-unsafe extern "system" fn poll_event(
-    instance: xr::Instance,
-    event: *mut xr::EventDataBuffer,
-) -> xr::Result {
-    let Some(downstream) = state().downstream(instance.into_raw()) else {
-        return xr::Result::ERROR_HANDLE_INVALID;
-    };
-
-    let result = unsafe { (downstream.poll_event)(instance, event) };
-    if result != xr::Result::EVENT_UNAVAILABLE || event.is_null() {
-        return result;
-    }
-
-    // The runtime's events come first, so the layer's never delay them
-    let mut state = state();
-    if let Some(space_event) = state.take_space_event(instance.into_raw()) {
-        unsafe {
-            event
-                .cast::<xr::EventDataReferenceSpaceChangePending>()
-                .write(space_event)
-        };
-        return xr::Result::SUCCESS;
-    }
-    let Some(context) = state.take_discovery_recommendation(instance.into_raw()) else {
-        return result;
-    };
-    unsafe {
-        event
-            .cast::<xr::EventDataSpatialDiscoveryRecommendedEXT>()
-            .write(xr::EventDataSpatialDiscoveryRecommendedEXT {
-                ty: xr::EventDataSpatialDiscoveryRecommendedEXT::TYPE,
-                next: ptr::null(),
-                spatial_context: xr::SpatialContextEXT::from_raw(context),
-            })
-    };
-
-    xr::Result::SUCCESS
 }
 
 unsafe extern "system" fn poll_future(
@@ -862,23 +621,19 @@ unsafe extern "system" fn poll_future(
     let Some(downstream) = state.downstream(instance.into_raw()) else {
         return xr::Result::ERROR_HANDLE_INVALID;
     };
-    if is_layer_handle(future) {
-        return match state.futures.get(&future) {
-            Some(data) if data.instance == instance.into_raw() => {
-                unsafe { (*result).state = xr::FutureStateEXT::READY };
-                xr::Result::SUCCESS
-            }
-            // Completed, cancelled, or of another instance
-            _ => xr::Result::ERROR_FUTURE_INVALID_EXT,
-        };
-    }
-
-    match downstream.poll_future {
-        Some(poll_future) => {
-            drop(state);
-            unsafe { poll_future(instance, info, result) }
+    match state.layer_future(instance.into_raw(), future) {
+        Some(Ok(())) => {
+            unsafe { (*result).state = xr::FutureStateEXT::READY };
+            xr::Result::SUCCESS
         }
-        None => xr::Result::ERROR_FUTURE_INVALID_EXT,
+        Some(Err(error)) => error,
+        None => {
+            drop(state);
+            match downstream.poll_future {
+                Some(poll_future) => unsafe { poll_future(instance, info, result) },
+                None => xr::Result::ERROR_FUTURE_INVALID_EXT,
+            }
+        }
     }
 }
 
@@ -895,23 +650,20 @@ unsafe extern "system" fn cancel_future(
     let Some(downstream) = state.downstream(instance.into_raw()) else {
         return xr::Result::ERROR_HANDLE_INVALID;
     };
-    if is_layer_handle(future) {
-        return match state.futures.get(&future) {
-            Some(data) if data.instance == instance.into_raw() => {
-                state.futures.remove(&future);
-                state.sync_requests();
-                xr::Result::SUCCESS
-            }
-            _ => xr::Result::ERROR_FUTURE_INVALID_EXT,
-        };
-    }
-
-    match downstream.cancel_future {
-        Some(cancel_future) => {
-            drop(state);
-            unsafe { cancel_future(instance, info) }
+    match state.layer_future(instance.into_raw(), future) {
+        Some(Ok(())) => {
+            state.futures.remove(&future);
+            state.sync_requests();
+            xr::Result::SUCCESS
         }
-        None => xr::Result::ERROR_FUTURE_INVALID_EXT,
+        Some(Err(error)) => error,
+        None => {
+            drop(state);
+            match downstream.cancel_future {
+                Some(cancel_future) => unsafe { cancel_future(instance, info) },
+                None => xr::Result::ERROR_FUTURE_INVALID_EXT,
+            }
+        }
     }
 }
 
@@ -1128,25 +880,9 @@ unsafe extern "system" fn create_context_complete(
     if !state.sessions.contains_key(&session.into_raw()) {
         return xr::Result::ERROR_HANDLE_INVALID;
     }
-    let context = match state.futures.get(&future.into_raw()) {
-        Some(FutureData {
-            kind: FutureKind::Context { session: s, .. },
-            ..
-        }) => {
-            // The completion must be called with the handle the operation was started on
-            if *s != session.into_raw() {
-                return xr::Result::ERROR_HANDLE_INVALID;
-            }
-            let Some(FutureData {
-                kind: FutureKind::Context { context, .. },
-                ..
-            }) = state.futures.remove(&future.into_raw())
-            else {
-                unreachable!()
-            };
-            context
-        }
-        _ => return xr::Result::ERROR_FUTURE_INVALID_EXT,
+    let context = match state.take_context_future(future.into_raw(), session.into_raw()) {
+        Ok(context) => context,
+        Err(result) => return result,
     };
 
     let handle = state.new_handle();
@@ -1198,9 +934,7 @@ unsafe extern "system" fn create_discovery_snapshot_async(
             info.component_type_count,
         )
     } {
-        // Every QR code has every component, so none is left out for having none of these
-        Ok([]) => context_data.components.clone(),
-        Ok(components) => components.to_vec(),
+        Ok(components) => components,
         Err(result) => return result,
     };
     let tracking_state = match unsafe { tracking_state_filter(info.next) } {
@@ -1251,35 +985,16 @@ unsafe extern "system" fn create_discovery_snapshot_complete(
     else {
         return xr::Result::ERROR_HANDLE_INVALID;
     };
-    match state.futures.get(&info.future.into_raw()) {
-        Some(FutureData {
-            kind: FutureKind::Discovery { context: c, .. },
-            ..
-        }) => {
-            // The completion must be called with the handle the operation was started on
-            if *c != context.into_raw() {
-                return xr::Result::ERROR_HANDLE_INVALID;
-            }
-        }
-        _ => return xr::Result::ERROR_FUTURE_INVALID_EXT,
+    let future = info.future.into_raw();
+    if let Err(result) = state.check_future(future, context.into_raw(), FutureKind::context) {
+        return result;
     }
 
     let stage = match state.locate_stage(session, info.base_space, info.time) {
         Ok(stage) => stage,
         Err(result) => return result,
     };
-    let Some(FutureData {
-        kind:
-            FutureKind::Discovery {
-                components,
-                tracking_state,
-                ..
-            },
-        ..
-    }) = state.futures.remove(&info.future.into_raw())
-    else {
-        unreachable!()
-    };
+    let (components, tracking_state) = state.take_discovery_future(future);
 
     let markers = state.context_markers(context.into_raw(), info.time);
     // Codes discovered for the first time get their entity ids
@@ -1301,7 +1016,7 @@ unsafe extern "system" fn create_discovery_snapshot_complete(
     let entities = markers
         .into_iter()
         .map(|(marker, payload, located)| {
-            State::snapshot_entity(context_data, marker, payload, located, stage)
+            context_data.snapshot_entity(marker, payload, located, stage)
         })
         .filter(|entity| tracking_state.is_none_or(|state| entity.state == state))
         .collect();
@@ -1351,8 +1066,7 @@ unsafe extern "system" fn create_update_snapshot(
             info.component_type_count,
         )
     } {
-        Ok([]) => context_data.components.clone(),
-        Ok(components) => components.to_vec(),
+        Ok(components) => components,
         Err(result) => return result,
     };
     let session = context_data.session;
@@ -1384,16 +1098,9 @@ unsafe extern "system" fn create_update_snapshot(
         .iter()
         .map(|&marker| match seen.get(&marker) {
             Some((payload, located)) => {
-                State::snapshot_entity(context_data, marker, payload.clone(), *located, stage)
+                context_data.snapshot_entity(marker, payload.clone(), *located, stage)
             }
-            // Out of the headset's sight, or the headset is not connected: it may come back
-            None => SnapshotEntity {
-                id: context_data.entity_ids[&marker],
-                marker,
-                state: xr::SpatialEntityTrackingStateEXT::PAUSED,
-                bounds: xr::SpatialBounded2DDataEXT::default(),
-                payload: None,
-            },
+            None => SnapshotEntity::paused(context_data.entity_ids[&marker], marker),
         })
         .collect();
 
@@ -1411,49 +1118,79 @@ unsafe extern "system" fn create_update_snapshot(
     xr::Result::SUCCESS
 }
 
-/// The component whose data a list structure in the chain of a query result is for, and the
-/// list's element count and array. `None` for structures that are not component lists.
-unsafe fn component_list(
-    ty: xr::StructureType,
-    structure: *const c_void,
-) -> Option<(xr::SpatialComponentTypeEXT, u32, *const c_void)> {
-    Some(if ty == xr::SpatialComponentBounded2DListEXT::TYPE {
+/// A component list in the chain of a query result.
+struct ComponentList {
+    component: xr::SpatialComponentTypeEXT,
+    count: u32,
+    elements: Elements,
+}
+
+#[derive(Clone, Copy)]
+enum Elements {
+    Bounded2D(*mut xr::SpatialBounded2DDataEXT),
+    Marker(*mut xr::SpatialMarkerDataEXT),
+    /// Of a component no QR code has. Such lists are only allowed when no entity has the
+    /// component, so nothing is written to them.
+    Other(*const c_void),
+}
+
+impl Elements {
+    fn is_null(&self) -> bool {
+        match *self {
+            Self::Bounded2D(elements) => elements.is_null(),
+            Self::Marker(elements) => elements.is_null(),
+            Self::Other(elements) => elements.is_null(),
+        }
+    }
+}
+
+/// The component list `structure` is, if it is one.
+unsafe fn component_list(ty: xr::StructureType, structure: *const c_void) -> Option<ComponentList> {
+    use xr::SpatialComponentTypeEXT as Component;
+
+    let (component, count, elements) = if ty == xr::SpatialComponentBounded2DListEXT::TYPE {
         let list = unsafe { &*structure.cast::<xr::SpatialComponentBounded2DListEXT>() };
         (
-            xr::SpatialComponentTypeEXT::BOUNDED_2D,
+            Component::BOUNDED_2D,
             list.bound_count,
-            list.bounds.cast(),
+            Elements::Bounded2D(list.bounds),
         )
     } else if ty == xr::SpatialComponentMarkerListEXT::TYPE {
         let list = unsafe { &*structure.cast::<xr::SpatialComponentMarkerListEXT>() };
         (
-            xr::SpatialComponentTypeEXT::MARKER,
+            Component::MARKER,
             list.marker_count,
-            list.markers.cast(),
+            Elements::Marker(list.markers),
         )
     } else if ty == xr::SpatialComponentBounded3DListEXT::TYPE {
         let list = unsafe { &*structure.cast::<xr::SpatialComponentBounded3DListEXT>() };
         (
-            xr::SpatialComponentTypeEXT::BOUNDED_3D,
+            Component::BOUNDED_3D,
             list.bound_count,
-            list.bounds.cast(),
+            Elements::Other(list.bounds.cast()),
         )
     } else if ty == xr::SpatialComponentParentListEXT::TYPE {
         let list = unsafe { &*structure.cast::<xr::SpatialComponentParentListEXT>() };
         (
-            xr::SpatialComponentTypeEXT::PARENT,
+            Component::PARENT,
             list.parent_count,
-            list.parents.cast(),
+            Elements::Other(list.parents.cast()),
         )
     } else if ty == xr::SpatialComponentMesh3DListEXT::TYPE {
         let list = unsafe { &*structure.cast::<xr::SpatialComponentMesh3DListEXT>() };
         (
-            xr::SpatialComponentTypeEXT::MESH_3D,
+            Component::MESH_3D,
             list.mesh_count,
-            list.meshes.cast(),
+            Elements::Other(list.meshes.cast()),
         )
     } else {
         return None;
+    };
+
+    Some(ComponentList {
+        component,
+        count,
+        elements,
     })
 }
 
@@ -1480,11 +1217,8 @@ unsafe extern "system" fn query_component_data(
             Ok(components) => components,
             Err(result) => return result,
         };
-    if !components
-        .iter()
-        .all(|component| KNOWN_COMPONENTS.contains(component))
-    {
-        return xr::Result::ERROR_VALIDATION_FAILURE;
+    if let Err(result) = check_known(components) {
+        return result;
     }
     let tracking_state = match unsafe { tracking_state_filter(condition.next) } {
         Ok(filter) => filter,
@@ -1495,19 +1229,15 @@ unsafe extern "system" fn query_component_data(
     // the snapshot has: the entities it returns have those.
     let lists = unsafe { chain(result.next) }
         .into_iter()
-        .filter_map(|(ty, structure)| {
-            unsafe { component_list(ty, structure) }.map(|list| (ty, structure, list))
-        })
+        .filter_map(|(ty, structure)| unsafe { component_list(ty, structure) })
         .collect::<Vec<_>>();
-    for &(_, _, (component, ..)) in &lists {
-        let allowed = if components.is_empty() {
-            &snapshot_data.components
-        } else {
-            components
-        };
-        if !allowed.contains(&component) {
-            return xr::Result::ERROR_VALIDATION_FAILURE;
-        }
+    let allowed = if components.is_empty() {
+        &snapshot_data.components
+    } else {
+        components
+    };
+    if lists.iter().any(|list| !allowed.contains(&list.component)) {
+        return xr::Result::ERROR_VALIDATION_FAILURE;
     }
 
     // Every entity in the snapshot has the snapshot's components, and only those
@@ -1537,11 +1267,11 @@ unsafe extern "system" fn query_component_data(
         return xr::Result::ERROR_VALIDATION_FAILURE;
     }
     // Check every component list before writing anything
-    for &(_, _, (_, list_count, list_ptr)) in &lists {
-        if list_count < count {
+    for list in &lists {
+        if list.count < count {
             return xr::Result::ERROR_SIZE_INSUFFICIENT;
         }
-        if count > 0 && list_ptr.is_null() {
+        if count > 0 && list.elements.is_null() {
             return xr::Result::ERROR_VALIDATION_FAILURE;
         }
     }
@@ -1554,9 +1284,7 @@ unsafe extern "system" fn query_component_data(
             }
         }
     }
-    // Lists of components no QR code has are only allowed when no entity has them, so nothing is
-    // written to them
-    for (ty, structure, _) in lists {
+    for list in lists {
         for (i, entity) in entities.iter().enumerate() {
             // Component data is only valid for tracked entities
             let Some(payload) = entity
@@ -1567,13 +1295,10 @@ unsafe extern "system" fn query_component_data(
                 continue;
             };
 
-            if ty == xr::SpatialComponentBounded2DListEXT::TYPE {
-                let list = unsafe { &*structure.cast::<xr::SpatialComponentBounded2DListEXT>() };
-                unsafe { *list.bounds.add(i) = entity.bounds };
-            } else if ty == xr::SpatialComponentMarkerListEXT::TYPE {
-                let list = unsafe { &*structure.cast::<xr::SpatialComponentMarkerListEXT>() };
-                unsafe {
-                    *list.markers.add(i) = xr::SpatialMarkerDataEXT {
+            match list.elements {
+                Elements::Bounded2D(bounds) => unsafe { *bounds.add(i) = entity.bounds },
+                Elements::Marker(markers) => unsafe {
+                    *markers.add(i) = xr::SpatialMarkerDataEXT {
                         capability: xr::SpatialCapabilityEXT::MARKER_TRACKING_QR_CODE,
                         // Only ArUco markers and AprilTags have a numeric id
                         marker_id: 0,
@@ -1585,7 +1310,8 @@ unsafe extern "system" fn query_component_data(
                             },
                         },
                     }
-                };
+                },
+                Elements::Other(_) => (),
             }
         }
     }
@@ -1690,7 +1416,6 @@ unsafe extern "system" fn get_buffer_string(
 ) -> xr::Result {
     let text = match buffer_payload(&state(), snapshot, info) {
         Ok(Payload::Text(text)) => text,
-        // A buffer of another type
         Ok(Payload::Bytes(_)) => return xr::Result::ERROR_VALIDATION_FAILURE,
         Err(result) => return result,
     };

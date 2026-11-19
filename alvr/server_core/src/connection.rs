@@ -35,7 +35,6 @@ use alvr_sockets::{
 use std::{
     collections::{HashMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
-    mem,
     net::{IpAddr, Ipv4Addr},
     process::Command,
     sync::{Arc, mpsc::RecvTimeoutError},
@@ -429,8 +428,7 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
     alvr_common::dbg_connection!("handshake_loop: End");
 }
 
-/// Readies a plugged in wired client, created once and kept alive in `wired_connection`. Whether
-/// it can be connected to.
+/// Creates the wired connection once and sets it up; returns whether the client is ready.
 fn prepare_wired_client(wired_connection: &mut Option<WiredConnection>) -> bool {
     if wired_connection.is_none() {
         match WiredConnection::new(
@@ -866,27 +864,22 @@ fn connection_pipeline(
     ));
     *ctx.bitrate_manager.lock() =
         BitrateManager::new(initial_settings.video.bitrate.history_size, fps);
+
+    let control_sender = Arc::new(Mutex::new(socket.request_reliable_stream()?));
     {
         let mut tracking_manager = ctx.tracking_manager.write();
         // Counted on across connections, so that a change is never missed for a repeated count
-        let origin_changes = tracking_manager.origin_change().count;
+        let previous_count = tracking_manager.origin_change().count;
         *tracking_manager =
             TrackingManager::new(initial_settings.connection.statistics_history_size)
-                .after_origin_changes(origin_changes);
-        // Now, not with the first markers: applications started meanwhile would take it for a
-        // later change
-        ctx.events_sender
-            .send(ServerCoreEvent::Markers {
-                streams: Vec::new(),
-                origin: tracking_manager.origin_change(),
-            })
-            .ok();
+                .continuing_from(previous_count);
+        ctx.marker_tracking
+            .lock()
+            .connect(Arc::clone(&control_sender));
+        // Published right away, so that applications that start before the first markers see it
+        // as the current origin rather than a later change
+        ctx.send_markers(&tracking_manager);
     }
-
-    let control_sender = Arc::new(Mutex::new(socket.request_reliable_stream()?));
-    ctx.marker_tracking
-        .lock()
-        .connect(Arc::clone(&control_sender));
     let mut video_sender = socket.request_unreliable_stream(VIDEO);
     let mut alpha_video_sender = enable_alpha_stream
         .then(|| socket.request_unreliable_stream::<VideoPacketHeader>(VIDEO_ALPHA));
@@ -1161,15 +1154,32 @@ fn connection_pipeline(
     let real_time_update_thread = thread::spawn({
         let control_sender = Arc::clone(&control_sender);
         let client_hostname = client_hostname.clone();
+        let ctx = Arc::clone(&ctx);
         move || {
             let mut previous_config = None;
+            let mut previous_recentering_mode = None;
             while is_streaming(&client_hostname) {
-                let config = {
+                let (config, recentering_mode) = {
                     let session_manager_lock = SESSION_MANAGER.read();
                     let settings = session_manager_lock.settings();
 
-                    RealTimeConfig::from_settings(settings)
+                    (
+                        RealTimeConfig::from_settings(settings),
+                        settings.headset.recentering_mode.clone(),
+                    )
                 };
+
+                // The origin moves to where the new mode puts it, in the same client space
+                if previous_recentering_mode
+                    .as_ref()
+                    .is_some_and(|previous| *previous != recentering_mode)
+                {
+                    info!("Recentering mode changed, recentering");
+                    let mut tracking_manager = ctx.tracking_manager.write();
+                    tracking_manager.recenter(&recentering_mode, Some(Pose::IDENTITY), false);
+                    ctx.send_markers(&tracking_manager);
+                }
+                previous_recentering_mode = Some(recentering_mode);
 
                 let same_config = previous_config.as_ref().is_some_and(|prev| config == *prev);
                 if !same_config {
@@ -1190,34 +1200,8 @@ fn connection_pipeline(
         let control_sender = Arc::clone(&control_sender);
         let disconnect_notif = Arc::clone(&disconnect_notif);
         let client_hostname = client_hostname.clone();
-        let ctx = Arc::clone(&ctx);
         move || {
-            let mut recentering_mode = None;
             while is_streaming(&client_hostname) {
-                // The recentering mode can change while streaming: the origin moves to where the
-                // new one puts it, in the same client space
-                let mode = SESSION_MANAGER
-                    .read()
-                    .settings()
-                    .headset
-                    .recentering_mode
-                    .clone();
-                let changed = recentering_mode
-                    .as_ref()
-                    .is_some_and(|last| mem::discriminant(last) != mem::discriminant(&mode));
-                if changed {
-                    info!("Recentering mode changed, recentering");
-                    let mut tracking_manager = ctx.tracking_manager.write();
-                    tracking_manager.recenter(&mode, Some(Pose::IDENTITY), false);
-                    ctx.events_sender
-                        .send(ServerCoreEvent::Markers {
-                            streams: tracking_manager.recentered_marker_streams(),
-                            origin: tracking_manager.origin_change(),
-                        })
-                        .ok();
-                }
-                recentering_mode = Some(mode);
-
                 if let Err(e) = control_sender.lock().send(&ServerControlPacket::KeepAlive) {
                     info!("Client disconnected. Cause: {e:?}");
 
@@ -1299,22 +1283,14 @@ fn connection_pipeline(
 
                             let session_manager_lock = SESSION_MANAGER.read();
                             let config = &session_manager_lock.settings().headset;
-                            let (streams, origin) = {
-                                let mut tracking_manager = ctx.tracking_manager.write();
-                                let bounds_changed = tracking_manager.set_stage_area(area);
-                                tracking_manager.recenter(
-                                    &config.recentering_mode,
-                                    stage_in_previous,
-                                    bounds_changed,
-                                );
-                                (
-                                    tracking_manager.recentered_marker_streams(),
-                                    tracking_manager.origin_change(),
-                                )
-                            };
-                            ctx.events_sender
-                                .send(ServerCoreEvent::Markers { streams, origin })
-                                .ok();
+                            let mut tracking_manager = ctx.tracking_manager.write();
+                            let bounds_changed = tracking_manager.set_stage_area(area);
+                            tracking_manager.recenter(
+                                &config.recentering_mode,
+                                stage_in_previous,
+                                bounds_changed,
+                            );
+                            ctx.send_markers(&tracking_manager);
                         }
                     }
                     ClientControlPacket::RequestIdr => {
@@ -1424,27 +1400,20 @@ fn connection_pipeline(
                         timestamp,
                         markers,
                     } => {
-                        let configs = ctx.marker_tracking.lock().configs();
-                        // Not from a tracker the headset was just told to stop
-                        if let Some(configs) = configs.filter(|configs| configs.contains(&config)) {
-                            let mut tracking_manager = ctx.tracking_manager.write();
-                            tracking_manager.retain_marker_streams(&configs);
-                            tracking_manager.set_marker_stream(MarkerStream {
-                                config,
-                                timestamp,
-                                markers,
-                            });
-                            ctx.events_sender
-                                .send(ServerCoreEvent::Markers {
-                                    streams: tracking_manager.recentered_marker_streams(),
-                                    origin: tracking_manager.origin_change(),
-                                })
-                                .ok();
+                        let tracking_manager = ctx.tracking_manager.read();
+                        if ctx.marker_tracking.lock().set_stream(MarkerStream {
+                            config,
+                            timestamp,
+                            markers,
+                        }) {
+                            ctx.send_markers(&tracking_manager);
                         }
                     }
                     ClientControlPacket::MarkerCapabilities(capabilities) => {
                         info!("Headset marker capabilities: {capabilities:?}");
-                        ctx.marker_tracking.lock().set_capabilities(capabilities);
+                        if ctx.marker_tracking.lock().set_capabilities(capabilities) {
+                            ctx.send_markers(&ctx.tracking_manager.read());
+                        }
                         ctx.events_sender
                             .send(ServerCoreEvent::MarkerCapabilities(capabilities))
                             .ok();
@@ -1594,12 +1563,6 @@ fn connection_pipeline(
     lifecycle_check_thread.join().ok();
 
     ctx.marker_tracking.lock().disconnect();
-    ctx.events_sender
-        .send(ServerCoreEvent::Markers {
-            streams: Vec::new(),
-            origin: ctx.tracking_manager.read().origin_change(),
-        })
-        .ok();
     ctx.events_sender
         .send(ServerCoreEvent::ClientDisconnected)
         .ok();
