@@ -145,6 +145,12 @@ by default, so the driver grants `ALL APPLICATION PACKAGES` read access to the k
 processes, including their AppContainers, which may only read from it. The layer only trusts a pipe
 created by its own user.
 
+Unregistering the driver from SteamVR (in the dashboard, or by another ALVR copy taking over) also
+removes the layer's registration. Where that cannot happen, as when an MSIX package is removed, the
+layer finds its streamer folder is no longer among SteamVR's drivers and stays out of the way: it
+only provides the extensions the loader advertises, without any QR code, so that applications
+enabling them still start, and leaves everything else to the runtime.
+
 Setting `DISABLE_XR_APILAYER_ALVR_MARKER_TRACKING` (any value) turns the layer off for one process.
 
 ## Debugging

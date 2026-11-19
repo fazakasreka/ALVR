@@ -371,7 +371,7 @@ impl State {
     fn qr_codes_available(&mut self, instance: u64) -> bool {
         self.instances
             .get(&instance)
-            .is_some_and(|data| data.marker_tracking_enabled)
+            .is_some_and(|data| data.marker_tracking_enabled && data.alvr_registered)
             && self
                 .refresh_markers()
                 .is_some_and(|capabilities| capabilities.qr_codes)

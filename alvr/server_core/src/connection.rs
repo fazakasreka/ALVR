@@ -288,68 +288,14 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
                     && hostname.as_str() == WIRED_CLIENT_HOSTNAME
             })
         {
-            // Make sure the wired connection is created once and kept alive
-            let wired_connection = if let Some(connection) = &wired_connection {
-                connection
-            } else {
-                let connection = match WiredConnection::new(
-                    FILESYSTEM_LAYOUT.get().unwrap(),
-                    |downloaded, maybe_total| {
-                        if let Some(total) = maybe_total {
-                            alvr_events::send_event(EventType::Adb(AdbEvent {
-                                download_progress: downloaded as f32 / total as f32,
-                            }));
-                        };
-                    },
-                ) {
-                    Ok(connection) => connection,
-                    Err(e) => {
-                        error!("{e:?}");
-                        thread::sleep(RETRY_CONNECT_MIN_INTERVAL);
-                        continue;
-                    }
-                };
-
-                wired_connection = Some(connection);
-
-                wired_connection.as_ref().unwrap()
-            };
-
-            let stream_port;
-            let client_type;
-            let client_autolaunch;
-            {
-                let session_manager_lock = SESSION_MANAGER.read();
-                let connection = &session_manager_lock.settings().connection;
-                stream_port = connection.stream_port;
-                client_type = connection.wired_client_type.clone();
-                client_autolaunch = connection.wired_client_autolaunch.as_option().cloned();
+            // Not ready (nothing plugged in, or the client still starting): the other clients are
+            // tried meanwhile, so that a wired entry never keeps them from connecting
+            if prepare_wired_client(&mut wired_connection) {
+                let client_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+                // Wired clients are reached over an ADB forward on the well-known port.
+                wired_client_ips
+                    .insert(client_ip, (WIRED_CLIENT_HOSTNAME.to_owned(), CONTROL_PORT));
             }
-
-            let status = match wired_connection.setup(
-                CONTROL_PORT,
-                stream_port,
-                &client_type,
-                client_autolaunch,
-            ) {
-                Ok(status) => status,
-                Err(e) => {
-                    error!("{e:?}");
-                    thread::sleep(RETRY_CONNECT_MIN_INTERVAL);
-                    continue;
-                }
-            };
-
-            #[cfg_attr(not(debug_assertions), expect(unused_variables))]
-            if let WiredConnectionStatus::NotReady(s) = status {
-                dbg_connection!("handshake_loop: Wired connection not ready: {s}");
-                thread::sleep(RETRY_CONNECT_MIN_INTERVAL);
-                continue;
-            }
-
-            let client_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
-            // Wired clients are reached over an ADB forward on the well-known port.
-            wired_client_ips.insert(client_ip, (WIRED_CLIENT_HOSTNAME.to_owned(), CONTROL_PORT));
         }
 
         if !wired_client_ips.is_empty()
@@ -481,6 +427,55 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
     }
 
     alvr_common::dbg_connection!("handshake_loop: End");
+}
+
+/// Readies a plugged in wired client, created once and kept alive in `wired_connection`. Whether
+/// it can be connected to.
+fn prepare_wired_client(wired_connection: &mut Option<WiredConnection>) -> bool {
+    if wired_connection.is_none() {
+        match WiredConnection::new(
+            FILESYSTEM_LAYOUT.get().unwrap(),
+            |downloaded, maybe_total| {
+                if let Some(total) = maybe_total {
+                    alvr_events::send_event(EventType::Adb(AdbEvent {
+                        download_progress: downloaded as f32 / total as f32,
+                    }));
+                };
+            },
+        ) {
+            Ok(connection) => *wired_connection = Some(connection),
+            Err(e) => {
+                error!("{e:?}");
+                return false;
+            }
+        }
+    }
+    let Some(connection) = wired_connection else {
+        return false;
+    };
+
+    let (stream_port, client_type, client_autolaunch) = {
+        let session_manager_lock = SESSION_MANAGER.read();
+        let connection = &session_manager_lock.settings().connection;
+        (
+            connection.stream_port,
+            connection.wired_client_type.clone(),
+            connection.wired_client_autolaunch.as_option().cloned(),
+        )
+    };
+
+    match connection.setup(CONTROL_PORT, stream_port, &client_type, client_autolaunch) {
+        Ok(WiredConnectionStatus::Ready) => true,
+        #[cfg_attr(not(debug_assertions), expect(unused_variables))]
+        Ok(WiredConnectionStatus::NotReady(s)) => {
+            dbg_connection!("handshake_loop: Wired connection not ready: {s}");
+            false
+        }
+        Err(e) => {
+            error!("{e:?}");
+            false
+        }
+    }
 }
 
 /// `clients` maps each candidate client address to its hostname and the control port to dial.

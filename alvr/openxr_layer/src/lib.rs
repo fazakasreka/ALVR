@@ -26,6 +26,7 @@
 //! and of runtimes that implement them themselves: then their calls go straight to the runtime.
 
 mod history;
+mod installation;
 mod log;
 mod math;
 mod spatial;
@@ -138,6 +139,10 @@ struct InstanceData {
     marker_tracking_enabled: bool,
     /// The application enabled XR_EXT_future, whoever implements it.
     future_enabled: bool,
+    /// The ALVR copy of the layer is a registered SteamVR driver: recentering is reported. A layer
+    /// left registered by an uninstalled ALVR only provides the extensions the loader advertises,
+    /// without any QR code, and is otherwise out of the way.
+    alvr_registered: bool,
     /// The systems xrGetSystem returned, the ones the spatial functions accept.
     systems: HashSet<u64>,
 }
@@ -342,6 +347,10 @@ unsafe extern "system" fn create_api_layer_instance(
     let wants_time = requested
         .iter()
         .any(|&name| unsafe { CStr::from_ptr(name) } == TIME_EXTENSION);
+    let alvr_registered = installation::alvr_is_registered();
+    if !alvr_registered {
+        log!("ALVR is not registered with SteamVR: recentering is not reported");
+    }
 
     let create = |strip_spatial: bool, strip_future: bool, add_time: bool| {
         let mut names = requested
@@ -377,7 +386,8 @@ unsafe extern "system" fn create_api_layer_instance(
                 let provides_future = wants_future && !has(FUTURE_EXTENSION);
                 // Without it, markers are located at their latest pose, and reference space
                 // changes are not reported
-                let add_time = !wants_time && has(TIME_EXTENSION);
+                let add_time =
+                    (provides_spatial || alvr_registered) && !wants_time && has(TIME_EXTENSION);
 
                 let result = create(provides_spatial, provides_future, add_time);
                 (provides_spatial, provides_future, add_time, result)
@@ -445,6 +455,7 @@ unsafe extern "system" fn create_api_layer_instance(
             provides_future,
             marker_tracking_enabled: wants_marker_tracking,
             future_enabled: wants_future,
+            alvr_registered,
             systems: HashSet::new(),
         },
     );
@@ -506,12 +517,12 @@ unsafe extern "system" fn get_instance_proc_addr(
     }
     let name_str = unsafe { CStr::from_ptr(name) };
 
-    let (next, known, provides_spatial, provides_future, future_enabled) = {
+    let (next, reports_recentering, provides_spatial, provides_future, future_enabled) = {
         let state = state();
         match state.instances.get(&instance.into_raw()) {
             Some(data) => (
                 data.downstream.get_instance_proc_addr,
-                true,
+                data.alvr_registered,
                 data.provides_spatial,
                 data.provides_future,
                 data.future_enabled,
@@ -530,7 +541,7 @@ unsafe extern "system" fn get_instance_proc_addr(
         b"xrDestroyInstance" => Some(void_fn!(destroy_instance, pfn::DestroyInstance)),
         b"xrGetSystem" if provides_spatial => Some(void_fn!(get_system, pfn::GetSystem)),
         // For every application, to report ALVR recentering
-        b"xrCreateSession" | b"xrDestroySession" | b"xrPollEvent" if known => {
+        b"xrCreateSession" | b"xrDestroySession" | b"xrPollEvent" if reports_recentering => {
             spatial::function(name_str)
         }
         _ if provides_spatial => spatial::function(name_str),

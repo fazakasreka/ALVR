@@ -426,6 +426,7 @@ dependencies = [
  "alvr_marker_ipc",
  "openxr",
  "openxr-sys",
+ "serde_json",
  "windows 0.62.2",
  "windows-sys 0.61.2",
 ]
@@ -482,6 +483,7 @@ dependencies = [
  "encoding_rs_io",
  "runas",
  "serde_json",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

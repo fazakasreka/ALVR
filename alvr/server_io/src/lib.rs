@@ -1,10 +1,12 @@
 mod firewall;
 mod openvr_drivers;
 mod openvrpaths;
+mod openxr_layer;
 
 pub use firewall::*;
 pub use openvr_drivers::*;
 pub use openvrpaths::*;
+pub use openxr_layer::*;
 
 use alvr_common::{
     ConnectionState,

@@ -31,6 +31,8 @@ pub fn driver_registration(driver_paths: &[PathBuf], register: bool) -> Result<(
     } else {
         for path in driver_paths {
             paths.remove(path);
+            // Its OpenXR layer would keep loading into every OpenXR application
+            crate::unregister_openxr_layers(path);
         }
     }
 
