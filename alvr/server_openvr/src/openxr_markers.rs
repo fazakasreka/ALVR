@@ -12,9 +12,10 @@
 use alvr_common::{info, parking_lot::Mutex, warn};
 use alvr_filesystem as afs;
 use alvr_marker_ipc::{
-    Capabilities, FLAG_CLIENT_CONNECTED, Marker, Pose, Server, Stream, TrackingConfig, now_ns,
+    Capabilities, FLAG_CLIENT_CONNECTED, Marker, Payload, Pose, Server, Stream, TrackingConfig,
+    now_ns,
 };
-use alvr_packets::{MarkerCapabilities, MarkerTrackingConfig};
+use alvr_packets::{MarkerCapabilities, MarkerPayload, MarkerTrackingConfig};
 use alvr_server_core::MarkerStream;
 use std::time::Duration;
 
@@ -160,8 +161,11 @@ fn publish(state: &mut State) {
                 .markers
                 .iter()
                 .map(|marker| {
-                    Marker::new(
-                        &marker.id,
+                    Marker::with_payload(
+                        match &marker.payload {
+                            MarkerPayload::Text(text) => Payload::Text(text.clone()),
+                            MarkerPayload::Bytes(bytes) => Payload::Bytes(bytes.clone()),
+                        },
                         Pose {
                             orientation: marker.pose.orientation.to_array(),
                             position: marker.pose.position.to_array(),

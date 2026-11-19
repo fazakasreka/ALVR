@@ -610,14 +610,19 @@ code lying face up on the centre of the rug:
 ```
 
 `rotation_degrees` is yaw, pitch and roll; all zero is an upright code facing +Z. `size` excludes
-the quiet zone. The drawn pattern looks like a QR code but does not decode. All codes are reported
-every frame while streaming, as if always in view, to every tracker the server asks for (an
-application's known marker size replaces `size` there, as a runtime must). The emulated headset
-supports both marker options, fixed size and static.
+the quiet zone. The drawn pattern looks like a QR code but does not decode. `id` is the text the
+code holds; give it `bytes_hex` (`"bytes_hex": "00ff7f80"`) to hold those bytes instead, as a byte
+mode code that is not text does, and `id` only names it.
+
+Every frame while streaming, the codes the headset could read go to every tracker the server asks
+for (an application's known marker size replaces `size` there, as a runtime must): the ones in the
+view, facing the camera within 70° and no further than 20 times their size. Look away from a code
+and applications see it paused. `"always_seen": true` at the top of the file reports every code all
+the time instead. The emulated headset supports both marker options, fixed size and static.
 
 To test applications that follow moving codes, give one a `motion`: it then circles its position
-horizontally, turning with it, like a code on a dog running around. The room keeps showing it at
-its position.
+horizontally, turning with it, like a code on a dog running around. The room shows it where it is,
+so in the **Mixed** view an application's drawing should stay on it; turned away, it is not seen.
 
 ```json
 {
@@ -630,6 +635,9 @@ its position.
 ```
 
 A negative `period_seconds` circles clockwise seen from above.
+
+`POST /api/markers` replaces the codes while the emulator runs, and `GET /api/markers` shows them;
+see [HTTP API](#http-api).
 
 
 ## HTTP API
@@ -725,6 +733,41 @@ Use this rather than repeated `POST /api/move` calls whenever motion smoothness 
 measured. A rate is integrated against the real frame time down the same path the keyboard uses,
 whereas posting individual poses puts the calling script's own scheduling into the tracking signal —
 and no HTTP client paces itself to anywhere near a frame.
+
+### `GET /api/markers`
+
+The codes in the room, as in `markers.json`, each with where it is now and whether the headset sees
+it this frame:
+
+```json
+{
+  "always_seen": false,
+  "markers": [
+    {
+      "id": "DOG",
+      "position": [0.0, 1.2, -2.0],
+      "rotation_degrees": [0.0, 0.0, 0.0],
+      "size": 0.15,
+      "motion": { "radius": 0.4, "period_seconds": 6.0 },
+      "seen": true,
+      "current_position": [0.31, 1.2, -1.75],
+      "current_orientation": [0.0, 0.38, 0.0, 0.92]
+    }
+  ]
+}
+```
+
+`current_orientation` is a quaternion, x y z w.
+
+### `POST /api/markers`
+
+Replaces every code, with the content of a `markers.json`, from the next frame. The file itself is
+not changed, so a restart brings back its codes. An invalid code (a size that is not positive, or
+`bytes_hex` that is not hexadecimal) is rejected with 400 and nothing changes.
+
+```sh
+curl -X POST -d '{"markers":[{"id":"CAT","position":[0,1.5,-1],"rotation_degrees":[0,0,0],"size":0.2}]}'   http://127.0.0.1:8080/api/markers
+```
 
 ### `GET /api/view/color`
 
@@ -968,7 +1011,7 @@ enabled.
 | `src/overlay.rs` | Device icons over the view and the 6DoF movement panel, shared by both kinds |
 | `src/controller_ui.rs` | Controller toolbar section and the corner input panels |
 | `src/hand_ui.rs` | Hand toolbar section and the corner gesture panels |
-| `src/markers.rs` | QR codes in the room: the settings file, their drawing and what is reported |
+| `src/markers.rs` | QR codes in the room: the settings file, their models, and which the headset sees |
 | `src/icons.rs` | Painted toolbar icons and the icon buttons that show them |
 | `src/api.rs` | HTTP server and shared state |
 | `src/shader.wgsl` | Unlit vertex/fragment shader |

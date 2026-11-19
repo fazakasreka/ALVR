@@ -9,7 +9,7 @@ use crate::{
     scene::Scene,
     skinned::{SkinnedModel, SkinnedVertex},
 };
-use alvr_common::{glam::Mat4, warn};
+use alvr_common::{glam::Mat4, parking_lot::Mutex, warn};
 use bytemuck::{Pod, Zeroable};
 use std::num::NonZeroU32;
 use wgpu::{
@@ -307,6 +307,8 @@ impl Mesh {
 pub struct SceneRenderer {
     pipeline: MeshPipeline,
     mesh: Mesh,
+    /// The QR codes in the room, each with its model matrix: they can move, and be replaced.
+    markers: Mutex<Vec<(Mesh, Mat4)>>,
     /// Colour format this pipeline was built for. Offscreen capture targets must use the same
     /// format, or the pipeline fails render pass validation.
     color_format: TextureFormat,
@@ -325,7 +327,28 @@ impl SceneRenderer {
         Self {
             pipeline,
             mesh,
+            markers: Mutex::new(Vec::new()),
             color_format: output_format,
+        }
+    }
+
+    /// Replaces the QR code models, each around its centre.
+    pub fn set_markers(&self, device: &Device, queue: &Queue, markers: &[Scene]) {
+        *self.markers.lock() = markers
+            .iter()
+            .map(|scene| {
+                (
+                    Mesh::new(device, queue, &self.pipeline, scene),
+                    Mat4::IDENTITY,
+                )
+            })
+            .collect();
+    }
+
+    /// Where the QR codes are, in the order they were set. Takes effect with the next view.
+    pub fn set_marker_poses(&self, models: &[Mat4]) {
+        for ((_, model), new) in self.markers.lock().iter_mut().zip(models) {
+            *model = *new;
         }
     }
 
@@ -340,18 +363,24 @@ impl SceneRenderer {
     pub fn draw<'pass>(&self, pass: &mut wgpu::RenderPass<'pass>, eye: Eye) {
         pass.set_pipeline(&self.pipeline.pipeline);
         self.mesh.draw(pass, eye);
+        for (marker, _) in self.markers.lock().iter() {
+            marker.draw(pass, eye);
+        }
     }
 
     /// Uploads the view-projection matrix into the given eye's uniform slot.
     pub fn set_view(&self, queue: &Queue, camera: &Camera, eye: Eye, aspect_ratio: f32) {
         let view_proj = Camera::projection_matrix(aspect_ratio) * camera.view_matrix(eye);
-        self.mesh.set_view(queue, eye, view_proj);
+        self.set_view_projection(queue, eye, view_proj);
     }
 
     /// Uploads a view-projection matrix built elsewhere, for drawing the scene from a pose other
     /// than the live camera's.
     pub fn set_view_projection(&self, queue: &Queue, eye: Eye, view_proj: Mat4) {
         self.mesh.set_view(queue, eye, view_proj);
+        for (marker, model) in self.markers.lock().iter() {
+            marker.set_view(queue, eye, view_proj * *model);
+        }
     }
 }
 

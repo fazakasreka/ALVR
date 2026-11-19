@@ -33,8 +33,8 @@ mod video;
 use crate::{
     api::{
         Articulation, CaptureRequestKind, ControllerCommand, ControllerSnapshot,
-        ControllersResponse, HandCommand, HandSnapshot, HandsResponse, NamedSummary,
-        ProfileSummary, SharedState, StateResponse, ViewSource,
+        ControllersResponse, HandCommand, HandSnapshot, HandsResponse, MarkerStatus,
+        MarkersResponse, NamedSummary, ProfileSummary, SharedState, StateResponse, ViewSource,
     },
     camera::{Camera, CameraInput, Eye},
     client::{
@@ -139,7 +139,9 @@ struct EmulatorApp {
     hand_settings: HandSettings,
     /// Emulated hand state, mutated by both the UI and the API commands. Left is index 0.
     hands: [HandState; 2],
-    markers: Vec<markers::MarkerSettings>,
+    markers: markers::MarkerSettingsFile,
+    /// The scene renderer has the models of the current markers.
+    markers_uploaded: bool,
     /// The icons and 6DoF panels of the controllers and the hands, which share one implementation.
     pose_overlay: PoseOverlay,
     /// Pending releases queued by the API's click endpoint.
@@ -170,8 +172,7 @@ impl EmulatorApp {
         let marker_settings = markers::load_or_create(&paths::user_dir());
 
         match Scene::load(&environment_path) {
-            Ok(mut loaded) => {
-                markers::add_to_scene(&mut loaded, &marker_settings);
+            Ok(loaded) => {
                 let loaded = Arc::new(loaded);
 
                 // Build the GPU resources on eframe's own device, so no second device or any
@@ -264,6 +265,7 @@ impl EmulatorApp {
             hand_settings,
             hands,
             markers: marker_settings,
+            markers_uploaded: false,
             pose_overlay: PoseOverlay::new(),
             timed_releases: Vec::new(),
             loaded_models: [None, None],
@@ -635,7 +637,13 @@ impl EmulatorApp {
             client.sync_interaction_profile(profile_id, input_ids);
         }
 
-        client.sync_markers(&self.markers);
+        client.sync_markers(
+            &self.markers,
+            Pose {
+                orientation: head_orientation,
+                position: head_position,
+            },
+        );
     }
 
     /// World-space model matrices of the controllers whose 3D model should be drawn, composed
@@ -699,6 +707,71 @@ impl EmulatorApp {
             .write()
             .callback_resources
             .insert(Arc::clone(&created));
+    }
+
+    /// Takes marker changes from the API, moves the codes in the room to where they are now, and
+    /// publishes them for `/api/markers`.
+    fn update_markers(&mut self, frame: &Frame) {
+        if let Some(markers) = self.shared.marker_update.lock().take() {
+            info!("Markers replaced: {} code(s)", markers.markers.len());
+            self.markers = markers;
+            self.markers_uploaded = false;
+        }
+
+        let time = client::tracking_time();
+        let head = Pose {
+            orientation: self.camera.orientation(),
+            position: self.camera.position,
+        };
+        let poses = self
+            .markers
+            .markers
+            .iter()
+            .map(|marker| marker.pose_at(time))
+            .collect::<Vec<_>>();
+
+        if let Some(state) = frame.wgpu_render_state() {
+            let renderer = state
+                .renderer
+                .read()
+                .callback_resources
+                .get::<Arc<SceneRenderer>>()
+                .cloned();
+            if let Some(renderer) = renderer {
+                if !self.markers_uploaded {
+                    let scenes = self
+                        .markers
+                        .markers
+                        .iter()
+                        .map(markers::marker_scene)
+                        .collect::<Vec<_>>();
+                    renderer.set_markers(&state.device, &state.queue, &scenes);
+                    self.markers_uploaded = true;
+                }
+                renderer.set_marker_poses(
+                    &poses
+                        .iter()
+                        .map(|&pose| markers::model_matrix(pose))
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+
+        *self.shared.markers.lock() = MarkersResponse {
+            always_seen: self.markers.always_seen,
+            markers: self
+                .markers
+                .markers
+                .iter()
+                .zip(poses)
+                .map(|(marker, pose)| MarkerStatus {
+                    settings: marker.clone(),
+                    seen: self.markers.always_seen || marker.is_seen_from(pose, head),
+                    current_position: pose.position.to_array(),
+                    current_orientation: pose.orientation.to_array(),
+                })
+                .collect(),
+        };
     }
 
     /// Uploads controller models to the GPU when a visible controller's profile changed.
@@ -1717,6 +1790,7 @@ impl App for EmulatorApp {
         self.update_camera(&ui_context, delta_seconds);
         let camera = self.camera;
 
+        self.update_markers(frame);
         self.ensure_controller_models(frame);
         self.ensure_hand_models(frame);
         self.ensure_gizmo_renderer(frame);

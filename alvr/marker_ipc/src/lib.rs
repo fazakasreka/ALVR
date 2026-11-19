@@ -40,16 +40,17 @@ pub use sys::{now_ns, ns_to_performance_counter, performance_counter_to_ns};
 pub const PIPE_NAME: &str = "ALVR_Markers";
 
 /// Changes whenever the encoding of a message changes. Messages of another version are ignored.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 const SNAPSHOT_MAGIC: u32 = u32::from_le_bytes(*b"ALVM");
 const REQUEST_MAGIC: u32 = u32::from_le_bytes(*b"ALVQ");
 
 pub const MAX_STREAMS: usize = 8;
 pub const MAX_MARKERS: usize = 32;
-/// Longer marker texts are cut short at a character boundary.
-pub const MAX_TEXT_LEN: usize = 2048;
+/// The most a QR code holds: 7089 digits, as text. Longer payloads are cut short, texts at a
+/// character boundary.
+pub const MAX_PAYLOAD_LEN: usize = 7089;
 /// Longer messages are treated as a broken connection.
-const MAX_MESSAGE_LEN: usize = 1024 * 1024;
+const MAX_MESSAGE_LEN: usize = 4 * 1024 * 1024;
 /// Snapshots kept for [`Client::take_received`] at most; older ones are dropped.
 const MAX_RECEIVED: usize = 256;
 
@@ -97,12 +98,52 @@ impl TrackingConfig {
     }
 }
 
+/// What a QR code holds, as the headset decoded it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Payload {
+    Text(String),
+    /// Byte mode data that is not text.
+    Bytes(Vec<u8>),
+}
+
+impl Payload {
+    /// Cut to [`MAX_PAYLOAD_LEN`].
+    fn truncated(self) -> Self {
+        match self {
+            Self::Text(text) => Self::Text(truncate(&text).to_owned()),
+            Self::Bytes(mut bytes) => {
+                bytes.truncate(MAX_PAYLOAD_LEN);
+                Self::Bytes(bytes)
+            }
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Text(text) => text.as_bytes(),
+            Self::Bytes(bytes) => bytes,
+        }
+    }
+}
+
+impl std::fmt::Display for Payload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text(text) => write!(f, "{text:?}"),
+            Self::Bytes(bytes) => {
+                write!(f, "0x")?;
+                bytes.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Marker {
-    /// Derived from the text, so a marker keeps its id across driver restarts. Never 0.
+    /// Derived from the payload, so a marker keeps its id across driver restarts. Never 0.
     pub id: u64,
     /// The decoded content of the QR code.
-    pub text: String,
+    pub payload: Payload,
     /// Centre of the marker; +Y towards its top edge, +Z out of its face.
     pub pose: Pose,
     /// Edge length in metres.
@@ -110,12 +151,17 @@ pub struct Marker {
 }
 
 impl Marker {
-    /// A marker for a QR code text, cut to [`MAX_TEXT_LEN`].
+    /// A marker for a QR code text, cut to [`MAX_PAYLOAD_LEN`].
     pub fn new(text: &str, pose: Pose, size: f32) -> Self {
-        let text = truncate(text);
+        Self::with_payload(Payload::Text(text.to_owned()), pose, size)
+    }
+
+    /// A marker for a QR code, its payload cut to [`MAX_PAYLOAD_LEN`].
+    pub fn with_payload(payload: Payload, pose: Pose, size: f32) -> Self {
+        let payload = payload.truncated();
         Self {
-            id: marker_id(text),
-            text: text.to_owned(),
+            id: payload_id(&payload),
+            payload,
             pose,
             size,
         }
@@ -144,7 +190,19 @@ pub struct Snapshot {
 
 /// A stable id for a marker text: FNV-1a, with 0 (reserved by OpenXR for "no entity") remapped.
 pub fn marker_id(text: &str) -> u64 {
-    let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+    fnv1a(0xcbf2_9ce4_8422_2325, text.as_bytes())
+}
+
+/// A stable id for a marker payload. Texts keep the ids of [`marker_id`]; bytes get other ones.
+pub fn payload_id(payload: &Payload) -> u64 {
+    match payload {
+        Payload::Text(text) => marker_id(text),
+        Payload::Bytes(bytes) => fnv1a(0x6c62_272e_07bb_0142, bytes),
+    }
+}
+
+fn fnv1a(basis: u64, bytes: &[u8]) -> u64 {
+    let hash = bytes.iter().fold(basis, |hash, &byte| {
         (hash ^ byte as u64).wrapping_mul(0x0100_0000_01b3)
     });
 
@@ -152,11 +210,11 @@ pub fn marker_id(text: &str) -> u64 {
 }
 
 fn truncate(text: &str) -> &str {
-    if text.len() <= MAX_TEXT_LEN {
+    if text.len() <= MAX_PAYLOAD_LEN {
         return text;
     }
 
-    let mut end = MAX_TEXT_LEN;
+    let mut end = MAX_PAYLOAD_LEN;
     while !text.is_char_boundary(end) {
         end -= 1;
     }
@@ -167,6 +225,9 @@ fn truncate(text: &str) -> &str {
 const CAPABILITY_QR_CODES: u32 = 1;
 const CAPABILITY_FIXED_SIZE_MARKERS: u32 = 2;
 const CAPABILITY_STATIC_MARKERS: u32 = 4;
+
+const PAYLOAD_TEXT: u32 = 0;
+const PAYLOAD_BYTES: u32 = 1;
 
 const CONFIG_STATIC_MARKERS: u32 = 1;
 const CONFIG_MARKER_SIZE: u32 = 2;
@@ -274,8 +335,13 @@ fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
                 writer.f32(value);
             }
             writer.f32(marker.size);
-            writer.u32(marker.text.len() as u32);
-            writer.0.extend(marker.text.as_bytes());
+            let bytes = marker.payload.as_bytes();
+            writer.u32(match marker.payload {
+                Payload::Text(_) => PAYLOAD_TEXT,
+                Payload::Bytes(_) => PAYLOAD_BYTES,
+            });
+            writer.u32(bytes.len() as u32);
+            writer.0.extend(bytes);
         }
     }
 
@@ -312,12 +378,18 @@ fn decode_snapshot(message: &[u8]) -> Option<Snapshot> {
             let orientation = [reader.f32()?, reader.f32()?, reader.f32()?, reader.f32()?];
             let position = [reader.f32()?, reader.f32()?, reader.f32()?];
             let size = reader.f32()?;
-            let text_len = reader.count(MAX_TEXT_LEN)?;
-            let text = String::from_utf8(reader.bytes(text_len)?.to_vec()).ok()?;
+            let kind = reader.u32()?;
+            let len = reader.count(MAX_PAYLOAD_LEN)?;
+            let bytes = reader.bytes(len)?.to_vec();
+            let payload = match kind {
+                PAYLOAD_TEXT => Payload::Text(String::from_utf8(bytes).ok()?),
+                PAYLOAD_BYTES => Payload::Bytes(bytes),
+                _ => return None,
+            };
 
             markers.push(Marker {
                 id,
-                text,
+                payload,
                 pose: Pose {
                     orientation,
                     position,
@@ -704,11 +776,37 @@ mod tests {
 
     #[test]
     fn long_text_is_cut_at_a_character_boundary() {
-        let text = "é".repeat(MAX_TEXT_LEN);
+        let text = "é".repeat(MAX_PAYLOAD_LEN);
         let cut = truncate(&text);
-        assert_eq!(cut.len(), MAX_TEXT_LEN);
+        assert_eq!(cut.len(), MAX_PAYLOAD_LEN - 1);
         assert!(text.starts_with(cut));
-        assert_eq!(Marker::new(&text, pose(0.0), 0.1).text, cut);
+        assert_eq!(
+            Marker::new(&text, pose(0.0), 0.1).payload,
+            Payload::Text(cut.to_owned())
+        );
+
+        // The longest QR code fits
+        let digits = "7".repeat(MAX_PAYLOAD_LEN);
+        assert_eq!(
+            Marker::new(&digits, pose(0.0), 0.1).payload,
+            Payload::Text(digits)
+        );
+    }
+
+    #[test]
+    fn bytes_round_trip_and_have_their_own_ids() {
+        let bytes = Marker::with_payload(Payload::Bytes(b"dog".to_vec()), pose(1.0), 0.2);
+        assert_ne!(bytes.id, marker_id("dog"));
+
+        let snapshot = Snapshot {
+            streams: vec![Stream {
+                config: STATIC,
+                time_ns: 1,
+                markers: vec![bytes, Marker::new("dog", pose(2.0), 0.2)],
+            }],
+            ..Default::default()
+        };
+        assert_eq!(decode_snapshot(&encode_snapshot(&snapshot)), Some(snapshot));
     }
 
     #[test]
@@ -780,7 +878,10 @@ mod tests {
             assert_eq!(snapshot.flags, FLAG_CLIENT_CONNECTED);
             assert_eq!(snapshot.capabilities, ALL);
             assert_eq!(snapshot.streams[0].config, STATIC);
-            assert_eq!(snapshot.streams[0].markers[0].text, "dog");
+            assert_eq!(
+                snapshot.streams[0].markers[0].payload,
+                Payload::Text("dog".into())
+            );
             assert_eq!(snapshot.streams[0].markers[0].id, marker_id("dog"));
             assert_eq!(snapshot.streams[1].time_ns, 20);
             assert_eq!(snapshot.streams[1].markers[0].pose, pose(2.0));
@@ -935,7 +1036,7 @@ mod tests {
             let mut stalled = Client::new_named(&name);
             stalled.read();
 
-            let long_text = "x".repeat(MAX_TEXT_LEN);
+            let long_text = "x".repeat(MAX_PAYLOAD_LEN);
             for i in 0..200 {
                 let markers = (0..MAX_MARKERS)
                     .map(|_| Marker::new(&long_text, pose(i as f32), 0.1))

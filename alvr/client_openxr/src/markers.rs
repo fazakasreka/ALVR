@@ -6,7 +6,7 @@
 //! frame, so that moving codes are reported at the frame rate, for the frame's display time.
 
 use alvr_common::{error, info, warn};
-use alvr_packets::{MarkerCapabilities, MarkerData, MarkerTrackingConfig};
+use alvr_packets::{MarkerCapabilities, MarkerData, MarkerPayload, MarkerTrackingConfig};
 use openxr::{self as xr, sys, sys::Handle};
 use std::{
     collections::HashMap,
@@ -57,7 +57,7 @@ enum ContextState {
 /// A code a tracker found.
 struct Entity {
     handle: sys::SpatialEntityEXT,
-    text: String,
+    payload: MarkerPayload,
     /// The last tracked pose, and when it was tracked.
     last_tracked: Option<(MarkerData, Instant)>,
     found_at: Instant,
@@ -450,10 +450,10 @@ impl MarkerTracker {
             {
                 continue;
             }
-            let Some(text) = found
+            // A code not decoded yet is left for a later discovery
+            let Some(payload) = found
                 .marker
-                .and_then(|marker| self.read_text(snapshot, marker.data))
-                .or_else(|| found.marker.map(|marker| marker.marker_id.to_string()))
+                .and_then(|marker| self.read_payload(snapshot, marker.data))
             else {
                 continue;
             };
@@ -468,19 +468,19 @@ impl MarkerTracker {
                 (self.entity_fns.create_spatial_entity_from_id)(context, &create_info, &mut handle)
             };
             if result != sys::Result::SUCCESS {
-                warn!("Cannot follow QR code \"{text}\": {result:?}");
+                warn!("Cannot follow QR code {payload}: {result:?}");
                 continue;
             }
 
             info!(
-                "QR code \"{text}\" at {:?}, size {} ({:?})",
+                "QR code {payload} at {:?}, size {} ({:?})",
                 found.bounds.center.position, found.bounds.extents.width, tracker.config
             );
             tracker.entities.insert(
                 found.id,
                 Entity {
                     handle,
-                    text,
+                    payload,
                     last_tracked: None,
                     found_at: Instant::now(),
                 },
@@ -536,14 +536,14 @@ impl MarkerTracker {
             match found.state {
                 sys::SpatialEntityTrackingStateEXT::TRACKING => {
                     let marker = MarkerData {
-                        id: entity.text.clone(),
+                        payload: entity.payload.clone(),
                         pose: crate::from_xr_pose(found.bounds.center),
                         size: found.bounds.extents.width,
                     };
                     entity.last_tracked = Some((marker, now));
                 }
                 sys::SpatialEntityTrackingStateEXT::STOPPED => {
-                    info!("QR code \"{}\" lost", entity.text);
+                    info!("QR code {} lost", entity.payload);
                     stopped.push(found.id);
                 }
                 _ => (),
@@ -659,49 +659,64 @@ impl MarkerTracker {
             .collect()
     }
 
-    fn read_text(
+    /// The data of a QR code, `None` if it is not decoded yet.
+    fn read_payload(
         &self,
         snapshot: sys::SpatialSnapshotEXT,
         buffer: sys::SpatialBufferEXT,
-    ) -> Option<String> {
-        if buffer.buffer_type != sys::SpatialBufferTypeEXT::STRING {
+    ) -> Option<MarkerPayload> {
+        if buffer.buffer_id.into_raw() == 0 {
             return None;
         }
-
         let info = sys::SpatialBufferGetInfoEXT {
             ty: sys::SpatialBufferGetInfoEXT::TYPE,
             next: ptr::null(),
             buffer_id: buffer.buffer_id,
         };
+
+        match buffer.buffer_type {
+            sys::SpatialBufferTypeEXT::STRING => {
+                let text = self
+                    .read_buffer(self.entity_fns.get_spatial_buffer_string, snapshot, &info)?
+                    .into_iter()
+                    .map(|c| c as u8)
+                    .collect::<Vec<_>>();
+                // The count includes the terminating null
+                let text = CStr::from_bytes_until_nul(&text)
+                    .ok()?
+                    .to_string_lossy()
+                    .into_owned();
+                Some(MarkerPayload::Text(text))
+            }
+            sys::SpatialBufferTypeEXT::UINT8 => self
+                .read_buffer(self.entity_fns.get_spatial_buffer_uint8, snapshot, &info)
+                .map(MarkerPayload::Bytes),
+            _ => None,
+        }
+    }
+
+    /// A spatial buffer, read with the two-call idiom.
+    fn read_buffer<T: Copy + Default>(
+        &self,
+        get: unsafe extern "system" fn(
+            sys::SpatialSnapshotEXT,
+            *const sys::SpatialBufferGetInfoEXT,
+            u32,
+            *mut u32,
+            *mut T,
+        ) -> sys::Result,
+        snapshot: sys::SpatialSnapshotEXT,
+        info: &sys::SpatialBufferGetInfoEXT,
+    ) -> Option<Vec<T>> {
         let mut count = 0;
-        unsafe {
-            (self.entity_fns.get_spatial_buffer_string)(
-                snapshot,
-                &info,
-                0,
-                &mut count,
-                ptr::null_mut(),
-            )
-        };
-        if count == 0 {
+        if unsafe { get(snapshot, info, 0, &mut count, ptr::null_mut()) } != sys::Result::SUCCESS {
             return None;
         }
-        let mut text = vec![0; count as usize];
-        let result = unsafe {
-            (self.entity_fns.get_spatial_buffer_string)(
-                snapshot,
-                &info,
-                count,
-                &mut count,
-                text.as_mut_ptr(),
-            )
-        };
+        let mut buffer = vec![T::default(); count as usize];
+        let result = unsafe { get(snapshot, info, count, &mut count, buffer.as_mut_ptr()) };
+        buffer.truncate(count as usize);
 
-        (result == sys::Result::SUCCESS).then(|| {
-            unsafe { CStr::from_ptr(text.as_ptr()) }
-                .to_string_lossy()
-                .into_owned()
-        })
+        (result == sys::Result::SUCCESS).then_some(buffer)
     }
 
     fn destroy(&self, tracker: Tracker) {

@@ -19,7 +19,7 @@ use alvr_graphics::{
 };
 use alvr_packets::{
     ButtonEntry, ButtonValue, FaceData, FaceExpressions, MarkerCapabilities, MarkerData,
-    MarkerTrackingConfig, TrackingData, VideoStreamKind,
+    MarkerPayload, MarkerTrackingConfig, TrackingData, VideoStreamKind,
 };
 use alvr_session::{
     CodecType, FoveatedEncodingConfig, MediacodecPropType, MediacodecProperty, UpscalingConfig,
@@ -466,9 +466,11 @@ pub extern "C" fn alvr_send_markers(
     let markers = markers
         .iter()
         .map(|marker| MarkerData {
-            id: unsafe { CStr::from_ptr(marker.id) }
-                .to_string_lossy()
-                .into_owned(),
+            payload: MarkerPayload::Text(
+                unsafe { CStr::from_ptr(marker.id) }
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             pose: alvr_common::from_capi_pose(&marker.pose),
             size: marker.size,
         })

@@ -33,9 +33,9 @@ fn main() -> ExitCode {
                     );
                     for marker in &stream.markers {
                         println!(
-                            "    {:016x} \"{}\" position {:?} orientation {:?} size {}",
+                            "    {:016x} {} position {:?} orientation {:?} size {}",
                             marker.id,
-                            marker.text,
+                            marker.payload,
                             marker.pose.position,
                             marker.pose.orientation,
                             marker.size

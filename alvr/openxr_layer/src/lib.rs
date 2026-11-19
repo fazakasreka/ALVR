@@ -33,7 +33,7 @@ use history::MarkerHistory;
 use log::log;
 use openxr_sys::{self as xr, Handle, loader, pfn};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::{CStr, CString, c_char},
     mem, ptr, slice,
     sync::{LazyLock, Mutex, MutexGuard},
@@ -41,8 +41,8 @@ use std::{
 
 const LAYER_NAME: &CStr = c"XR_APILAYER_ALVR_marker_tracking";
 
-const SPATIAL_EXTENSIONS: [&CStr; 2] =
-    [c"XR_EXT_spatial_entity", c"XR_EXT_spatial_marker_tracking"];
+const MARKER_TRACKING_EXTENSION: &CStr = c"XR_EXT_spatial_marker_tracking";
+const SPATIAL_EXTENSIONS: [&CStr; 2] = [c"XR_EXT_spatial_entity", MARKER_TRACKING_EXTENSION];
 const FUTURE_EXTENSION: &CStr = c"XR_EXT_future";
 /// Enabled on the runtime too when the layer provides the spatial extensions, to answer for the
 /// times applications ask for.
@@ -60,6 +60,7 @@ pub(crate) use void_fn;
 struct Downstream {
     get_instance_proc_addr: pfn::GetInstanceProcAddr,
     destroy_instance: pfn::DestroyInstance,
+    get_system: pfn::GetSystem,
     poll_event: pfn::PollEvent,
     create_session: pfn::CreateSession,
     destroy_session: pfn::DestroySession,
@@ -96,6 +97,7 @@ impl Downstream {
             Some(Self {
                 get_instance_proc_addr: gipa,
                 destroy_instance: get(gipa, instance, c"xrDestroyInstance")?,
+                get_system: get(gipa, instance, c"xrGetSystem")?,
                 poll_event: get(gipa, instance, c"xrPollEvent")?,
                 create_session: get(gipa, instance, c"xrCreateSession")?,
                 destroy_session: get(gipa, instance, c"xrDestroySession")?,
@@ -120,6 +122,12 @@ struct InstanceData {
     provides_spatial: bool,
     /// XR_EXT_future is implemented by the layer.
     provides_future: bool,
+    /// The application enabled XR_EXT_spatial_marker_tracking, not only XR_EXT_spatial_entity.
+    marker_tracking_enabled: bool,
+    /// The application enabled XR_EXT_future, whoever implements it.
+    future_enabled: bool,
+    /// The systems xrGetSystem returned, the ones the spatial functions accept.
+    systems: HashSet<u64>,
 }
 
 /// The markers sent by the ALVR driver.
@@ -193,10 +201,13 @@ impl State {
     /// A value for a handle or future the layer creates. Never 0, and never reused.
     fn new_handle(&mut self) -> u64 {
         self.next_handle += 1;
-        // A recognisable prefix, to tell the layer's handles apart in a debugger
-        0x414C_5652_0000_0000 | self.next_handle
+        HANDLE_PREFIX | self.next_handle
     }
 }
+
+/// In every handle and future of the layer: recognisable in a debugger, and tells the layer's
+/// futures apart from the runtime's.
+const HANDLE_PREFIX: u64 = 0x414C_5652_0000_0000;
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(Mutex::default);
 
@@ -280,6 +291,9 @@ unsafe extern "system" fn create_api_layer_instance(
     let is_future = |name: *const c_char| unsafe { CStr::from_ptr(name) } == FUTURE_EXTENSION;
     let wants_spatial = requested.iter().any(|&name| is_spatial(name));
     let wants_future = requested.iter().any(|&name| is_future(name));
+    let wants_marker_tracking = requested
+        .iter()
+        .any(|&name| unsafe { CStr::from_ptr(name) } == MARKER_TRACKING_EXTENSION);
     let wants_time = requested
         .iter()
         .any(|&name| unsafe { CStr::from_ptr(name) } == TIME_EXTENSION);
@@ -383,6 +397,9 @@ unsafe extern "system" fn create_api_layer_instance(
             downstream,
             provides_spatial,
             provides_future,
+            marker_tracking_enabled: wants_marker_tracking,
+            future_enabled: wants_future,
+            systems: HashSet::new(),
         },
     );
 
@@ -443,16 +460,17 @@ unsafe extern "system" fn get_instance_proc_addr(
     }
     let name_str = unsafe { CStr::from_ptr(name) };
 
-    let (next, provides_spatial, provides_future) = {
+    let (next, provides_spatial, provides_future, future_enabled) = {
         let state = state();
         match state.instances.get(&instance.into_raw()) {
             Some(data) => (
                 data.downstream.get_instance_proc_addr,
                 data.provides_spatial,
                 data.provides_future,
+                data.future_enabled,
             ),
             None => match state.last_get_instance_proc_addr {
-                Some(next) => (next, false, false),
+                Some(next) => (next, false, false, false),
                 None => return xr::Result::ERROR_HANDLE_INVALID,
             },
         }
@@ -463,16 +481,47 @@ unsafe extern "system" fn get_instance_proc_addr(
             Some(void_fn!(get_instance_proc_addr, pfn::GetInstanceProcAddr))
         }
         b"xrDestroyInstance" => Some(void_fn!(destroy_instance, pfn::DestroyInstance)),
+        b"xrGetSystem" if provides_spatial => Some(void_fn!(get_system, pfn::GetSystem)),
         _ if provides_spatial => spatial::function(name_str),
-        _ if provides_future => spatial::future_function(name_str),
         _ => None,
-    };
+    }
+    // The layer's futures go through the layer even when the runtime implements XR_EXT_future,
+    // but only for applications that enabled it
+    .or_else(|| {
+        ((provides_spatial || provides_future) && future_enabled)
+            .then(|| spatial::future_function(name_str))
+            .flatten()
+    });
     if let Some(ours) = ours {
         unsafe { *function = Some(ours) };
         return xr::Result::SUCCESS;
     }
 
     unsafe { next(instance, name, function) }
+}
+
+/// Remembers the systems of the instance, which the spatial functions are called with.
+unsafe extern "system" fn get_system(
+    instance: xr::Instance,
+    info: *const xr::SystemGetInfo,
+    system: *mut xr::SystemId,
+) -> xr::Result {
+    let Some(downstream) = state()
+        .instances
+        .get(&instance.into_raw())
+        .map(|data| data.downstream)
+    else {
+        return xr::Result::ERROR_HANDLE_INVALID;
+    };
+
+    let result = unsafe { (downstream.get_system)(instance, info, system) };
+    if result == xr::Result::SUCCESS
+        && let Some(data) = state().instances.get_mut(&instance.into_raw())
+    {
+        data.systems.insert(unsafe { *system }.into_raw());
+    }
+
+    result
 }
 
 unsafe extern "system" fn destroy_instance(instance: xr::Instance) -> xr::Result {

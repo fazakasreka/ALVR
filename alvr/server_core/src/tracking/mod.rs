@@ -156,8 +156,10 @@ impl TrackingManager {
             .find(|stream| Some(stream.config) == base)
             .into_iter()
             .flat_map(|stream| &stream.markers)
-            .find(|m| wanted.is_none_or(|text| m.id == *text))
-            .and_then(|m| Some((m.id.clone(), floor_origin_from_marker(m.pose)?)))
+            // Only codes holding text can be named in the settings
+            .filter_map(|m| Some((m.payload.text()?, m.pose)))
+            .find(|(text, _)| wanted.is_none_or(|wanted| text == wanted))
+            .and_then(|(text, pose)| Some((text.to_owned(), floor_origin_from_marker(pose)?)))
         else {
             return false;
         };
@@ -671,7 +673,7 @@ mod tests {
 
     fn code(id: &str, x: f32) -> alvr_packets::MarkerData {
         alvr_packets::MarkerData {
-            id: id.into(),
+            payload: alvr_packets::MarkerPayload::Text(id.into()),
             pose: Pose {
                 position: Vec3::new(x, 1.0, -2.0),
                 orientation: Quat::IDENTITY,

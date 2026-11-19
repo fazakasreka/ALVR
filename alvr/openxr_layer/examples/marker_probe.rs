@@ -209,7 +209,7 @@ impl Spatial {
 
             for i in 0..count {
                 let text = if states[i] == sys::SpatialEntityTrackingStateEXT::TRACKING {
-                    self.text(snapshot, markers[i].data.buffer_id)
+                    self.data(snapshot, markers[i].data)
                 } else {
                     String::new()
                 };
@@ -222,43 +222,55 @@ impl Spatial {
         entities
     }
 
-    fn text(&self, snapshot: sys::SpatialSnapshotEXT, buffer: sys::SpatialBufferIdEXT) -> String {
+    /// The data of a QR code: its text, or its bytes in hexadecimal.
+    fn data(&self, snapshot: sys::SpatialSnapshotEXT, buffer: sys::SpatialBufferEXT) -> String {
         let info = sys::SpatialBufferGetInfoEXT {
             ty: sys::SpatialBufferGetInfoEXT::TYPE,
             next: ptr::null(),
-            buffer_id: buffer,
+            buffer_id: buffer.buffer_id,
         };
-        let mut count = 0;
-        check(
-            unsafe {
-                (self.fns.get_spatial_buffer_string)(
-                    snapshot,
-                    &info,
-                    0,
-                    &mut count,
-                    ptr::null_mut(),
-                )
-            },
-            "xrGetSpatialBufferStringEXT",
-        );
-        let mut text = vec![0; count as usize];
-        check(
-            unsafe {
-                (self.fns.get_spatial_buffer_string)(
-                    snapshot,
-                    &info,
-                    count,
-                    &mut count,
-                    text.as_mut_ptr(),
-                )
-            },
-            "xrGetSpatialBufferStringEXT",
-        );
 
-        unsafe { CStr::from_ptr(text.as_ptr()) }
-            .to_string_lossy()
-            .into_owned()
+        match buffer.buffer_type {
+            sys::SpatialBufferTypeEXT::STRING => {
+                let text = read_buffer(self.fns.get_spatial_buffer_string, snapshot, &info);
+                format!(
+                    "{:?}",
+                    unsafe { CStr::from_ptr(text.as_ptr()) }.to_string_lossy()
+                )
+            }
+            sys::SpatialBufferTypeEXT::UINT8 => {
+                let bytes = read_buffer(self.fns.get_spatial_buffer_uint8, snapshot, &info);
+                bytes.iter().fold("0x".to_owned(), |text, byte| format!("{text}{byte:02x}"))
+            }
+            other => format!("(not decoded, {other:?})"),
+        }
     }
+}
+
+/// A spatial buffer, read with the two-call idiom.
+fn read_buffer<T: Copy + Default>(
+    get: unsafe extern "system" fn(
+        sys::SpatialSnapshotEXT,
+        *const sys::SpatialBufferGetInfoEXT,
+        u32,
+        *mut u32,
+        *mut T,
+    ) -> sys::Result,
+    snapshot: sys::SpatialSnapshotEXT,
+    info: &sys::SpatialBufferGetInfoEXT,
+) -> Vec<T> {
+    let mut count = 0;
+    check(
+        unsafe { get(snapshot, info, 0, &mut count, ptr::null_mut()) },
+        "xrGetSpatialBuffer*EXT",
+    );
+    let mut buffer = vec![T::default(); count as usize];
+    check(
+        unsafe { get(snapshot, info, count, &mut count, buffer.as_mut_ptr()) },
+        "xrGetSpatialBuffer*EXT",
+    );
+
+    buffer
 }
 
 fn format_pose(pose: sys::Posef) -> String {
@@ -436,7 +448,7 @@ fn main() {
             println!("{} QR code(s)", in_view.len());
             for ((text, state, bounds), (_, _, stage_bounds)) in in_view.iter().zip(&in_stage) {
                 println!(
-                    "  \"{text}\" {state:?}, {:.3} x {:.3} m",
+                    "  {text} {state:?}, {:.3} x {:.3} m",
                     bounds.extents.width, bounds.extents.height
                 );
                 println!("    in VIEW:  {}", format_pose(bounds.center));

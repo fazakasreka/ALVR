@@ -8,7 +8,7 @@
 //! the application's alpha. It gets a decoder of its own, and its frames are paired with the color
 //! frames by timestamp when they are displayed.
 
-use crate::markers::MarkerSettings;
+use crate::markers::MarkerSettingsFile;
 use crate::{
     camera::{Camera, IPD},
     decoder::{self, DecodedFrame, DecoderKind, VideoDecoder},
@@ -104,6 +104,11 @@ const MAX_PENDING_ALPHA_FRAMES: usize = 8;
 
 /// The clock of the tracking's `poll_timestamp`, which marker times are on too.
 static TRACKING_CLOCK: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Now on the tracking clock: what moving markers are animated by.
+pub fn tracking_time() -> Duration {
+    TRACKING_CLOCK.elapsed()
+}
 
 /// The emulated headset tracks QR codes with every option.
 const MARKER_CAPABILITIES: MarkerCapabilities = MarkerCapabilities {
@@ -629,19 +634,20 @@ impl EmulatedClient {
         self.announced_inputs = Some(input_ids);
     }
 
-    /// Reports where the markers are now, to every tracker the server asked for. Call once per
-    /// frame while streaming, as a headset reports them.
-    pub fn sync_markers(&mut self, markers: &[MarkerSettings]) {
+    /// Reports the markers a headset at `head` sees now, and where, to every tracker the server
+    /// asked for. Call once per frame while streaming, as a headset reports them.
+    pub fn sync_markers(&mut self, markers: &MarkerSettingsFile, head: Pose) {
         if !self.status.streaming {
             return;
         }
 
-        let timestamp = TRACKING_CLOCK.elapsed();
+        let timestamp = tracking_time();
+        let seen = markers.seen(head, timestamp);
         for config in &self.marker_configs {
-            let seen = markers
+            let seen = seen
                 .iter()
-                .map(|marker| {
-                    let mut data = marker.data_at(timestamp);
+                .cloned()
+                .map(|mut data| {
                     // As a runtime must: every code has the size the application gave
                     if let Some(size) = config.marker_size {
                         data.size = size;

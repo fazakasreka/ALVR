@@ -37,16 +37,20 @@ app ─▶ OpenXR loader ─▶ this layer ─▶ SteamVR OpenXR runtime
 | | |
 |---|---|
 | Capabilities | `XR_SPATIAL_CAPABILITY_MARKER_TRACKING_QR_CODE_EXT`, when the headset connected last tracks QR codes |
-| Components | `MARKER` (QR text as a string buffer), `BOUNDED_2D` (centre pose and size) |
+| Components | `MARKER` (the code's data: a string buffer for text, a `uint8` buffer for other bytes), `BOUNDED_2D` (centre pose and size) |
 | Features | fixed size markers, static markers; both always honoured, see below |
 | Snapshots | discovery and update snapshots, `XrSpatialFilterTrackingStateEXT` |
 | Poses | at the requested time: interpolated between the headset's poses, predicted up to 100 ms past the latest |
-| Entities | ids derived from the QR text, so stable across snapshots, contexts and SteamVR restarts |
-| Tracking states | `TRACKING` while the headset sees the code; `PAUSED` otherwise, while disconnected, or when nothing came for 500 ms |
+| Entities | a context gives a code an id when it first discovers it and keeps it, so it is stable across the context's snapshots; no two contexts share an id, as the extension requires. Buffer ids come from the code's data |
+| Tracking states | `TRACKING` while the headset sees the code; `PAUSED` otherwise, while disconnected, or when nothing came for 500 ms; never `STOPPED` |
+| Data | up to 7089 bytes, the most a QR code holds; codes the headset has not decoded yet are not reported |
 | Events | `XrEventDataSpatialDiscoveryRecommendedEXT` when a context is created and when the set of codes changes |
 | `XR_EXT_future` | provided when the runtime lacks it; futures of the layer are ready immediately |
 
-ArUco, AprilTag and Micro QR are reported as unsupported: the headset only reports QR codes.
+ArUco, AprilTag and Micro QR are reported as unsupported: they are not enumerated, and their
+capability gets `XR_ERROR_SPATIAL_CAPABILITY_UNSUPPORTED_EXT`. The headset only reports QR codes.
+An instance that enables `XR_EXT_spatial_entity` without `XR_EXT_spatial_marker_tracking` has no
+capability at all.
 
 **Marker options.** A context's `XrSpatialMarkerSizeEXT` and `XrSpatialMarkerStaticOptimizationEXT`
 go to the headset, which uses them for more precise poses when it supports them. The layer honours
@@ -57,6 +61,24 @@ a context for static codes gets their poses averaged over the last second instea
 for. If the runtime accepts them, it implements them itself and the layer steps aside. An
 application that enables none of the extensions talks to the runtime directly: the layer only sits
 in `xrGetInstanceProcAddr` and `xrDestroyInstance`.
+
+## Conformance
+
+The OpenXR CTS (1.1.65) passes `XR_EXT_spatial_marker_tracking-qr-code`, also with invalid handle and
+type validation, through SteamVR, the driver and the client emulator, and skips the Micro QR, ArUco
+and AprilTag tests as unsupported. Build `conformance_cli` from
+[OpenXR-CTS](https://github.com/KhronosGroup/OpenXR-CTS) (`cmake --build build --target
+conformance_cli`; keep the build path short on Windows) and, with a headset or the emulator
+streaming, run from its output folder:
+
+```sh
+conformance_cli.exe "XR_EXT_spatial_marker_tracking-qr-code" -G D3D11 -H -T
+conformance_cli.exe "XR_EXT_spatial_marker_tracking-qr-code-interactive" -G D3D11
+```
+
+The interactive test draws a box on every code it finds, magenta when the code's data was read;
+complete it with the select button. Every marker test is tagged `[no_auto]`, so it only runs when
+named.
 
 ## Registration
 
@@ -75,7 +97,8 @@ Setting `DISABLE_XR_APILAYER_ALVR_MARKER_TRACKING` (any value) turns the layer o
 
 ## Debugging
 
-- `cargo run -p alvr_marker_ipc --example dump_markers -- --watch` prints what the driver sends.
+- `cargo run -p alvr_marker_ipc --example dump_markers -- --watch` prints what the driver sends:
+  texts quoted, bytes in hexadecimal.
 - `cargo run -p alvr_openxr_layer --example marker_probe --release -- 15` runs a minimal OpenXR
   application (D3D11, empty frames) on SteamVR and prints the codes it gets, relative to the head
   and to `STAGE`. The headset shows black while it runs.
@@ -96,3 +119,5 @@ Setting `DISABLE_XR_APILAYER_ALVR_MARKER_TRACKING` (any value) turns the layer o
   starts SteamVR itself may need to query again once the headset is up.
 - Reference space changes (`XrEventDataReferenceSpaceChangePending`) are not reported when ALVR
   recenters.
+- The layer provides both spatial extensions together: on a runtime with `XR_EXT_spatial_entity` but
+  not `XR_EXT_spatial_marker_tracking`, the runtime's own spatial entities are hidden.

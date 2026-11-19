@@ -215,9 +215,39 @@ pub struct ButtonEntry {
     pub value: ButtonValue,
 }
 
+/// What a QR code holds, as the headset decoded it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum MarkerPayload {
+    Text(String),
+    /// Byte mode data that is not text.
+    Bytes(Vec<u8>),
+}
+
+impl MarkerPayload {
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Bytes(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for MarkerPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text(text) => write!(f, "{text:?}"),
+            Self::Bytes(bytes) => {
+                write!(f, "0x")?;
+                bytes.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+            }
+        }
+    }
+}
+
+/// A QR code the headset decoded. Codes it has not decoded yet are not reported.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MarkerData {
-    pub id: String, // QR code text
+    pub payload: MarkerPayload,
     pub pose: Pose, // Centre of the marker; +Y towards its top edge, +Z out of its face
     pub size: f32,  // Edge length in metres
 }

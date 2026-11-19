@@ -4,7 +4,12 @@
 //! shared state plus a request channel for anything needing the GPU. Rendering must happen on the
 //! thread owning the wgpu device, so capture requests are queued and answered by the UI thread.
 
-use crate::{client::FrameTiming, controllers::Hand, hands::HandPose};
+use crate::{
+    client::FrameTiming,
+    controllers::Hand,
+    hands::HandPose,
+    markers::{MarkerSettings, MarkerSettingsFile},
+};
 use alvr_common::{
     glam::{Quat, Vec3},
     info,
@@ -460,6 +465,29 @@ pub struct SharedState {
     pub captures: Mutex<VecDeque<CaptureRequest>>,
     /// View source change requested by `/api/source`, applied on the next frame.
     pub source: Mutex<Option<ViewSource>>,
+    /// Latest marker snapshot published by the UI thread, for `/api/markers`.
+    pub markers: Mutex<MarkersResponse>,
+    /// Markers set by `POST /api/markers`, replacing the current ones on the next frame.
+    pub marker_update: Mutex<Option<MarkerSettingsFile>>,
+}
+
+/// `GET /api/markers`: the codes in the room, as in `markers.json`, with where they are now and
+/// whether the headset sees them.
+#[derive(Serialize, Default)]
+pub struct MarkersResponse {
+    pub always_seen: bool,
+    pub markers: Vec<MarkerStatus>,
+}
+
+#[derive(Serialize)]
+pub struct MarkerStatus {
+    #[serde(flatten)]
+    pub settings: MarkerSettings,
+    /// Reported to the server this frame.
+    pub seen: bool,
+    pub current_position: [f32; 3],
+    /// Quaternion, x y z w.
+    pub current_orientation: [f32; 4],
 }
 
 impl SharedState {
@@ -474,6 +502,8 @@ impl SharedState {
             hand_commands: Mutex::new(VecDeque::new()),
             captures: Mutex::new(VecDeque::new()),
             source: Mutex::new(None),
+            markers: Mutex::new(MarkersResponse::default()),
+            marker_update: Mutex::new(None),
         }
     }
 }
@@ -614,6 +644,31 @@ fn route(shared: &SharedState, request: &mut tiny_http::Request) -> Reply {
 
                     Reply::Json("{\"ok\":true}".into())
                 }
+                Err(e) => Reply::Error(400, format!("Invalid JSON: {e}")),
+            }
+        }
+
+        (tiny_http::Method::Get, "/api/markers") => {
+            match serde_json::to_string_pretty(&*shared.markers.lock()) {
+                Ok(json) => Reply::Json(json),
+                Err(e) => Reply::Error(500, format!("Cannot serialise markers: {e}")),
+            }
+        }
+
+        (tiny_http::Method::Post, "/api/markers") => {
+            let mut body = String::new();
+            if let Err(e) = request.as_reader().read_to_string(&mut body) {
+                return Reply::Error(400, format!("Cannot read request body: {e}"));
+            }
+
+            match serde_json::from_str::<MarkerSettingsFile>(&body) {
+                Ok(parsed) => match parsed.validate() {
+                    Ok(()) => {
+                        *shared.marker_update.lock() = Some(parsed);
+                        Reply::Json("{\"ok\":true}".into())
+                    }
+                    Err(e) => Reply::Error(400, format!("{e:#}")),
+                },
                 Err(e) => Reply::Error(400, format!("Invalid JSON: {e}")),
             }
         }

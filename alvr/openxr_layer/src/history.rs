@@ -5,7 +5,7 @@
 //! - **Static markers** (the application asked for XrSpatialMarkerStaticOptimizationEXT) are
 //!   averaged over the latest second, since they do not move and detections jitter.
 
-use alvr_marker_ipc::{Pose, Snapshot, TrackingConfig};
+use alvr_marker_ipc::{Payload, Pose, Snapshot, TrackingConfig};
 use std::collections::{HashMap, VecDeque};
 
 const SECOND_NS: i64 = 1_000_000_000;
@@ -30,7 +30,7 @@ struct TrackerHistory {
     config: TrackingConfig,
     latest_time_ns: i64,
     /// The markers of the latest update: id and text.
-    seen: Vec<(u64, String)>,
+    seen: Vec<(u64, Payload)>,
     samples: HashMap<u64, VecDeque<Sample>>,
 }
 
@@ -96,7 +96,7 @@ impl MarkerHistory {
             tracker.seen = stream
                 .markers
                 .iter()
-                .map(|marker| (marker.id, marker.text.clone()))
+                .map(|marker| (marker.id, marker.payload.clone()))
                 .collect();
 
             for marker in &stream.markers {
@@ -131,7 +131,7 @@ impl MarkerHistory {
     }
 
     /// The markers the tracker of `config` currently sees: id and text.
-    pub fn seen(&self, config: TrackingConfig, now_ns: i64) -> Vec<(u64, String)> {
+    pub fn seen(&self, config: TrackingConfig, now_ns: i64) -> Vec<(u64, Payload)> {
         self.tracker(config, now_ns)
             .map(|tracker| tracker.seen.clone())
             .unwrap_or_default()

@@ -1,8 +1,11 @@
 //! XR_EXT_spatial_entity with the QR code capability of XR_EXT_spatial_marker_tracking, and the
 //! parts of XR_EXT_future they use.
 //!
-//! Every QR code the headset sees is an entity with the marker and 2D bounds components. Its
-//! entity id comes from its text, so it stays the same across snapshots, contexts and sessions.
+//! Every QR code the headset sees is an entity with the marker and 2D bounds components. A context
+//! gives a code an entity id the first time it discovers it, and keeps it for the code's data, so
+//! it stays the same across the context's snapshots; as the extension requires, no two contexts
+//! share an id. Buffer ids come from the code's data, so they are the same in every snapshot.
+//! Codes the headset has not decoded yet are not reported.
 //! Asynchronous operations complete immediately: their futures are ready as soon as they exist.
 //!
 //! Each spatial context gets its codes from the headset tracker with its marker options, as far as
@@ -14,10 +17,10 @@ use crate::{
     history::{At, Located},
     log, math, state, void_fn,
 };
-use alvr_marker_ipc::{TrackingConfig, now_ns, performance_counter_to_ns};
+use alvr_marker_ipc::{Payload, TrackingConfig, now_ns, performance_counter_to_ns};
 use openxr_sys::{self as xr, Handle, pfn};
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     ffi::{CStr, c_char, c_void},
     mem, ptr, slice,
 };
@@ -25,6 +28,14 @@ use std::{
 const QR_COMPONENTS: [xr::SpatialComponentTypeEXT; 2] = [
     xr::SpatialComponentTypeEXT::MARKER,
     xr::SpatialComponentTypeEXT::BOUNDED_2D,
+];
+/// The component types defined by the extensions the layer implements. Others are invalid values.
+const KNOWN_COMPONENTS: [xr::SpatialComponentTypeEXT; 5] = [
+    xr::SpatialComponentTypeEXT::BOUNDED_2D,
+    xr::SpatialComponentTypeEXT::BOUNDED_3D,
+    xr::SpatialComponentTypeEXT::PARENT,
+    xr::SpatialComponentTypeEXT::MESH_3D,
+    xr::SpatialComponentTypeEXT::MARKER,
 ];
 const QR_FEATURES: [xr::SpatialCapabilityFeatureEXT; 2] = [
     xr::SpatialCapabilityFeatureEXT::MARKER_TRACKING_FIXED_SIZE_MARKERS,
@@ -43,27 +54,32 @@ pub(crate) struct ContextData {
     components: Vec<xr::SpatialComponentTypeEXT>,
     /// The marker options the application asked for.
     config: TrackingConfig,
-    /// Entities seen in this context's discovery snapshots, which may be created from their ids.
-    discovered: HashSet<u64>,
+    /// The entity ids of the codes this context discovered, by marker id: the ones entities may be
+    /// created from.
+    entity_ids: HashMap<u64, u64>,
     /// The marker ids the last discovery recommendation was sent for.
     announced: Option<Vec<u64>>,
 }
 
 pub(crate) struct SnapshotData {
     context: u64,
+    /// The components whose data the snapshot has, which every entity in it has.
+    components: Vec<xr::SpatialComponentTypeEXT>,
     entities: Vec<SnapshotEntity>,
 }
 
 struct SnapshotEntity {
     id: u64,
+    /// The marker id, also the id of the buffer with the code's data.
+    marker: u64,
     state: xr::SpatialEntityTrackingStateEXT,
     bounds: xr::SpatialBounded2DDataEXT,
-    text: String,
+    payload: Option<Payload>,
 }
 
 pub(crate) struct EntityData {
     context: u64,
-    id: u64,
+    marker: u64,
 }
 
 pub(crate) struct FutureData {
@@ -72,8 +88,15 @@ pub(crate) struct FutureData {
 }
 
 enum FutureKind {
-    Context { session: u64, context: ContextData },
-    Discovery { context: u64 },
+    Context {
+        session: u64,
+        context: ContextData,
+    },
+    Discovery {
+        context: u64,
+        components: Vec<xr::SpatialComponentTypeEXT>,
+        tracking_state: Option<xr::SpatialEntityTrackingStateEXT>,
+    },
 }
 
 pub(crate) fn function(name: &CStr) -> Option<pfn::VoidFunction> {
@@ -144,7 +167,7 @@ pub(crate) fn function(name: &CStr) -> Option<pfn::VoidFunction> {
         b"xrGetSpatialBufferVector3fEXT" => {
             void_fn!(get_buffer_vector3f, pfn::GetSpatialBufferVector3fEXT)
         }
-        _ => return future_function(name),
+        _ => return None,
     })
 }
 
@@ -183,12 +206,67 @@ unsafe fn write_array<T: Copy>(
     xr::Result::SUCCESS
 }
 
-unsafe fn read_array<'a, T>(items: *const T, count: u32) -> &'a [T] {
-    if count == 0 || items.is_null() {
-        &[]
+unsafe fn read_array<'a, T>(items: *const T, count: u32) -> Result<&'a [T], xr::Result> {
+    if count == 0 {
+        Ok(&[])
+    } else if items.is_null() {
+        Err(xr::Result::ERROR_VALIDATION_FAILURE)
     } else {
-        unsafe { slice::from_raw_parts(items, count as usize) }
+        Ok(unsafe { slice::from_raw_parts(items, count as usize) })
     }
+}
+
+/// Component types to filter by: valid values, all enabled in the context.
+unsafe fn read_component_filter<'a>(
+    context: &ContextData,
+    items: *const xr::SpatialComponentTypeEXT,
+    count: u32,
+) -> Result<&'a [xr::SpatialComponentTypeEXT], xr::Result> {
+    let components = unsafe { read_array(items, count) }?;
+    if !components
+        .iter()
+        .all(|component| KNOWN_COMPONENTS.contains(component))
+    {
+        return Err(xr::Result::ERROR_VALIDATION_FAILURE);
+    }
+    if !components
+        .iter()
+        .all(|component| context.components.contains(component))
+    {
+        return Err(xr::Result::ERROR_SPATIAL_COMPONENT_NOT_ENABLED_EXT);
+    }
+
+    Ok(components)
+}
+
+/// The tracking state an `XrSpatialFilterTrackingStateEXT` in the chain filters by.
+unsafe fn tracking_state_filter(
+    next: *const c_void,
+) -> Result<Option<xr::SpatialEntityTrackingStateEXT>, xr::Result> {
+    let mut filter = None;
+    for (ty, structure) in unsafe { chain(next) } {
+        if ty == xr::SpatialFilterTrackingStateEXT::TYPE {
+            let state =
+                unsafe { (*structure.cast::<xr::SpatialFilterTrackingStateEXT>()).tracking_state };
+            if ![
+                xr::SpatialEntityTrackingStateEXT::STOPPED,
+                xr::SpatialEntityTrackingStateEXT::TRACKING,
+                xr::SpatialEntityTrackingStateEXT::PAUSED,
+            ]
+            .contains(&state)
+            {
+                return Err(xr::Result::ERROR_VALIDATION_FAILURE);
+            }
+            filter = Some(state);
+        }
+    }
+
+    Ok(filter)
+}
+
+/// Futures and handles of the layer have this in their upper half.
+fn is_layer_handle(handle: u64) -> bool {
+    handle >> 32 == crate::HANDLE_PREFIX >> 32
 }
 
 /// The structures chained to `next`, as (type, pointer) pairs.
@@ -208,11 +286,16 @@ impl State {
         self.instances.get(&instance).map(|data| data.downstream)
     }
 
-    /// Whether the headset tracks QR codes, as far as the driver knows.
-    fn qr_codes_available(&mut self) -> bool {
-        self.markers
-            .refresh()
-            .is_some_and(|capabilities| capabilities.qr_codes)
+    /// Whether the application enabled QR codes on the instance and the headset tracks them, as
+    /// far as the driver knows.
+    fn qr_codes_available(&mut self, instance: u64) -> bool {
+        self.instances
+            .get(&instance)
+            .is_some_and(|data| data.marker_tracking_enabled)
+            && self
+                .markers
+                .refresh()
+                .is_some_and(|capabilities| capabilities.qr_codes)
     }
 
     /// Tells the driver the marker options of the application's spatial contexts, also the ones
@@ -235,12 +318,13 @@ impl State {
         self.markers.refresh();
     }
 
-    /// The codes the context's tracker sees: their ids and texts, and where they are at `time`.
+    /// The codes the context's tracker sees: their marker ids and data, and where they are at
+    /// `time`.
     fn context_markers(
         &mut self,
         context: u64,
         time: xr::Time,
-    ) -> Vec<(u64, String, Option<Located>)> {
+    ) -> Vec<(u64, Payload, Option<Located>)> {
         let Some(capabilities) = self.markers.refresh() else {
             return Vec::new();
         };
@@ -260,9 +344,9 @@ impl State {
         history
             .seen(tracker, now)
             .into_iter()
-            .map(|(id, text)| {
+            .map(|(id, payload)| {
                 let located = history.locate(tracker, id, at, now);
-                (id, text, located)
+                (id, payload, located)
             })
             .collect()
     }
@@ -277,16 +361,15 @@ impl State {
     }
 
     fn check_instance(&self, instance: xr::Instance, system: xr::SystemId) -> xr::Result {
-        if !self
-            .instances
-            .get(&instance.into_raw())
-            .is_some_and(|data| data.provides_spatial)
-        {
-            xr::Result::ERROR_HANDLE_INVALID
-        } else if system == xr::SystemId::NULL {
-            xr::Result::ERROR_SYSTEM_INVALID
-        } else {
-            xr::Result::SUCCESS
+        match self.instances.get(&instance.into_raw()) {
+            Some(data) if data.provides_spatial => {
+                if data.systems.contains(&system.into_raw()) {
+                    xr::Result::SUCCESS
+                } else {
+                    xr::Result::ERROR_SYSTEM_INVALID
+                }
+            }
+            _ => xr::Result::ERROR_HANDLE_INVALID,
         }
     }
 
@@ -318,7 +401,7 @@ impl State {
             .retain(|_, snapshot| snapshot.context != context);
         self.entities.retain(|_, entity| entity.context != context);
         self.futures.retain(|_, future| {
-            !matches!(future.kind, FutureKind::Discovery { context: c } if c == context)
+            !matches!(future.kind, FutureKind::Discovery { context: c, .. } if c == context)
         });
 
         true
@@ -385,17 +468,19 @@ impl State {
 
     fn snapshot_entity(
         context: &ContextData,
-        id: u64,
-        text: String,
+        marker: u64,
+        payload: Payload,
         located: Option<Located>,
         stage: Option<xr::Posef>,
     ) -> SnapshotEntity {
+        let id = context.entity_ids[&marker];
         let (Some(located), Some(stage)) = (located, stage) else {
             return SnapshotEntity {
                 id,
+                marker,
                 state: xr::SpatialEntityTrackingStateEXT::PAUSED,
                 bounds: xr::SpatialBounded2DDataEXT::default(),
-                text,
+                payload: None,
             };
         };
 
@@ -414,6 +499,7 @@ impl State {
 
         SnapshotEntity {
             id,
+            marker,
             state: xr::SpatialEntityTrackingStateEXT::TRACKING,
             bounds: xr::SpatialBounded2DDataEXT {
                 center: math::compose(stage, pose),
@@ -422,7 +508,7 @@ impl State {
                     height: size,
                 },
             },
-            text,
+            payload: Some(payload),
         }
     }
 
@@ -539,25 +625,31 @@ unsafe extern "system" fn poll_future(
     info: *const xr::FuturePollInfoEXT,
     result: *mut xr::FuturePollResultEXT,
 ) -> xr::Result {
-    if info.is_null() || result.is_null() {
+    if info.is_null()
+        || result.is_null()
+        || unsafe { (*info).ty } != xr::FuturePollInfoEXT::TYPE
+        || unsafe { (*result).ty } != xr::FuturePollResultEXT::TYPE
+    {
         return xr::Result::ERROR_VALIDATION_FAILURE;
     }
     let future = unsafe { (*info).future }.into_raw();
 
     let state = state();
-    if state
-        .futures
-        .get(&future)
-        .is_some_and(|data| data.instance == instance.into_raw())
-    {
-        unsafe { (*result).state = xr::FutureStateEXT::READY };
-        return xr::Result::SUCCESS;
+    let Some(downstream) = state.downstream(instance.into_raw()) else {
+        return xr::Result::ERROR_HANDLE_INVALID;
+    };
+    if is_layer_handle(future) {
+        return match state.futures.get(&future) {
+            Some(data) if data.instance == instance.into_raw() => {
+                unsafe { (*result).state = xr::FutureStateEXT::READY };
+                xr::Result::SUCCESS
+            }
+            // Completed, cancelled, or of another instance
+            _ => xr::Result::ERROR_FUTURE_INVALID_EXT,
+        };
     }
 
-    match state
-        .downstream(instance.into_raw())
-        .and_then(|downstream| downstream.poll_future)
-    {
+    match downstream.poll_future {
         Some(poll_future) => {
             drop(state);
             unsafe { poll_future(instance, info, result) }
@@ -570,26 +662,27 @@ unsafe extern "system" fn cancel_future(
     instance: xr::Instance,
     info: *const xr::FutureCancelInfoEXT,
 ) -> xr::Result {
-    if info.is_null() {
+    if info.is_null() || unsafe { (*info).ty } != xr::FutureCancelInfoEXT::TYPE {
         return xr::Result::ERROR_VALIDATION_FAILURE;
     }
     let future = unsafe { (*info).future }.into_raw();
 
     let mut state = state();
-    if state
-        .futures
-        .get(&future)
-        .is_some_and(|data| data.instance == instance.into_raw())
-    {
-        state.futures.remove(&future);
-        state.sync_requests();
-        return xr::Result::SUCCESS;
+    let Some(downstream) = state.downstream(instance.into_raw()) else {
+        return xr::Result::ERROR_HANDLE_INVALID;
+    };
+    if is_layer_handle(future) {
+        return match state.futures.get(&future) {
+            Some(data) if data.instance == instance.into_raw() => {
+                state.futures.remove(&future);
+                state.sync_requests();
+                xr::Result::SUCCESS
+            }
+            _ => xr::Result::ERROR_FUTURE_INVALID_EXT,
+        };
     }
 
-    match state
-        .downstream(instance.into_raw())
-        .and_then(|downstream| downstream.cancel_future)
-    {
+    match downstream.cancel_future {
         Some(cancel_future) => {
             drop(state);
             unsafe { cancel_future(instance, info) }
@@ -611,7 +704,7 @@ unsafe extern "system" fn enumerate_capabilities(
         return result;
     }
 
-    let available: &[_] = if state.qr_codes_available() {
+    let available: &[_] = if state.qr_codes_available(instance.into_raw()) {
         &[xr::SpatialCapabilityEXT::MARKER_TRACKING_QR_CODE]
     } else {
         &[]
@@ -637,7 +730,7 @@ unsafe extern "system" fn enumerate_capability_component_types(
         return xr::Result::ERROR_VALIDATION_FAILURE;
     }
     if capability != xr::SpatialCapabilityEXT::MARKER_TRACKING_QR_CODE
-        || !state.qr_codes_available()
+        || !state.qr_codes_available(instance.into_raw())
     {
         return xr::Result::ERROR_SPATIAL_CAPABILITY_UNSUPPORTED_EXT;
     }
@@ -667,7 +760,7 @@ unsafe extern "system" fn enumerate_capability_features(
         return result;
     }
     if capability != xr::SpatialCapabilityEXT::MARKER_TRACKING_QR_CODE
-        || !state.qr_codes_available()
+        || !state.qr_codes_available(instance.into_raw())
     {
         return xr::Result::ERROR_SPATIAL_CAPABILITY_UNSUPPORTED_EXT;
     }
@@ -680,23 +773,30 @@ unsafe fn context_config(
     session: u64,
     info: &xr::SpatialContextCreateInfoEXT,
 ) -> Result<ContextData, xr::Result> {
-    let configs = unsafe { read_array(info.capability_configs, info.capability_config_count) };
+    let configs = unsafe { read_array(info.capability_configs, info.capability_config_count) }?;
+    // A context needs at least one capability
     if configs.is_empty() {
-        return Err(xr::Result::ERROR_VALIDATION_FAILURE);
+        return Err(xr::Result::ERROR_SPATIAL_CAPABILITY_CONFIGURATION_INVALID_EXT);
     }
 
     let mut context = ContextData {
         session,
         components: Vec::new(),
         config: TrackingConfig::default(),
-        discovered: HashSet::new(),
+        entity_ids: HashMap::new(),
         announced: None,
     };
+    let mut capabilities = Vec::new();
     for &config in configs {
         if config.is_null() {
             return Err(xr::Result::ERROR_VALIDATION_FAILURE);
         }
         let config = unsafe { &*config };
+
+        if capabilities.contains(&config.capability) {
+            return Err(xr::Result::ERROR_SPATIAL_CAPABILITY_CONFIGURATION_INVALID_EXT);
+        }
+        capabilities.push(config.capability);
 
         if config.capability != xr::SpatialCapabilityEXT::MARKER_TRACKING_QR_CODE {
             return Err(xr::Result::ERROR_SPATIAL_CAPABILITY_UNSUPPORTED_EXT);
@@ -706,11 +806,15 @@ unsafe fn context_config(
         }
 
         let components =
-            unsafe { read_array(config.enabled_components, config.enabled_component_count) };
+            unsafe { read_array(config.enabled_components, config.enabled_component_count) }?;
+        // A capability configuration needs at least one component
         if components.is_empty() {
-            return Err(xr::Result::ERROR_VALIDATION_FAILURE);
+            return Err(xr::Result::ERROR_SPATIAL_CAPABILITY_CONFIGURATION_INVALID_EXT);
         }
         for component in components {
+            if !KNOWN_COMPONENTS.contains(component) {
+                return Err(xr::Result::ERROR_VALIDATION_FAILURE);
+            }
             if !QR_COMPONENTS.contains(component) {
                 return Err(xr::Result::ERROR_SPATIAL_COMPONENT_UNSUPPORTED_FOR_CAPABILITY_EXT);
             }
@@ -759,13 +863,13 @@ unsafe extern "system" fn create_context_async(
     else {
         return xr::Result::ERROR_HANDLE_INVALID;
     };
-    if !state.qr_codes_available() {
-        return xr::Result::ERROR_SPATIAL_CAPABILITY_UNSUPPORTED_EXT;
-    }
     let context = match unsafe { context_config(session.into_raw(), &*info) } {
         Ok(context) => context,
         Err(result) => return result,
     };
+    if !state.qr_codes_available(instance) {
+        return xr::Result::ERROR_SPATIAL_CAPABILITY_UNSUPPORTED_EXT;
+    }
 
     let handle = state.new_handle();
     state.futures.insert(
@@ -804,7 +908,11 @@ unsafe extern "system" fn create_context_complete(
         Some(FutureData {
             kind: FutureKind::Context { session: s, .. },
             ..
-        }) if *s == session.into_raw() => {
+        }) => {
+            // The completion must be called with the handle the operation was started on
+            if *s != session.into_raw() {
+                return xr::Result::ERROR_HANDLE_INVALID;
+            }
             let Some(FutureData {
                 kind: FutureKind::Context { context, .. },
                 ..
@@ -842,21 +950,6 @@ unsafe extern "system" fn destroy_context(context: xr::SpatialContextEXT) -> xr:
     }
 }
 
-/// Checks that the context has every requested component enabled.
-fn check_components(
-    context: &ContextData,
-    components: &[xr::SpatialComponentTypeEXT],
-) -> xr::Result {
-    if components
-        .iter()
-        .all(|component| context.components.contains(component))
-    {
-        xr::Result::SUCCESS
-    } else {
-        xr::Result::ERROR_SPATIAL_COMPONENT_NOT_ENABLED_EXT
-    }
-}
-
 unsafe extern "system" fn create_discovery_snapshot_async(
     context: xr::SpatialContextEXT,
     info: *const xr::SpatialDiscoverySnapshotCreateInfoEXT,
@@ -873,12 +966,23 @@ unsafe extern "system" fn create_discovery_snapshot_async(
     let Some(context_data) = state.contexts.get(&context.into_raw()) else {
         return xr::Result::ERROR_HANDLE_INVALID;
     };
-    // Every QR code has every component, so the requested ones do not filter entities
-    let components = unsafe { read_array((*info).component_types, (*info).component_type_count) };
-    let result = check_components(context_data, components);
-    if result != xr::Result::SUCCESS {
-        return result;
-    }
+    let info = unsafe { &*info };
+    let components = match unsafe {
+        read_component_filter(
+            context_data,
+            info.component_types,
+            info.component_type_count,
+        )
+    } {
+        // Every QR code has every component, so none is left out for having none of these
+        Ok([]) => context_data.components.clone(),
+        Ok(components) => components.to_vec(),
+        Err(result) => return result,
+    };
+    let tracking_state = match unsafe { tracking_state_filter(info.next) } {
+        Ok(filter) => filter,
+        Err(result) => return result,
+    };
     let instance = state.sessions[&context_data.session].instance;
 
     let handle = state.new_handle();
@@ -888,6 +992,8 @@ unsafe extern "system" fn create_discovery_snapshot_async(
             instance,
             kind: FutureKind::Discovery {
                 context: context.into_raw(),
+                components,
+                tracking_state,
             },
         },
     );
@@ -921,27 +1027,59 @@ unsafe extern "system" fn create_discovery_snapshot_complete(
     else {
         return xr::Result::ERROR_HANDLE_INVALID;
     };
-    if !matches!(
-        state.futures.get(&info.future.into_raw()),
-        Some(FutureData { kind: FutureKind::Discovery { context: c }, .. }) if *c == context.into_raw()
-    ) {
-        return xr::Result::ERROR_FUTURE_INVALID_EXT;
+    match state.futures.get(&info.future.into_raw()) {
+        Some(FutureData {
+            kind: FutureKind::Discovery { context: c, .. },
+            ..
+        }) => {
+            // The completion must be called with the handle the operation was started on
+            if *c != context.into_raw() {
+                return xr::Result::ERROR_HANDLE_INVALID;
+            }
+        }
+        _ => return xr::Result::ERROR_FUTURE_INVALID_EXT,
     }
 
     let stage = match state.locate_stage(session, info.base_space, info.time) {
         Ok(stage) => stage,
         Err(result) => return result,
     };
-    state.futures.remove(&info.future.into_raw());
+    let Some(FutureData {
+        kind:
+            FutureKind::Discovery {
+                components,
+                tracking_state,
+                ..
+            },
+        ..
+    }) = state.futures.remove(&info.future.into_raw())
+    else {
+        unreachable!()
+    };
 
     let markers = state.context_markers(context.into_raw(), info.time);
-    let context_data = state.contexts.get_mut(&context.into_raw()).unwrap();
+    // Codes discovered for the first time get their entity ids
+    for (marker, ..) in &markers {
+        if !state.contexts[&context.into_raw()]
+            .entity_ids
+            .contains_key(marker)
+        {
+            let id = state.new_handle();
+            state
+                .contexts
+                .get_mut(&context.into_raw())
+                .unwrap()
+                .entity_ids
+                .insert(*marker, id);
+        }
+    }
+    let context_data = &state.contexts[&context.into_raw()];
     let entities = markers
         .into_iter()
-        .map(|(id, text, located)| {
-            context_data.discovered.insert(id);
-            State::snapshot_entity(context_data, id, text, located, stage)
+        .map(|(marker, payload, located)| {
+            State::snapshot_entity(context_data, marker, payload, located, stage)
         })
+        .filter(|entity| tracking_state.is_none_or(|state| entity.state == state))
         .collect();
 
     let handle = state.new_handle();
@@ -949,6 +1087,7 @@ unsafe extern "system" fn create_discovery_snapshot_complete(
         handle,
         SnapshotData {
             context: context.into_raw(),
+            components,
             entities,
         },
     );
@@ -981,21 +1120,27 @@ unsafe extern "system" fn create_update_snapshot(
     let Some(context_data) = state.contexts.get(&context.into_raw()) else {
         return xr::Result::ERROR_HANDLE_INVALID;
     };
-    let components = unsafe { read_array(info.component_types, info.component_type_count) };
-    let result = check_components(context_data, components);
-    if result != xr::Result::SUCCESS {
-        return result;
-    }
+    let components = match unsafe {
+        read_component_filter(
+            context_data,
+            info.component_types,
+            info.component_type_count,
+        )
+    } {
+        Ok([]) => context_data.components.clone(),
+        Ok(components) => components.to_vec(),
+        Err(result) => return result,
+    };
     let session = context_data.session;
 
-    let entity_handles = unsafe { read_array(info.entities, info.entity_count) };
-    if entity_handles.is_empty() {
-        return xr::Result::ERROR_VALIDATION_FAILURE;
-    }
-    let mut ids = Vec::with_capacity(entity_handles.len());
+    let entity_handles = match unsafe { read_array(info.entities, info.entity_count) } {
+        Ok([]) | Err(_) => return xr::Result::ERROR_VALIDATION_FAILURE,
+        Ok(handles) => handles,
+    };
+    let mut markers = Vec::with_capacity(entity_handles.len());
     for entity in entity_handles {
         match state.entities.get(&entity.into_raw()) {
-            Some(data) if data.context == context.into_raw() => ids.push(data.id),
+            Some(data) if data.context == context.into_raw() => markers.push(data.marker),
             _ => return xr::Result::ERROR_HANDLE_INVALID,
         }
     }
@@ -1005,25 +1150,27 @@ unsafe extern "system" fn create_update_snapshot(
         Err(result) => return result,
     };
 
-    let mut markers = state.context_markers(context.into_raw(), info.time);
+    let seen = state
+        .context_markers(context.into_raw(), info.time)
+        .into_iter()
+        .map(|(marker, payload, located)| (marker, (payload, located)))
+        .collect::<HashMap<_, _>>();
     let context_data = &state.contexts[&context.into_raw()];
-    let entities = ids
+    let entities = markers
         .iter()
-        .map(
-            |&id| match markers.iter().position(|marker| marker.0 == id) {
-                Some(index) => {
-                    let (id, text, located) = markers.swap_remove(index);
-                    State::snapshot_entity(context_data, id, text, located, stage)
-                }
-                // Out of the headset's sight, or the headset is not connected: it may come back
-                None => SnapshotEntity {
-                    id,
-                    state: xr::SpatialEntityTrackingStateEXT::PAUSED,
-                    bounds: xr::SpatialBounded2DDataEXT::default(),
-                    text: String::new(),
-                },
+        .map(|&marker| match seen.get(&marker) {
+            Some((payload, located)) => {
+                State::snapshot_entity(context_data, marker, payload.clone(), *located, stage)
+            }
+            // Out of the headset's sight, or the headset is not connected: it may come back
+            None => SnapshotEntity {
+                id: context_data.entity_ids[&marker],
+                marker,
+                state: xr::SpatialEntityTrackingStateEXT::PAUSED,
+                bounds: xr::SpatialBounded2DDataEXT::default(),
+                payload: None,
             },
-        )
+        })
         .collect();
 
     let handle = state.new_handle();
@@ -1031,12 +1178,59 @@ unsafe extern "system" fn create_update_snapshot(
         handle,
         SnapshotData {
             context: context.into_raw(),
+            components,
             entities,
         },
     );
     unsafe { *snapshot = xr::SpatialSnapshotEXT::from_raw(handle) };
 
     xr::Result::SUCCESS
+}
+
+/// The component whose data a list structure in the chain of a query result is for, and the
+/// list's element count and array. `None` for structures that are not component lists.
+unsafe fn component_list(
+    ty: xr::StructureType,
+    structure: *const c_void,
+) -> Option<(xr::SpatialComponentTypeEXT, u32, *const c_void)> {
+    Some(if ty == xr::SpatialComponentBounded2DListEXT::TYPE {
+        let list = unsafe { &*structure.cast::<xr::SpatialComponentBounded2DListEXT>() };
+        (
+            xr::SpatialComponentTypeEXT::BOUNDED_2D,
+            list.bound_count,
+            list.bounds.cast(),
+        )
+    } else if ty == xr::SpatialComponentMarkerListEXT::TYPE {
+        let list = unsafe { &*structure.cast::<xr::SpatialComponentMarkerListEXT>() };
+        (
+            xr::SpatialComponentTypeEXT::MARKER,
+            list.marker_count,
+            list.markers.cast(),
+        )
+    } else if ty == xr::SpatialComponentBounded3DListEXT::TYPE {
+        let list = unsafe { &*structure.cast::<xr::SpatialComponentBounded3DListEXT>() };
+        (
+            xr::SpatialComponentTypeEXT::BOUNDED_3D,
+            list.bound_count,
+            list.bounds.cast(),
+        )
+    } else if ty == xr::SpatialComponentParentListEXT::TYPE {
+        let list = unsafe { &*structure.cast::<xr::SpatialComponentParentListEXT>() };
+        (
+            xr::SpatialComponentTypeEXT::PARENT,
+            list.parent_count,
+            list.parents.cast(),
+        )
+    } else if ty == xr::SpatialComponentMesh3DListEXT::TYPE {
+        let list = unsafe { &*structure.cast::<xr::SpatialComponentMesh3DListEXT>() };
+        (
+            xr::SpatialComponentTypeEXT::MESH_3D,
+            list.mesh_count,
+            list.meshes.cast(),
+        )
+    } else {
+        return None;
+    })
 }
 
 unsafe extern "system" fn query_component_data(
@@ -1057,26 +1251,49 @@ unsafe extern "system" fn query_component_data(
     let Some(snapshot_data) = state.snapshots.get(&snapshot.into_raw()) else {
         return xr::Result::ERROR_HANDLE_INVALID;
     };
-    let context = &state.contexts[&snapshot_data.context];
     let components =
-        unsafe { read_array(condition.component_types, condition.component_type_count) };
-    let check = check_components(context, components);
-    if check != xr::Result::SUCCESS {
-        return check;
+        match unsafe { read_array(condition.component_types, condition.component_type_count) } {
+            Ok(components) => components,
+            Err(result) => return result,
+        };
+    if !components
+        .iter()
+        .all(|component| KNOWN_COMPONENTS.contains(component))
+    {
+        return xr::Result::ERROR_VALIDATION_FAILURE;
     }
+    let tracking_state = match unsafe { tracking_state_filter(condition.next) } {
+        Ok(filter) => filter,
+        Err(result) => return result,
+    };
 
-    let mut tracking_state = None;
-    for (ty, structure) in unsafe { chain(condition.next) } {
-        if ty == xr::SpatialFilterTrackingStateEXT::TYPE {
-            tracking_state = Some(unsafe {
-                (*structure.cast::<xr::SpatialFilterTrackingStateEXT>()).tracking_state
-            });
+    // Lists only for the components of the condition. Without any in the condition, for the ones
+    // the snapshot has: the entities it returns have those.
+    let lists = unsafe { chain(result.next) }
+        .into_iter()
+        .filter_map(|(ty, structure)| {
+            unsafe { component_list(ty, structure) }.map(|list| (ty, structure, list))
+        })
+        .collect::<Vec<_>>();
+    for &(_, _, (component, ..)) in &lists {
+        let allowed = if components.is_empty() {
+            &snapshot_data.components
+        } else {
+            components
+        };
+        if !allowed.contains(&component) {
+            return xr::Result::ERROR_VALIDATION_FAILURE;
         }
     }
+
+    // Every entity in the snapshot has the snapshot's components, and only those
+    let has_components = components
+        .iter()
+        .all(|component| snapshot_data.components.contains(component));
     let entities = snapshot_data
         .entities
         .iter()
-        .filter(|entity| tracking_state.is_none_or(|state| entity.state == state))
+        .filter(|entity| has_components && tracking_state.is_none_or(|state| entity.state == state))
         .collect::<Vec<_>>();
     let count = entities.len() as u32;
 
@@ -1095,32 +1312,12 @@ unsafe extern "system" fn query_component_data(
     {
         return xr::Result::ERROR_VALIDATION_FAILURE;
     }
-
     // Check every component list before writing anything
-    let lists = unsafe { chain(result.next) };
-    for &(ty, structure) in &lists {
-        let (component, list_count, list_ptr) = if ty == xr::SpatialComponentBounded2DListEXT::TYPE
-        {
-            let list = unsafe { &*structure.cast::<xr::SpatialComponentBounded2DListEXT>() };
-            (
-                xr::SpatialComponentTypeEXT::BOUNDED_2D,
-                list.bound_count,
-                list.bounds.cast::<c_void>(),
-            )
-        } else if ty == xr::SpatialComponentMarkerListEXT::TYPE {
-            let list = unsafe { &*structure.cast::<xr::SpatialComponentMarkerListEXT>() };
-            (
-                xr::SpatialComponentTypeEXT::MARKER,
-                list.marker_count,
-                list.markers.cast::<c_void>(),
-            )
-        } else {
-            continue;
-        };
-        if !context.components.contains(&component) {
-            return xr::Result::ERROR_SPATIAL_COMPONENT_NOT_ENABLED_EXT;
+    for &(_, _, (_, list_count, list_ptr)) in &lists {
+        if list_count < count {
+            return xr::Result::ERROR_SIZE_INSUFFICIENT;
         }
-        if list_count != count || (count > 0 && list_ptr.is_null()) {
+        if count > 0 && list_ptr.is_null() {
             return xr::Result::ERROR_VALIDATION_FAILURE;
         }
     }
@@ -1133,12 +1330,18 @@ unsafe extern "system" fn query_component_data(
             }
         }
     }
-    for (ty, structure) in lists {
+    // Lists of components no QR code has are only allowed when no entity has them, so nothing is
+    // written to them
+    for (ty, structure, _) in lists {
         for (i, entity) in entities.iter().enumerate() {
             // Component data is only valid for tracked entities
-            if entity.state != xr::SpatialEntityTrackingStateEXT::TRACKING {
+            let Some(payload) = entity
+                .payload
+                .as_ref()
+                .filter(|_| entity.state == xr::SpatialEntityTrackingStateEXT::TRACKING)
+            else {
                 continue;
-            }
+            };
 
             if ty == xr::SpatialComponentBounded2DListEXT::TYPE {
                 let list = unsafe { &*structure.cast::<xr::SpatialComponentBounded2DListEXT>() };
@@ -1151,9 +1354,11 @@ unsafe extern "system" fn query_component_data(
                         // Only ArUco markers and AprilTags have a numeric id
                         marker_id: 0,
                         data: xr::SpatialBufferEXT {
-                            // The buffer of a QR code is its text, identified by its entity
-                            buffer_id: xr::SpatialBufferIdEXT::from_raw(entity.id),
-                            buffer_type: xr::SpatialBufferTypeEXT::STRING,
+                            buffer_id: xr::SpatialBufferIdEXT::from_raw(entity.marker),
+                            buffer_type: match payload {
+                                Payload::Text(_) => xr::SpatialBufferTypeEXT::STRING,
+                                Payload::Bytes(_) => xr::SpatialBufferTypeEXT::UINT8,
+                            },
                         },
                     }
                 };
@@ -1189,16 +1394,22 @@ unsafe extern "system" fn create_entity_from_id(
     let Some(context_data) = state.contexts.get(&context.into_raw()) else {
         return xr::Result::ERROR_HANDLE_INVALID;
     };
-    if !context_data.discovered.contains(&id) {
+    // Only ids this context discovered
+    let Some(marker) = context_data
+        .entity_ids
+        .iter()
+        .find(|&(_, &entity_id)| entity_id == id)
+        .map(|(&marker, _)| marker)
+    else {
         return xr::Result::ERROR_SPATIAL_ENTITY_ID_INVALID_EXT;
-    }
+    };
 
     let handle = state.new_handle();
     state.entities.insert(
         handle,
         EntityData {
             context: context.into_raw(),
-            id,
+            marker,
         },
     );
     unsafe { *entity = xr::SpatialEntityEXT::from_raw(handle) };
@@ -1214,12 +1425,12 @@ unsafe extern "system" fn destroy_entity(entity: xr::SpatialEntityEXT) -> xr::Re
     }
 }
 
-/// The text of the QR code whose buffer `info` names.
-fn buffer_text(
+/// The data of the QR code whose buffer `info` names.
+fn buffer_payload(
     state: &State,
     snapshot: xr::SpatialSnapshotEXT,
     info: *const xr::SpatialBufferGetInfoEXT,
-) -> Result<String, xr::Result> {
+) -> Result<Payload, xr::Result> {
     if info.is_null() || unsafe { (*info).ty } != xr::SpatialBufferGetInfoEXT::TYPE {
         return Err(xr::Result::ERROR_VALIDATION_FAILURE);
     }
@@ -1229,13 +1440,20 @@ fn buffer_text(
         .snapshots
         .get(&snapshot.into_raw())
         .ok_or(xr::Result::ERROR_HANDLE_INVALID)?;
+    // Only snapshots with the marker component have the codes' data
+    if !snapshot
+        .components
+        .contains(&xr::SpatialComponentTypeEXT::MARKER)
+    {
+        return Err(xr::Result::ERROR_SPATIAL_BUFFER_ID_INVALID_EXT);
+    }
     snapshot
         .entities
         .iter()
         .find(|entity| {
-            entity.id == buffer && entity.state == xr::SpatialEntityTrackingStateEXT::TRACKING
+            entity.marker == buffer && entity.state == xr::SpatialEntityTrackingStateEXT::TRACKING
         })
-        .map(|entity| entity.text.clone())
+        .and_then(|entity| entity.payload.clone())
         .ok_or(xr::Result::ERROR_SPATIAL_BUFFER_ID_INVALID_EXT)
 }
 
@@ -1246,8 +1464,10 @@ unsafe extern "system" fn get_buffer_string(
     count_output: *mut u32,
     buffer: *mut c_char,
 ) -> xr::Result {
-    let text = match buffer_text(&state(), snapshot, info) {
-        Ok(text) => text,
+    let text = match buffer_payload(&state(), snapshot, info) {
+        Ok(Payload::Text(text)) => text,
+        // A buffer of another type
+        Ok(Payload::Bytes(_)) => return xr::Result::ERROR_VALIDATION_FAILURE,
         Err(result) => return result,
     };
 
@@ -1260,7 +1480,23 @@ unsafe extern "system" fn get_buffer_string(
     unsafe { write_array(&bytes, capacity, count_output, buffer) }
 }
 
-/// The buffers of QR codes are strings, so getting one as anything else is an error.
+unsafe extern "system" fn get_buffer_uint8(
+    snapshot: xr::SpatialSnapshotEXT,
+    info: *const xr::SpatialBufferGetInfoEXT,
+    capacity: u32,
+    count_output: *mut u32,
+    buffer: *mut u8,
+) -> xr::Result {
+    let bytes = match buffer_payload(&state(), snapshot, info) {
+        Ok(Payload::Bytes(bytes)) => bytes,
+        Ok(Payload::Text(_)) => return xr::Result::ERROR_VALIDATION_FAILURE,
+        Err(result) => return result,
+    };
+
+    unsafe { write_array(&bytes, capacity, count_output, buffer) }
+}
+
+/// The buffers of QR codes are strings or bytes, so getting one as anything else is an error.
 macro_rules! typed_buffer_getter {
     ($name:ident, $ty:ty) => {
         unsafe extern "system" fn $name(
@@ -1270,14 +1506,13 @@ macro_rules! typed_buffer_getter {
             _count_output: *mut u32,
             _buffer: *mut $ty,
         ) -> xr::Result {
-            match buffer_text(&state(), snapshot, info) {
+            match buffer_payload(&state(), snapshot, info) {
                 Ok(_) => xr::Result::ERROR_VALIDATION_FAILURE,
                 Err(result) => result,
             }
         }
     };
 }
-typed_buffer_getter!(get_buffer_uint8, u8);
 typed_buffer_getter!(get_buffer_uint16, u16);
 typed_buffer_getter!(get_buffer_uint32, u32);
 typed_buffer_getter!(get_buffer_float, f32);
