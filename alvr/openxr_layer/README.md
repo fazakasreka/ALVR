@@ -19,7 +19,7 @@ app ─▶ OpenXR loader ─▶ this layer ─▶ SteamVR OpenXR runtime
 - **The headset tracks every frame.** It finds codes with a discovery every 500 ms and follows them
   with an update snapshot every frame, at the frame's display time. It runs one tracker per marker
   configuration (static or not, known size or not) that applications ask for, as far as it
-  supports the options, plus one for marker recentering.
+  supports the options, plus one for marker recentering while that is the recentering mode.
 - **The driver owns the markers.** It recenters them like the headset pose, converts their time to
   the PC's performance counter the way the headset pose's time is, and serves them on the named
   pipe `\\.\pipe\ALVR_Markers` (see `alvr/marker_ipc`): each connected layer gets the complete
@@ -57,10 +57,29 @@ go to the headset, which uses them for more precise poses when it supports them.
 them either way, as the extension requires: a context with a size gets every code at that size, and
 a context for static codes gets their poses averaged over the last second instead of predicted.
 
+**Recentering.** ALVR recenters by moving the space it submits poses to SteamVR in, which SteamVR
+does not see: to applications, all their reference spaces move without the
+`XrEventDataReferenceSpaceChangePending` a runtime must queue. So the driver counts these moves and
+sends them with the markers, and the layer queues the event for every reference space of every
+session but `VIEW`, in every application, marker extensions or not:
+
+- `changeTime` is when the driver started submitting poses in the new space.
+- `poseInPreviousSpace` is valid when the headset's own space stayed, so the move is known
+  exactly: ALVR moved the origin to a QR code (the QR code recentering mode), or the recentering
+  mode was changed while streaming. When the headset's space may have changed too (a new
+  connection, or the headset recentering), `poseValid` is false. In the Stage mode, ALVR adds no
+  recentering of its own: only those headset changes are reported.
+- A recentering that leaves the origin where it was is not reported.
+- Marker poses kept from before the move are moved with it, or forgotten when it is not known.
+
+Sessions created after a move do not get its event.
+
 **Coexistence.** The layer first creates the instance with the extensions the application asked
 for. If the runtime accepts them, it implements them itself and the layer steps aside. An
-application that enables none of the extensions talks to the runtime directly: the layer only sits
-in `xrGetInstanceProcAddr` and `xrDestroyInstance`.
+application that enables none of the extensions talks to the runtime directly, but for
+`xrCreateSession`, `xrDestroySession` and `xrPollEvent`, which report recentering, and
+`XR_KHR_win32_convert_performance_counter_time`, which the layer enables on the runtime for the
+change times.
 
 ## Conformance
 
@@ -117,7 +136,9 @@ Setting `DISABLE_XR_APILAYER_ALVR_MARKER_TRACKING` (any value) turns the layer o
   the requested time. SteamVR has it.
 - No `xrEnumerateSpatialCapabilities` result until a headset has connected, so an application that
   starts SteamVR itself may need to query again once the headset is up.
-- Reference space changes (`XrEventDataReferenceSpaceChangePending`) are not reported when ALVR
-  recenters.
+- Without `XR_KHR_win32_convert_performance_counter_time` on the runtime, recentering is not
+  reported. SteamVR has it.
+- A code moved in one jump, which only the emulator does, is predicted past where it lands for
+  about a frame, as if it kept moving.
 - The layer provides both spatial extensions together: on a runtime with `XR_EXT_spatial_entity` but
   not `XR_EXT_spatial_marker_tracking`, the runtime's own spatial entities are hidden.

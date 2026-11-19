@@ -68,9 +68,21 @@ struct MotionConfig {
     angular_velocity_cutoff: f32,
 }
 
+/// A change of the space poses are submitted to SteamVR in. Applications see their reference
+/// spaces move: SteamVR's do not change, the poses in them do.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OriginChange {
+    /// Changes so far.
+    pub count: u64,
+    /// The new origin in the space before the latest change, when known. Not when the client's own
+    /// space may have changed with it.
+    pub pose_in_previous: Option<Pose>,
+}
+
 pub struct TrackingManager {
     last_head_pose: Pose,             // client's reference space
     inverse_recentering_origin: Pose, // client's reference space
+    origin_change: OriginChange,
     device_motions_history: HashMap<u64, VecDeque<(Duration, DeviceMotion)>>,
     hand_skeletons_history: [VecDeque<(Duration, [Pose; 26])>; 2],
     max_history_size: usize,
@@ -85,6 +97,7 @@ impl TrackingManager {
         TrackingManager {
             last_head_pose: Pose::IDENTITY,
             inverse_recentering_origin: Pose::IDENTITY,
+            origin_change: OriginChange::default(),
             device_motions_history: HashMap::new(),
             hand_skeletons_history: [VecDeque::new(), VecDeque::new()],
             max_history_size,
@@ -176,21 +189,58 @@ impl TrackingManager {
         }
 
         self.marker_origin = Some(origin);
-        self.inverse_recentering_origin = origin.inverse();
+        // The client's space stayed: the origin moved by exactly this much
+        self.change_origin(origin.inverse(), true);
 
         true
     }
 
+    fn change_origin(&mut self, inverse_origin: Pose, known: bool) {
+        let previous = self.inverse_recentering_origin;
+        self.inverse_recentering_origin = inverse_origin;
+        // Nothing moved: not a change for applications
+        if known
+            && previous.position.distance(inverse_origin.position) < 1e-4
+            && previous
+                .orientation
+                .angle_between(inverse_origin.orientation)
+                < 1e-4
+        {
+            return;
+        }
+        self.origin_change = OriginChange {
+            count: self.origin_change.count + 1,
+            pose_in_previous: known.then(|| previous * inverse_origin.inverse()),
+        };
+    }
+
+    pub fn origin_change(&self) -> OriginChange {
+        self.origin_change
+    }
+
+    /// For a new connection: its origin is a change from the last one, to somewhere not known.
+    pub fn after_origin_changes(mut self, count: u64) -> Self {
+        self.origin_change = OriginChange {
+            count: count + 1,
+            pose_in_previous: None,
+        };
+        self
+    }
+
+    /// Moves the origin as `recentering_mode` puts it. `client_space_kept` is false for a new
+    /// client space, which may have moved too: then where the new origin is in the previous one is
+    /// not known.
     pub fn recenter(
         &mut self,
         recentering_mode: &RecenteringMode,
         marker_base: Option<MarkerTrackingConfig>,
+        client_space_kept: bool,
     ) {
         let recentering_mode = match recentering_mode {
             RecenteringMode::Marker { .. } => {
                 self.update_marker_origin(recentering_mode, marker_base);
                 if let Some(origin) = self.marker_origin {
-                    self.inverse_recentering_origin = origin.inverse();
+                    self.change_origin(origin.inverse(), client_space_kept);
                     return;
                 }
                 &RecenteringMode::LocalFloor
@@ -227,11 +277,14 @@ impl TrackingManager {
             RecenteringMode::Marker { .. } => unreachable!(),
         };
 
-        self.inverse_recentering_origin = Pose {
-            position,
-            orientation,
-        }
-        .inverse();
+        self.change_origin(
+            Pose {
+                position,
+                orientation,
+            }
+            .inverse(),
+            client_space_kept,
+        );
     }
 
     pub fn recenter_pose(&self, pose: Pose) -> Pose {
@@ -732,5 +785,63 @@ mod tests {
 
         manager.retain_marker_streams(&[MarkerTrackingConfig::BASE]);
         assert_eq!(manager.recentered_marker_streams().len(), 1);
+    }
+
+    #[test]
+    fn origin_changes_say_where_the_new_origin_is() {
+        let mode = RecenteringMode::Marker {
+            code_text: String::new(),
+        };
+        let mut manager = TrackingManager::new(10).after_origin_changes(4);
+        assert_eq!(manager.origin_change().count, 5);
+        assert!(manager.origin_change().pose_in_previous.is_none());
+
+        let base = MarkerTrackingConfig::BASE;
+        manager.set_marker_stream(stream(base, vec![code("dog", 0.0)]));
+        assert!(manager.update_marker_origin(&mode, BASE));
+
+        // The code moves 1 m along X and turns; the client's space stays
+        let point = Pose {
+            position: Vec3::new(0.3, 1.7, -0.4),
+            orientation: Quat::from_rotation_y(0.3),
+        };
+        let before = manager.recenter_pose(point);
+        manager.set_marker_stream(stream(
+            base,
+            vec![alvr_packets::MarkerData {
+                pose: Pose {
+                    orientation: Quat::from_rotation_y(0.5),
+                    ..code("dog", 1.0).pose
+                },
+                ..code("dog", 1.0)
+            }],
+        ));
+        assert!(manager.update_marker_origin(&mode, BASE));
+        let after = manager.recenter_pose(point);
+
+        let change = manager.origin_change();
+        assert_eq!(change.count, 7);
+        // Anything in the previous space is the new origin's pose composed with it in the new one
+        let in_previous = change.pose_in_previous.unwrap() * after;
+        assert!(in_previous.position.distance(before.position) < 1e-5);
+        assert!(in_previous.orientation.angle_between(before.orientation) < 1e-5);
+
+        // A new client space: not known
+        manager.recenter(&mode, BASE, false);
+        assert_eq!(manager.origin_change().count, 8);
+        assert!(manager.origin_change().pose_in_previous.is_none());
+
+        // The same origin again is no change
+        let count = manager.origin_change().count;
+        manager.recenter(&mode, BASE, true);
+        assert_eq!(manager.origin_change().count, count);
+
+        // Another mode, in the same client space: known
+        let before = manager.recenter_pose(point);
+        manager.recenter(&RecenteringMode::Stage, BASE, true);
+        let after = manager.recenter_pose(point);
+        let in_previous = manager.origin_change().pose_in_previous.unwrap() * after;
+        assert!(in_previous.position.distance(before.position) < 1e-5);
+        assert_eq!(after.position, point.position);
     }
 }

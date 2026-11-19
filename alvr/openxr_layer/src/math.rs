@@ -50,9 +50,83 @@ pub fn compose(a: Posef, b: Posef) -> Posef {
     }
 }
 
+/// The pose that undoes `a`: composed with it, either way round, it gives the identity.
+pub fn inverse(a: Posef) -> Posef {
+    let orientation = Quaternionf {
+        x: -a.orientation.x,
+        y: -a.orientation.y,
+        z: -a.orientation.z,
+        w: a.orientation.w,
+    };
+    let position = rotate(orientation, a.position);
+
+    Posef {
+        orientation,
+        position: Vector3f {
+            x: -position.x,
+            y: -position.y,
+            z: -position.z,
+        },
+    }
+}
+
+pub fn from_ipc(pose: alvr_marker_ipc::Pose) -> Posef {
+    let [x, y, z, w] = pose.orientation;
+    let [px, py, pz] = pose.position;
+    Posef {
+        orientation: Quaternionf { x, y, z, w },
+        position: Vector3f {
+            x: px,
+            y: py,
+            z: pz,
+        },
+    }
+}
+
+pub fn to_ipc(pose: Posef) -> alvr_marker_ipc::Pose {
+    let (o, p) = (pose.orientation, pose.position);
+    alvr_marker_ipc::Pose {
+        orientation: [o.x, o.y, o.z, o.w],
+        position: [p.x, p.y, p.z],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inverse_undoes() {
+        let a = Posef {
+            orientation: Quaternionf {
+                x: 0.0,
+                y: 0.38268343,
+                z: 0.0,
+                w: 0.9238795,
+            },
+            position: Vector3f {
+                x: 1.0,
+                y: 2.0,
+                z: -3.0,
+            },
+        };
+        let point = Posef {
+            orientation: Quaternionf::IDENTITY,
+            position: Vector3f {
+                x: 0.5,
+                y: -1.0,
+                z: 2.0,
+            },
+        };
+        assert!(close(
+            compose(inverse(a), compose(a, point)).position,
+            point.position
+        ));
+        assert!(close(
+            compose(a, compose(inverse(a), point)).position,
+            point.position
+        ));
+    }
 
     fn close(a: Vector3f, b: Vector3f) -> bool {
         (a.x - b.x).abs() < 1e-5 && (a.y - b.y).abs() < 1e-5 && (a.z - b.z).abs() < 1e-5

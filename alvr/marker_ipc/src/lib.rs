@@ -40,7 +40,7 @@ pub use sys::{now_ns, ns_to_performance_counter, performance_counter_to_ns};
 pub const PIPE_NAME: &str = "ALVR_Markers";
 
 /// Changes whenever the encoding of a message changes. Messages of another version are ignored.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 const SNAPSHOT_MAGIC: u32 = u32::from_le_bytes(*b"ALVM");
 const REQUEST_MAGIC: u32 = u32::from_le_bytes(*b"ALVQ");
 
@@ -67,6 +67,15 @@ pub struct Pose {
     /// x, y, z, w
     pub orientation: [f32; 4],
     pub position: [f32; 3],
+}
+
+impl Default for Pose {
+    fn default() -> Self {
+        Self {
+            orientation: [0.0, 0.0, 0.0, 1.0],
+            position: [0.0; 3],
+        }
+    }
 }
 
 /// What the headset can do with markers.
@@ -177,6 +186,18 @@ pub struct Stream {
     pub markers: Vec<Marker>,
 }
 
+/// How ALVR recentering moved the space the poses are in, which is what SteamVR's OpenXR runtime
+/// calls STAGE. SteamVR does not see it: for applications, all their reference spaces moved.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Origin {
+    /// Changes since the driver started.
+    pub changes: u64,
+    /// When the latest change took effect, see [`now_ns`].
+    pub changed_ns: i64,
+    /// The new origin in the space before the latest change, when known.
+    pub pose_in_previous: Option<Pose>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Snapshot {
     pub flags: u32,
@@ -184,6 +205,7 @@ pub struct Snapshot {
     pub generation: u64,
     /// Of the headset connected last.
     pub capabilities: Capabilities,
+    pub origin: Origin,
     /// One per tracker the headset runs, each configuration supported by the headset.
     pub streams: Vec<Stream>,
 }
@@ -295,6 +317,13 @@ impl<'a> MessageReader<'a> {
         Some(f32::from_le_bytes(self.array()?))
     }
 
+    fn pose(&mut self) -> Option<Pose> {
+        Some(Pose {
+            orientation: [self.f32()?, self.f32()?, self.f32()?, self.f32()?],
+            position: [self.f32()?, self.f32()?, self.f32()?],
+        })
+    }
+
     fn count(&mut self, max: usize) -> Option<usize> {
         let count = self.u32()? as usize;
         (count <= max).then_some(count)
@@ -323,6 +352,15 @@ fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
             | (u32::from(capabilities.fixed_size_markers) * CAPABILITY_FIXED_SIZE_MARKERS)
             | (u32::from(capabilities.static_markers) * CAPABILITY_STATIC_MARKERS),
     );
+
+    let origin = &snapshot.origin;
+    writer.u64(origin.changes);
+    writer.i64(origin.changed_ns);
+    writer.u32(origin.pose_in_previous.is_some().into());
+    let pose = origin.pose_in_previous.unwrap_or_default();
+    for &value in pose.orientation.iter().chain(&pose.position) {
+        writer.f32(value);
+    }
 
     writer.u32(snapshot.streams.len() as u32);
     for stream in &snapshot.streams {
@@ -365,6 +403,16 @@ fn decode_snapshot(message: &[u8]) -> Option<Snapshot> {
         static_markers: capability_bits & CAPABILITY_STATIC_MARKERS != 0,
     };
 
+    let changes = reader.u64()?;
+    let changed_ns = reader.i64()?;
+    let has_pose = reader.u32()? != 0;
+    let pose = reader.pose()?;
+    let origin = Origin {
+        changes,
+        changed_ns,
+        pose_in_previous: has_pose.then_some(pose),
+    };
+
     let stream_count = reader.count(MAX_STREAMS)?;
     let mut streams = Vec::with_capacity(stream_count);
     for _ in 0..stream_count {
@@ -375,8 +423,7 @@ fn decode_snapshot(message: &[u8]) -> Option<Snapshot> {
         let mut markers = Vec::with_capacity(marker_count);
         for _ in 0..marker_count {
             let id = reader.u64()?;
-            let orientation = [reader.f32()?, reader.f32()?, reader.f32()?, reader.f32()?];
-            let position = [reader.f32()?, reader.f32()?, reader.f32()?];
+            let pose = reader.pose()?;
             let size = reader.f32()?;
             let kind = reader.u32()?;
             let len = reader.count(MAX_PAYLOAD_LEN)?;
@@ -390,10 +437,7 @@ fn decode_snapshot(message: &[u8]) -> Option<Snapshot> {
             markers.push(Marker {
                 id,
                 payload,
-                pose: Pose {
-                    orientation,
-                    position,
-                },
+                pose,
                 size,
             });
         }
@@ -409,6 +453,7 @@ fn decode_snapshot(message: &[u8]) -> Option<Snapshot> {
         flags,
         generation,
         capabilities,
+        origin,
         streams,
     })
 }
@@ -528,10 +573,20 @@ impl Server {
             flags,
             generation: self.snapshot.generation + 1,
             capabilities,
+            origin: self.snapshot.origin,
             streams,
         };
 
         self.pipe.send(encode_snapshot(&self.snapshot));
+    }
+
+    pub fn origin(&self) -> Origin {
+        self.snapshot.origin
+    }
+
+    /// Sent with the next [`Server::publish`].
+    pub fn set_origin(&mut self, origin: Origin) {
+        self.snapshot.origin = origin;
     }
 }
 
@@ -726,13 +781,30 @@ mod tests {
                 fixed_size_markers: false,
                 static_markers: true,
             },
+            origin: Origin {
+                changes: 3,
+                changed_ns: 456,
+                pose_in_previous: Some(pose(0.5)),
+            },
             streams: vec![
                 stream(STATIC, 123, &[("dog", 1.0)]),
                 stream(SIZED, -5, &[("cat", 2.0), ("cow", 3.0)]),
             ],
         };
+        assert_eq!(
+            decode_snapshot(&encode_snapshot(&snapshot)),
+            Some(snapshot.clone())
+        );
 
-        assert_eq!(decode_snapshot(&encode_snapshot(&snapshot)), Some(snapshot));
+        // Not known where the new origin is
+        let unknown = Snapshot {
+            origin: Origin {
+                pose_in_previous: None,
+                ..snapshot.origin
+            },
+            ..snapshot
+        };
+        assert_eq!(decode_snapshot(&encode_snapshot(&unknown)), Some(unknown));
     }
 
     #[test]

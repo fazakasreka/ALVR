@@ -240,7 +240,9 @@ impl Spatial {
             }
             sys::SpatialBufferTypeEXT::UINT8 => {
                 let bytes = read_buffer(self.fns.get_spatial_buffer_uint8, snapshot, &info);
-                bytes.iter().fold("0x".to_owned(), |text, byte| format!("{text}{byte:02x}"))
+                bytes
+                    .iter()
+                    .fold("0x".to_owned(), |text, byte| format!("{text}{byte:02x}"))
             }
             other => format!("(not decoded, {other:?})"),
         }
@@ -424,6 +426,24 @@ fn main() {
             } else if event.ty == sys::EventDataSpatialDiscoveryRecommendedEXT::TYPE {
                 recommendations += 1;
                 println!("Discovery recommended ({recommendations})");
+                last_discovery = None;
+            } else if event.ty == sys::EventDataReferenceSpaceChangePending::TYPE {
+                let change = unsafe {
+                    &*(&raw const event).cast::<sys::EventDataReferenceSpaceChangePending>()
+                };
+                println!(
+                    "{:?} space changes at {} ns: {}",
+                    change.reference_space_type,
+                    change.change_time.as_nanos(),
+                    if change.pose_valid.into() {
+                        format!(
+                            "new origin in the previous one: {}",
+                            format_pose(change.pose_in_previous_space)
+                        )
+                    } else {
+                        "where to is not known".to_owned()
+                    }
+                );
                 last_discovery = None;
             }
         }

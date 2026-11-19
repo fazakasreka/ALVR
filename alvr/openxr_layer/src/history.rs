@@ -5,7 +5,9 @@
 //! - **Static markers** (the application asked for XrSpatialMarkerStaticOptimizationEXT) are
 //!   averaged over the latest second, since they do not move and detections jitter.
 
+use crate::math;
 use alvr_marker_ipc::{Payload, Pose, Snapshot, TrackingConfig};
+use openxr_sys::Posef;
 use std::collections::{HashMap, VecDeque};
 
 const SECOND_NS: i64 = 1_000_000_000;
@@ -59,6 +61,25 @@ pub struct MarkerHistory {
 impl MarkerHistory {
     pub fn clear(&mut self) {
         self.trackers.clear();
+    }
+
+    /// The space the poses are in moved: the new origin is at `new_in_previous` in the old space.
+    /// The poses so far are moved into the new space, or forgotten if where it is is not known.
+    pub fn move_origin(&mut self, new_in_previous: Option<Posef>) {
+        let Some(new_in_previous) = new_in_previous else {
+            self.clear();
+            return;
+        };
+
+        let previous_in_new = math::inverse(new_in_previous);
+        for sample in self
+            .trackers
+            .iter_mut()
+            .flat_map(|tracker| tracker.samples.values_mut())
+            .flatten()
+        {
+            sample.pose = math::to_ipc(math::compose(previous_in_new, math::from_ipc(sample.pose)));
+        }
     }
 
     /// Takes in a snapshot from the driver. Snapshots repeat the trackers that did not change.
@@ -370,6 +391,31 @@ mod tests {
         assert!(close(located.pose.position[0], 0.05));
         assert!(close(located.pose.orientation[1], yaw(4.5)[1]));
         assert!(close(located.size, 0.2));
+    }
+
+    #[test]
+    fn poses_follow_the_origin() {
+        let mut history = history();
+        // The new origin is 1 m along +X: everything is 1 m nearer along X
+        history.move_origin(Some(openxr_sys::Posef {
+            orientation: openxr_sys::Quaternionf::IDENTITY,
+            position: openxr_sys::Vector3f {
+                x: 1.0,
+                y: 0.0,
+                z: 0.0,
+            },
+        }));
+        let located = history.locate(MOVING, dog(), At::Latest, 100 * MS).unwrap();
+        assert!(close(located.pose.position[0], 0.1 - 1.0));
+        // Interpolated within the new space only
+        let located = history
+            .locate(MOVING, dog(), At::Time(50 * MS), 100 * MS)
+            .unwrap();
+        assert!(close(located.pose.position[0], 0.05 - 1.0));
+
+        // Not known where to: the poses are of no use
+        history.move_origin(None);
+        assert!(history.seen(MOVING, 100 * MS).is_empty());
     }
 
     #[test]

@@ -3,8 +3,8 @@
 
 use crate::{LAYER_NAME, TIME_EXTENSION, xrNegotiateLoaderApiLayerInterface};
 use alvr_marker_ipc::{
-    Capabilities, FLAG_CLIENT_CONNECTED, Marker, Payload, Pose, Server, Stream, TrackingConfig,
-    now_ns, ns_to_performance_counter,
+    Capabilities, FLAG_CLIENT_CONNECTED, Marker, Origin, Payload, Pose, Server, Stream,
+    TrackingConfig, now_ns, ns_to_performance_counter, performance_counter_to_ns,
 };
 use openxr_sys::{self as xr, Handle, loader, pfn};
 use std::{
@@ -153,7 +153,34 @@ unsafe extern "system" fn runtime_create_reference_space(
         .unwrap()
         .created_spaces
         .push(unsafe { (*info).reference_space_type });
-    unsafe { *space = xr::Space::from_raw(STAGE) };
+    let ty = unsafe { (*info).reference_space_type };
+    unsafe {
+        *space = xr::Space::from_raw(if ty == xr::ReferenceSpaceType::LOCAL {
+            LOCAL
+        } else {
+            STAGE
+        })
+    };
+    xr::Result::SUCCESS
+}
+
+unsafe extern "system" fn runtime_enumerate_reference_spaces(
+    _: xr::Session,
+    capacity: u32,
+    count: *mut u32,
+    spaces: *mut xr::ReferenceSpaceType,
+) -> xr::Result {
+    let types = [
+        xr::ReferenceSpaceType::VIEW,
+        xr::ReferenceSpaceType::LOCAL,
+        xr::ReferenceSpaceType::STAGE,
+    ];
+    unsafe { *count = types.len() as u32 };
+    if capacity >= types.len() as u32 {
+        for (i, ty) in types.into_iter().enumerate() {
+            unsafe { *spaces.add(i) = ty };
+        }
+    }
     xr::Result::SUCCESS
 }
 
@@ -172,14 +199,25 @@ unsafe extern "system" fn runtime_locate_space(
     _: xr::Time,
     location: *mut xr::SpaceLocation,
 ) -> xr::Result {
-    if space.into_raw() != STAGE || base.into_raw() != LOCAL {
-        return xr::Result::ERROR_HANDLE_INVALID;
-    }
+    let pose = match (space.into_raw(), base.into_raw()) {
+        (STAGE, LOCAL) => STAGE_IN_LOCAL,
+        (LOCAL, STAGE) => crate::math::inverse(STAGE_IN_LOCAL),
+        _ => return xr::Result::ERROR_HANDLE_INVALID,
+    };
     unsafe {
         (*location).location_flags =
             xr::SpaceLocationFlags::ORIENTATION_VALID | xr::SpaceLocationFlags::POSITION_VALID;
-        (*location).pose = STAGE_IN_LOCAL;
+        (*location).pose = pose;
     }
+    xr::Result::SUCCESS
+}
+
+unsafe extern "system" fn runtime_convert_counter(
+    _: xr::Instance,
+    counter: *const i64,
+    time: *mut xr::Time,
+) -> xr::Result {
+    unsafe { *time = xr::Time::from_nanos(performance_counter_to_ns(*counter)) };
     xr::Result::SUCCESS
 }
 
@@ -212,6 +250,14 @@ unsafe extern "system" fn runtime_get_instance_proc_addr(
         b"xrCreateReferenceSpace" => f!(runtime_create_reference_space, pfn::CreateReferenceSpace),
         b"xrDestroySpace" => f!(runtime_destroy_space, pfn::DestroySpace),
         b"xrLocateSpace" => f!(runtime_locate_space, pfn::LocateSpace),
+        b"xrEnumerateReferenceSpaces" => f!(
+            runtime_enumerate_reference_spaces,
+            pfn::EnumerateReferenceSpaces
+        ),
+        b"xrConvertWin32PerformanceCounterToTimeKHR" => f!(
+            runtime_convert_counter,
+            pfn::ConvertWin32PerformanceCounterToTimeKHR
+        ),
         b"xrEnumerateInstanceExtensionProperties" if LISTS_EXTENSIONS.load(Ordering::SeqCst) => f!(
             runtime_enumerate_extensions,
             pfn::EnumerateInstanceExtensionProperties
@@ -373,7 +419,7 @@ fn publish_markers(server: &mut Server, markers: &[Marker]) -> xr::Time {
     let start = Instant::now();
     loop {
         let mut state = crate::state();
-        state.markers.refresh();
+        state.refresh_markers();
         if state.markers.client.is_connected() {
             break;
         }
@@ -397,13 +443,15 @@ fn publish_markers(server: &mut Server, markers: &[Marker]) -> xr::Time {
     let start = Instant::now();
     loop {
         let mut state = crate::state();
-        state.markers.refresh();
+        state.refresh_markers();
         if state
             .markers
             .client
             .read()
             .is_some_and(|snapshot| snapshot.generation == generation)
         {
+            // Taking in what that read received too
+            state.refresh_markers();
             break;
         }
         drop(state);
@@ -1190,9 +1238,14 @@ fn applications_without_the_extensions_go_straight_to_the_runtime() {
     let (result, instance, gipa) = create_instance(&[]);
     assert_eq!(result, xr::Result::SUCCESS);
 
-    // The runtime's own function, not the layer's
+    // The runtime's own functions, but those the layer reports recentering with
+    let locate: pfn::LocateSpace = get(gipa, instance, c"xrLocateSpace");
+    assert_eq!(
+        locate as usize,
+        runtime_locate_space as pfn::LocateSpace as usize
+    );
     let poll: pfn::PollEvent = get(gipa, instance, c"xrPollEvent");
-    assert_eq!(poll as usize, runtime_poll_event as pfn::PollEvent as usize);
+    assert_ne!(poll as usize, runtime_poll_event as pfn::PollEvent as usize);
 
     let mut function = None;
     let result = unsafe {
@@ -1570,5 +1623,96 @@ fn the_spatial_entity_rules_are_followed() {
     );
     assert_eq!(app.buffer_string(snapshot, dog_buffer).unwrap(), "dog");
 
+    app.destroy();
+}
+
+/// ALVR recentering moves every reference space but VIEW, in every application.
+#[test]
+fn recentering_is_reported() {
+    let _serial = serial();
+    let (mut writer, _requests) = start_driver();
+
+    // An application without the marker extensions
+    let (result, instance, gipa) = create_instance(&[]);
+    assert_eq!(result, xr::Result::SUCCESS);
+    // To report the change time
+    assert_eq!(
+        runtime().as_ref().unwrap().enabled_extensions,
+        [TIME_EXTENSION.to_str().unwrap()]
+    );
+    let app = App { gipa, instance };
+
+    // Changes before the session are not its own
+    writer.set_origin(Origin {
+        changes: 3,
+        changed_ns: now_ns(),
+        pose_in_previous: None,
+    });
+    publish(&mut writer, &[]);
+    let session = app.create_session();
+    let poll: pfn::PollEvent = app.get(c"xrPollEvent");
+    let poll_space_event = || {
+        let mut event = xr::EventDataBuffer {
+            ty: xr::StructureType::EVENT_DATA_BUFFER,
+            next: ptr::null(),
+            varying: [0; 4000],
+        };
+        match unsafe { poll(instance, &mut event) } {
+            xr::Result::EVENT_UNAVAILABLE => None,
+            xr::Result::SUCCESS => {
+                assert_eq!(event.ty, xr::EventDataReferenceSpaceChangePending::TYPE);
+                Some(unsafe {
+                    *(&raw const event).cast::<xr::EventDataReferenceSpaceChangePending>()
+                })
+            }
+            result => panic!("{result:?}"),
+        }
+    };
+
+    assert!(poll_space_event().is_none());
+
+    // The origin moves 1 m along +X
+    let changed_ns = now_ns();
+    writer.set_origin(Origin {
+        changes: 4,
+        changed_ns,
+        pose_in_previous: Some(pose(1.0, 0.0, 0.0)),
+    });
+    publish(&mut writer, &[]);
+    let mut events = (0..2)
+        .map(|_| poll_space_event().unwrap())
+        .collect::<Vec<_>>();
+    assert!(poll_space_event().is_none());
+    events.sort_by_key(|event| event.reference_space_type.into_raw());
+    let [local, stage] = events[..] else {
+        unreachable!()
+    };
+    assert_eq!(local.reference_space_type, xr::ReferenceSpaceType::LOCAL);
+    assert_eq!(stage.reference_space_type, xr::ReferenceSpaceType::STAGE);
+    for event in [local, stage] {
+        assert_eq!(event.session, session);
+        assert_eq!(event.pose_valid, xr::TRUE);
+        // To the performance counter's tick
+        assert!((event.change_time.as_nanos() - changed_ns).abs() < 1000);
+        assert!(close(
+            event.pose_in_previous_space.position,
+            [1.0, 0.0, 0.0]
+        ));
+    }
+
+    // A change missed, or a driver restarted: where the origin went is not known
+    writer.set_origin(Origin {
+        changes: 6,
+        changed_ns: now_ns(),
+        pose_in_previous: Some(pose(1.0, 0.0, 0.0)),
+    });
+    publish(&mut writer, &[]);
+    for _ in 0..2 {
+        assert_eq!(poll_space_event().unwrap().pose_valid, xr::FALSE);
+    }
+    assert!(poll_space_event().is_none());
+
+    let destroy_session: pfn::DestroySession = app.get(c"xrDestroySession");
+    assert_eq!(unsafe { destroy_session(session) }, xr::Result::SUCCESS);
     app.destroy();
 }

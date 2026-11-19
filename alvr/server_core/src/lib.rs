@@ -13,7 +13,7 @@ mod web_server;
 
 pub use c_api::*;
 pub use logging_backend::init_logging;
-pub use tracking::HandType;
+pub use tracking::{HandType, OriginChange};
 
 use crate::connection::VideoPacket;
 use alvr_common::{
@@ -107,9 +107,12 @@ pub enum ServerCoreEvent {
     ShutdownPending,
     RestartPending,
     ProximityState(bool),
-    /// Every marker tracker the headset runs, with poses already recentered. Sent whenever one
-    /// of them updates.
-    Markers(Vec<MarkerStream>),
+    /// Every marker tracker the headset runs, with poses already recentered, and how recentering
+    /// moved the space poses are submitted in. Sent whenever one of them updates.
+    Markers {
+        streams: Vec<MarkerStream>,
+        origin: OriginChange,
+    },
     /// Of the headset that connected.
     MarkerCapabilities(MarkerCapabilities),
 }

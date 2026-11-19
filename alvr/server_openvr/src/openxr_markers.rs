@@ -12,11 +12,11 @@
 use alvr_common::{info, parking_lot::Mutex, warn};
 use alvr_filesystem as afs;
 use alvr_marker_ipc::{
-    Capabilities, FLAG_CLIENT_CONNECTED, Marker, Payload, Pose, Server, Stream, TrackingConfig,
-    now_ns,
+    Capabilities, FLAG_CLIENT_CONNECTED, Marker, Origin, Payload, Pose, Server, Stream,
+    TrackingConfig, now_ns,
 };
 use alvr_packets::{MarkerCapabilities, MarkerPayload, MarkerTrackingConfig};
-use alvr_server_core::MarkerStream;
+use alvr_server_core::{MarkerStream, OriginChange};
 use std::time::Duration;
 
 /// Weight of each new sample of the clock offset. Smooths network jitter over about a second.
@@ -30,6 +30,8 @@ struct State {
     streams: Vec<MarkerStream>,
     /// Performance counter time minus headset time, in nanoseconds.
     clock_offset_ns: Option<f64>,
+    /// The latest origin change of the server's tracking.
+    tracking_origin: OriginChange,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -71,6 +73,7 @@ pub fn start(
         capabilities: Capabilities::default(),
         streams: Vec::new(),
         clock_offset_ns: None,
+        tracking_origin: OriginChange::default(),
     });
 }
 
@@ -118,9 +121,27 @@ pub fn report_head_pose_time(headset_time: Duration) {
 }
 
 /// Every tracker of the headset, with poses recentered: in the space the headset pose is
-/// submitted to SteamVR in.
-pub fn set_markers(streams: Vec<MarkerStream>) {
+/// submitted to SteamVR in. `origin` says how recentering moved that space.
+pub fn set_markers(streams: Vec<MarkerStream>, origin: OriginChange) {
     if let Some(state) = &mut *STATE.lock() {
+        if origin.count != state.tracking_origin.count {
+            // Where the new origin is, is known only for a single step from the last one seen
+            let follows = origin.count == state.tracking_origin.count + 1;
+            state.tracking_origin = origin;
+            let previous = state.server.origin();
+            state.server.set_origin(Origin {
+                changes: previous.changes + 1,
+                // The poses being submitted to SteamVR are already in the new space
+                changed_ns: now_ns(),
+                pose_in_previous: origin
+                    .pose_in_previous
+                    .filter(|_| follows)
+                    .map(|pose| Pose {
+                        orientation: pose.orientation.to_array(),
+                        position: pose.position.to_array(),
+                    }),
+            });
+        }
         state.streams = streams;
         publish(state);
     }

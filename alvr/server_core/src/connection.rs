@@ -26,7 +26,7 @@ use alvr_packets::{
 };
 use alvr_session::{
     BodyTrackingSinkConfig, CodecType, ControllersEmulationMode, FrameSize, H264Profile,
-    PassthroughMode, Settings, SocketProtocol, SteamvrHmdInitConfig,
+    PassthroughMode, RecenteringMode, Settings, SocketProtocol, SteamvrHmdInitConfig,
 };
 use alvr_sockets::{
     CONTROL_PORT, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, ProtoControlSocket, SocketConnection,
@@ -35,6 +35,7 @@ use alvr_sockets::{
 use std::{
     collections::{HashMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
+    mem,
     net::{IpAddr, Ipv4Addr},
     process::Command,
     sync::{Arc, mpsc::RecvTimeoutError},
@@ -870,8 +871,22 @@ fn connection_pipeline(
     ));
     *ctx.bitrate_manager.lock() =
         BitrateManager::new(initial_settings.video.bitrate.history_size, fps);
-    *ctx.tracking_manager.write() =
-        TrackingManager::new(initial_settings.connection.statistics_history_size);
+    {
+        let mut tracking_manager = ctx.tracking_manager.write();
+        // Counted on across connections, so that a change is never missed for a repeated count
+        let origin_changes = tracking_manager.origin_change().count;
+        *tracking_manager =
+            TrackingManager::new(initial_settings.connection.statistics_history_size)
+                .after_origin_changes(origin_changes);
+        // Now, not with the first markers: applications started meanwhile would take it for a
+        // later change
+        ctx.events_sender
+            .send(ServerCoreEvent::Markers {
+                streams: Vec::new(),
+                origin: tracking_manager.origin_change(),
+            })
+            .ok();
+    }
 
     let control_sender = Arc::new(Mutex::new(socket.request_reliable_stream()?));
     ctx.marker_tracking
@@ -1180,8 +1195,38 @@ fn connection_pipeline(
         let control_sender = Arc::clone(&control_sender);
         let disconnect_notif = Arc::clone(&disconnect_notif);
         let client_hostname = client_hostname.clone();
+        let ctx = Arc::clone(&ctx);
         move || {
+            let mut recentering_mode = None;
             while is_streaming(&client_hostname) {
+                // The recentering mode can change while streaming: the origin moves to where the
+                // new one puts it, in the same client space
+                let mode = SESSION_MANAGER
+                    .read()
+                    .settings()
+                    .headset
+                    .recentering_mode
+                    .clone();
+                ctx.marker_tracking
+                    .lock()
+                    .set_recentering(matches!(mode, RecenteringMode::Marker { .. }));
+                let changed = recentering_mode
+                    .as_ref()
+                    .is_some_and(|last| mem::discriminant(last) != mem::discriminant(&mode));
+                if changed {
+                    info!("Recentering mode changed, recentering");
+                    let marker_base = ctx.marker_tracking.lock().base_config();
+                    let mut tracking_manager = ctx.tracking_manager.write();
+                    tracking_manager.recenter(&mode, marker_base, true);
+                    ctx.events_sender
+                        .send(ServerCoreEvent::Markers {
+                            streams: tracking_manager.recentered_marker_streams(),
+                            origin: tracking_manager.origin_change(),
+                        })
+                        .ok();
+                }
+                recentering_mode = Some(mode);
+
                 if let Err(e) = control_sender.lock().send(&ServerControlPacket::KeepAlive) {
                     info!("Client disconnected. Cause: {e:?}");
 
@@ -1248,12 +1293,20 @@ fn connection_pipeline(
                             let session_manager_lock = SESSION_MANAGER.read();
                             let config = &session_manager_lock.settings().headset;
                             let marker_base = ctx.marker_tracking.lock().base_config();
-                            ctx.tracking_manager
-                                .write()
-                                .recenter(&config.recentering_mode, marker_base);
-                            let streams = ctx.tracking_manager.read().recentered_marker_streams();
+                            ctx.tracking_manager.write().recenter(
+                                &config.recentering_mode,
+                                marker_base,
+                                false,
+                            );
+                            let (streams, origin) = {
+                                let tracking_manager = ctx.tracking_manager.read();
+                                (
+                                    tracking_manager.recentered_marker_streams(),
+                                    tracking_manager.origin_change(),
+                                )
+                            };
                             ctx.events_sender
-                                .send(ServerCoreEvent::Markers(streams))
+                                .send(ServerCoreEvent::Markers { streams, origin })
                                 .ok();
 
                             let area = packet.unwrap_or(Vec2::new(2.0, 2.0));
@@ -1398,9 +1451,10 @@ fn connection_pipeline(
                                 info!("Origin moved to the QR code");
                             }
                             ctx.events_sender
-                                .send(ServerCoreEvent::Markers(
-                                    tracking_manager.recentered_marker_streams(),
-                                ))
+                                .send(ServerCoreEvent::Markers {
+                                    streams: tracking_manager.recentered_marker_streams(),
+                                    origin: tracking_manager.origin_change(),
+                                })
                                 .ok();
                         }
                     }
@@ -1557,7 +1611,10 @@ fn connection_pipeline(
 
     ctx.marker_tracking.lock().disconnect();
     ctx.events_sender
-        .send(ServerCoreEvent::Markers(Vec::new()))
+        .send(ServerCoreEvent::Markers {
+            streams: Vec::new(),
+            origin: ctx.tracking_manager.read().origin_change(),
+        })
         .ok();
     ctx.events_sender
         .send(ServerCoreEvent::ClientDisconnected)

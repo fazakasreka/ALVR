@@ -24,6 +24,19 @@ fn main() -> ExitCode {
                     },
                     snapshot.capabilities,
                 );
+                let origin = &snapshot.origin;
+                println!(
+                    "  origin: {} change(s), the latest {:.1} s ago, {}",
+                    origin.changes,
+                    (now_ns() - origin.changed_ns) as f64 / 1e9,
+                    match &origin.pose_in_previous {
+                        Some(pose) => format!(
+                            "new origin at {:?} {:?} in the previous one",
+                            pose.position, pose.orientation
+                        ),
+                        None => "where to not known".to_owned(),
+                    }
+                );
                 for stream in &snapshot.streams {
                     println!(
                         "  tracker {:?}: {} marker(s), {:.1} ms old",

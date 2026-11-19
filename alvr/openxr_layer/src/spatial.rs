@@ -17,10 +17,13 @@ use crate::{
     history::{At, Located},
     log, math, state, void_fn,
 };
-use alvr_marker_ipc::{Payload, TrackingConfig, now_ns, performance_counter_to_ns};
+use alvr_marker_ipc::{
+    Capabilities, Payload, TrackingConfig, now_ns, ns_to_performance_counter,
+    performance_counter_to_ns,
+};
 use openxr_sys::{self as xr, Handle, pfn};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     ffi::{CStr, c_char, c_void},
     mem, ptr, slice,
 };
@@ -44,8 +47,45 @@ const QR_FEATURES: [xr::SpatialCapabilityFeatureEXT; 2] = [
 
 pub(crate) struct SessionData {
     pub instance: u64,
-    /// Created the first time markers are located for the session.
-    stage: Option<xr::Space>,
+    /// Reference spaces of the layer's own, at their natural origins, created when first needed.
+    spaces: Vec<(xr::ReferenceSpaceType, xr::Space)>,
+    /// The reference space types of the session, once asked for.
+    reference_space_types: Option<Vec<xr::ReferenceSpaceType>>,
+    /// Origin changes not yet reported.
+    origin_changes: VecDeque<OriginChange>,
+    /// Reference space change events ready for xrPollEvent.
+    space_events: VecDeque<SpaceEvent>,
+}
+
+/// An XrEventDataReferenceSpaceChangePending of the session.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SpaceEvent {
+    reference_space_type: xr::ReferenceSpaceType,
+    change_time: xr::Time,
+    /// Where the new origin is in the previous space, when known.
+    pose_in_previous_space: Option<xr::Posef>,
+}
+
+impl SessionData {
+    fn new(instance: u64) -> Self {
+        Self {
+            instance,
+            spaces: Vec::new(),
+            reference_space_types: None,
+            origin_changes: VecDeque::new(),
+            space_events: VecDeque::new(),
+        }
+    }
+}
+
+/// ALVR moved the space it submits poses to SteamVR in: for applications, every reference space
+/// but VIEW moved by as much.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OriginChange {
+    /// When it took effect, on the performance counter clock.
+    pub changed_ns: i64,
+    /// Where the new origin of STAGE is in the previous STAGE, when known.
+    pub pose_in_previous: Option<xr::Posef>,
 }
 
 #[derive(Clone)]
@@ -180,6 +220,30 @@ pub(crate) fn future_function(name: &CStr) -> Option<pfn::VoidFunction> {
     })
 }
 
+/// The reference space types of the session, from the runtime.
+unsafe fn reference_space_types(
+    downstream: &Downstream,
+    session: u64,
+) -> Vec<xr::ReferenceSpaceType> {
+    let session = xr::Session::from_raw(session);
+    let mut count = 0;
+    if unsafe { (downstream.enumerate_reference_spaces)(session, 0, &mut count, ptr::null_mut()) }
+        != xr::Result::SUCCESS
+    {
+        return Vec::new();
+    }
+    let mut types = vec![xr::ReferenceSpaceType::VIEW; count as usize];
+    if unsafe {
+        (downstream.enumerate_reference_spaces)(session, count, &mut count, types.as_mut_ptr())
+    } != xr::Result::SUCCESS
+    {
+        return Vec::new();
+    }
+    types.truncate(count as usize);
+
+    types
+}
+
 /// The two-call idiom: reports the count, and fills `output` when its capacity allows.
 unsafe fn write_array<T: Copy>(
     items: &[T],
@@ -293,9 +357,22 @@ impl State {
             .get(&instance)
             .is_some_and(|data| data.marker_tracking_enabled)
             && self
-                .markers
-                .refresh()
+                .refresh_markers()
                 .is_some_and(|capabilities| capabilities.qr_codes)
+    }
+
+    /// Takes in what the driver sent, and hands origin changes to the sessions there are now.
+    /// Returns what the headset connected last can do, or `None` while the driver is not running.
+    pub(crate) fn refresh_markers(&mut self) -> Option<Capabilities> {
+        let capabilities = self.markers.refresh();
+        for change in self.markers.origin_changes.drain(..) {
+            log!("ALVR recentered: {change:?}");
+            for session in self.sessions.values_mut() {
+                session.origin_changes.push_back(change);
+            }
+        }
+
+        capabilities
     }
 
     /// Tells the driver the marker options of the application's spatial contexts, also the ones
@@ -315,7 +392,7 @@ impl State {
             )
             .collect::<Vec<_>>();
         self.markers.client.set_requests(&configs);
-        self.markers.refresh();
+        self.refresh_markers();
     }
 
     /// The codes the context's tracker sees: their marker ids and data, and where they are at
@@ -325,7 +402,7 @@ impl State {
         context: u64,
         time: xr::Time,
     ) -> Vec<(u64, Payload, Option<Located>)> {
-        let Some(capabilities) = self.markers.refresh() else {
+        let Some(capabilities) = self.refresh_markers() else {
             return Vec::new();
         };
         let context = &self.contexts[&context];
@@ -420,31 +497,8 @@ impl State {
             .downstream(instance)
             .ok_or(xr::Result::ERROR_HANDLE_INVALID)?;
 
-        let stage = match self.sessions[&session].stage {
-            Some(stage) => stage,
-            None => {
-                let info = xr::ReferenceSpaceCreateInfo {
-                    ty: xr::ReferenceSpaceCreateInfo::TYPE,
-                    next: ptr::null(),
-                    reference_space_type: xr::ReferenceSpaceType::STAGE,
-                    pose_in_reference_space: xr::Posef::IDENTITY,
-                };
-                let mut stage = xr::Space::NULL;
-                let result = unsafe {
-                    (downstream.create_reference_space)(
-                        xr::Session::from_raw(session),
-                        &info,
-                        &mut stage,
-                    )
-                };
-                if result != xr::Result::SUCCESS {
-                    log!("Cannot create the stage space: {result:?}");
-                    return Ok(None);
-                }
-                self.sessions.get_mut(&session).unwrap().stage = Some(stage);
-
-                stage
-            }
+        let Some(stage) = self.reference_space(session, xr::ReferenceSpaceType::STAGE) else {
+            return Ok(None);
         };
 
         let mut location = xr::SpaceLocation {
@@ -464,6 +518,146 @@ impl State {
             .location_flags
             .contains(valid)
             .then_some(location.pose))
+    }
+
+    /// The layer's own reference space of the type, at its natural origin.
+    fn reference_space(&mut self, session: u64, ty: xr::ReferenceSpaceType) -> Option<xr::Space> {
+        let data = self.sessions.get(&session)?;
+        if let Some(&(_, space)) = data.spaces.iter().find(|(t, _)| *t == ty) {
+            return Some(space);
+        }
+        let downstream = self.downstream(data.instance)?;
+
+        let info = xr::ReferenceSpaceCreateInfo {
+            ty: xr::ReferenceSpaceCreateInfo::TYPE,
+            next: ptr::null(),
+            reference_space_type: ty,
+            pose_in_reference_space: xr::Posef::IDENTITY,
+        };
+        let mut space = xr::Space::NULL;
+        let result = unsafe {
+            (downstream.create_reference_space)(xr::Session::from_raw(session), &info, &mut space)
+        };
+        if result != xr::Result::SUCCESS {
+            log!("Cannot create a {ty:?} space: {result:?}");
+            return None;
+        }
+        self.sessions.get_mut(&session)?.spaces.push((ty, space));
+
+        Some(space)
+    }
+
+    /// A reference space change event for a session of `instance`, if one is due.
+    fn take_space_event(
+        &mut self,
+        instance: u64,
+    ) -> Option<xr::EventDataReferenceSpaceChangePending> {
+        self.refresh_markers();
+
+        let sessions = self
+            .sessions
+            .iter()
+            .filter(|(_, data)| data.instance == instance)
+            .map(|(&session, _)| session)
+            .collect::<Vec<_>>();
+        for session in sessions {
+            loop {
+                let data = self.sessions.get_mut(&session)?;
+                if let Some(event) = data.space_events.pop_front() {
+                    return Some(xr::EventDataReferenceSpaceChangePending {
+                        ty: xr::EventDataReferenceSpaceChangePending::TYPE,
+                        next: ptr::null(),
+                        session: xr::Session::from_raw(session),
+                        reference_space_type: event.reference_space_type,
+                        change_time: event.change_time,
+                        pose_valid: event.pose_in_previous_space.is_some().into(),
+                        pose_in_previous_space: event
+                            .pose_in_previous_space
+                            .unwrap_or(xr::Posef::IDENTITY),
+                    });
+                }
+                let change = data.origin_changes.pop_front()?;
+                let events = self.space_events(session, change);
+                self.sessions.get_mut(&session)?.space_events.extend(events);
+            }
+        }
+
+        None
+    }
+
+    /// The events for an origin change: one per reference space type of the session but VIEW,
+    /// each with where its new origin is in its previous self.
+    fn space_events(&mut self, session: u64, change: OriginChange) -> Vec<SpaceEvent> {
+        let instance = self.sessions[&session].instance;
+        let Some(downstream) = self.downstream(instance) else {
+            return Vec::new();
+        };
+        // The layer's times are the performance counter's; without the conversion, there is no
+        // change time to report
+        let Some(convert) = downstream.convert_counter else {
+            return Vec::new();
+        };
+        let counter = ns_to_performance_counter(change.changed_ns);
+        let mut change_time = xr::Time::from_nanos(0);
+        if unsafe { convert(xr::Instance::from_raw(instance), &counter, &mut change_time) }
+            != xr::Result::SUCCESS
+        {
+            return Vec::new();
+        }
+
+        let types = match &self.sessions[&session].reference_space_types {
+            Some(types) => types.clone(),
+            None => {
+                let types = unsafe { reference_space_types(&downstream, session) };
+                self.sessions
+                    .get_mut(&session)
+                    .unwrap()
+                    .reference_space_types = Some(types.clone());
+                types
+            }
+        };
+
+        types
+            .into_iter()
+            .filter(|&ty| ty != xr::ReferenceSpaceType::VIEW)
+            .map(|ty| {
+                // The spaces of SteamVR keep their poses relative to each other: each moved like
+                // STAGE, seen from its own origin
+                let pose = change.pose_in_previous.and_then(|stage_change| {
+                    if ty == xr::ReferenceSpaceType::STAGE {
+                        return Some(stage_change);
+                    }
+                    let space = self.reference_space(session, ty)?;
+                    let stage = self.reference_space(session, xr::ReferenceSpaceType::STAGE)?;
+                    let mut location = xr::SpaceLocation {
+                        ty: xr::SpaceLocation::TYPE,
+                        next: ptr::null_mut(),
+                        location_flags: xr::SpaceLocationFlags::EMPTY,
+                        pose: xr::Posef::IDENTITY,
+                    };
+                    let result = unsafe {
+                        (downstream.locate_space)(space, stage, change_time, &mut location)
+                    };
+                    let valid = xr::SpaceLocationFlags::ORIENTATION_VALID
+                        | xr::SpaceLocationFlags::POSITION_VALID;
+                    (result == xr::Result::SUCCESS && location.location_flags.contains(valid)).then(
+                        || {
+                            let in_stage = location.pose;
+                            math::compose(
+                                math::inverse(in_stage),
+                                math::compose(stage_change, in_stage),
+                            )
+                        },
+                    )
+                });
+
+                SpaceEvent {
+                    reference_space_type: ty,
+                    change_time,
+                    pose_in_previous_space: pose,
+                }
+            })
+            .collect()
     }
 
     fn snapshot_entity(
@@ -515,7 +709,7 @@ impl State {
     /// A context of `instance` to recommend a discovery for, when the codes its tracker sees have
     /// changed since its last recommendation.
     fn take_discovery_recommendation(&mut self, instance: u64) -> Option<u64> {
-        let capabilities = self.markers.refresh().unwrap_or_default();
+        let capabilities = self.refresh_markers().unwrap_or_default();
         let now = now_ns();
 
         for (&handle, context) in &mut self.contexts {
@@ -560,10 +754,7 @@ unsafe extern "system" fn create_session(
     if result.into_raw() >= 0 {
         state().sessions.insert(
             unsafe { *session }.into_raw(),
-            SessionData {
-                instance: instance.into_raw(),
-                stage: None,
-            },
+            SessionData::new(instance.into_raw()),
         );
     }
 
@@ -583,8 +774,8 @@ unsafe extern "system" fn destroy_session(session: xr::Session) -> xr::Result {
         (data, downstream)
     };
 
-    if let Some(stage) = data.stage {
-        unsafe { (downstream.destroy_space)(stage) };
+    for (_, space) in data.spaces {
+        unsafe { (downstream.destroy_space)(space) };
     }
 
     unsafe { (downstream.destroy_session)(session) }
@@ -604,7 +795,16 @@ unsafe extern "system" fn poll_event(
     }
 
     // The runtime's events come first, so the layer's never delay them
-    let Some(context) = state().take_discovery_recommendation(instance.into_raw()) else {
+    let mut state = state();
+    if let Some(space_event) = state.take_space_event(instance.into_raw()) {
+        unsafe {
+            event
+                .cast::<xr::EventDataReferenceSpaceChangePending>()
+                .write(space_event)
+        };
+        return xr::Result::SUCCESS;
+    }
+    let Some(context) = state.take_discovery_recommendation(instance.into_raw()) else {
         return result;
     };
     unsafe {

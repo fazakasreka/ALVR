@@ -550,7 +550,9 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                 ServerCoreEvent::ProximityState(headset_is_worn) => unsafe {
                     SetProximityState(headset_is_worn)
                 },
-                ServerCoreEvent::Markers(streams) => openxr_markers::set_markers(streams),
+                ServerCoreEvent::Markers { streams, origin } => {
+                    openxr_markers::set_markers(streams, origin)
+                }
                 ServerCoreEvent::MarkerCapabilities(capabilities) => {
                     openxr_markers::set_capabilities(capabilities)
                 }

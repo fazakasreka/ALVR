@@ -18,8 +18,12 @@
 //! XR_KHR_win32_convert_performance_counter_time, and tells the driver which tracker options the
 //! application's spatial contexts ask for.
 //!
-//! The layer stays out of the way of applications that do not enable these extensions, and of
-//! runtimes that implement them themselves: then every call goes straight to the runtime.
+//! ALVR also recenters: it moves the space it submits poses to SteamVR in, which SteamVR does not
+//! see, so every application's reference spaces move without the event a runtime must queue. The
+//! layer queues XrEventDataReferenceSpaceChangePending for those moves, for every application.
+//!
+//! Otherwise the layer stays out of the way of applications that do not enable these extensions,
+//! and of runtimes that implement them themselves: then their calls go straight to the runtime.
 
 mod history;
 mod log;
@@ -28,7 +32,7 @@ mod spatial;
 #[cfg(test)]
 mod tests;
 
-use alvr_marker_ipc::{Capabilities, Client};
+use alvr_marker_ipc::{Capabilities, Client, Origin};
 use history::MarkerHistory;
 use log::log;
 use openxr_sys::{self as xr, Handle, loader, pfn};
@@ -67,11 +71,13 @@ struct Downstream {
     create_reference_space: pfn::CreateReferenceSpace,
     destroy_space: pfn::DestroySpace,
     locate_space: pfn::LocateSpace,
+    enumerate_reference_spaces: pfn::EnumerateReferenceSpaces,
     // Only when the runtime implements XR_EXT_future
     poll_future: Option<pfn::PollFutureEXT>,
     cancel_future: Option<pfn::CancelFutureEXT>,
     // Only when XR_KHR_win32_convert_performance_counter_time is enabled
     convert_time: Option<pfn::ConvertTimeToWin32PerformanceCounterKHR>,
+    convert_counter: Option<pfn::ConvertWin32PerformanceCounterToTimeKHR>,
 }
 
 impl Downstream {
@@ -104,10 +110,16 @@ impl Downstream {
                 create_reference_space: get(gipa, instance, c"xrCreateReferenceSpace")?,
                 destroy_space: get(gipa, instance, c"xrDestroySpace")?,
                 locate_space: get(gipa, instance, c"xrLocateSpace")?,
+                enumerate_reference_spaces: get(gipa, instance, c"xrEnumerateReferenceSpaces")?,
                 poll_future: get(gipa, instance, c"xrPollFutureEXT"),
                 cancel_future: get(gipa, instance, c"xrCancelFutureEXT"),
                 convert_time: if has_time_extension {
                     get(gipa, instance, c"xrConvertTimeToWin32PerformanceCounterKHR")
+                } else {
+                    None
+                },
+                convert_counter: if has_time_extension {
+                    get(gipa, instance, c"xrConvertWin32PerformanceCounterToTimeKHR")
                 } else {
                     None
                 },
@@ -135,6 +147,10 @@ struct Markers {
     client: Client,
     was_connected: bool,
     history: MarkerHistory,
+    /// The origin the driver sent last.
+    origin: Option<Origin>,
+    /// Origin changes not yet handed to the sessions.
+    origin_changes: Vec<spatial::OriginChange>,
 }
 
 impl Default for Markers {
@@ -143,6 +159,8 @@ impl Default for Markers {
             client: Client::new_named(&pipe_name()),
             was_connected: false,
             history: MarkerHistory::default(),
+            origin: None,
+            origin_changes: Vec::new(),
         }
     }
 }
@@ -153,6 +171,11 @@ impl Markers {
     fn refresh(&mut self) -> Option<Capabilities> {
         let snapshot = self.client.read();
         for received in self.client.take_received() {
+            // Before the snapshot's poses, which are in the new space already
+            if let Some(change) = self.origin_change(received.origin) {
+                self.history.move_origin(change.pose_in_previous);
+                self.origin_changes.push(change);
+            }
             self.history.add(&received);
         }
         if snapshot.is_none() {
@@ -173,6 +196,24 @@ impl Markers {
         }
 
         snapshot.map(|snapshot| snapshot.capabilities)
+    }
+
+    /// How the space the poses are in moved since the last origin the driver sent, if it did.
+    fn origin_change(&mut self, origin: Origin) -> Option<spatial::OriginChange> {
+        let previous = self.origin.replace(origin)?;
+        if origin.changes == previous.changes {
+            return None;
+        }
+
+        // A step from the last change seen, or else (a missed one, a restarted driver) unknown
+        let follows = origin.changes == previous.changes + 1;
+        Some(spatial::OriginChange {
+            changed_ns: origin.changed_ns,
+            pose_in_previous: origin
+                .pose_in_previous
+                .filter(|_| follows)
+                .map(math::from_ipc),
+        })
     }
 }
 
@@ -330,8 +371,9 @@ unsafe extern "system" fn create_api_layer_instance(
                 let provides_spatial =
                     wants_spatial && !SPATIAL_EXTENSIONS.iter().all(|&name| has(name));
                 let provides_future = wants_future && !has(FUTURE_EXTENSION);
-                // Without it, markers are located at their latest pose
-                let add_time = provides_spatial && !wants_time && has(TIME_EXTENSION);
+                // Without it, markers are located at their latest pose, and reference space
+                // changes are not reported
+                let add_time = !wants_time && has(TIME_EXTENSION);
 
                 let result = create(provides_spatial, provides_future, add_time);
                 (provides_spatial, provides_future, add_time, result)
@@ -460,17 +502,18 @@ unsafe extern "system" fn get_instance_proc_addr(
     }
     let name_str = unsafe { CStr::from_ptr(name) };
 
-    let (next, provides_spatial, provides_future, future_enabled) = {
+    let (next, known, provides_spatial, provides_future, future_enabled) = {
         let state = state();
         match state.instances.get(&instance.into_raw()) {
             Some(data) => (
                 data.downstream.get_instance_proc_addr,
+                true,
                 data.provides_spatial,
                 data.provides_future,
                 data.future_enabled,
             ),
             None => match state.last_get_instance_proc_addr {
-                Some(next) => (next, false, false, false),
+                Some(next) => (next, false, false, false, false),
                 None => return xr::Result::ERROR_HANDLE_INVALID,
             },
         }
@@ -482,6 +525,10 @@ unsafe extern "system" fn get_instance_proc_addr(
         }
         b"xrDestroyInstance" => Some(void_fn!(destroy_instance, pfn::DestroyInstance)),
         b"xrGetSystem" if provides_spatial => Some(void_fn!(get_system, pfn::GetSystem)),
+        // For every application, to report ALVR recentering
+        b"xrCreateSession" | b"xrDestroySession" | b"xrPollEvent" if known => {
+            spatial::function(name_str)
+        }
         _ if provides_spatial => spatial::function(name_str),
         _ => None,
     }
