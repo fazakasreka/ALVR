@@ -361,10 +361,27 @@ impl ServerCoreContext {
     pub fn set_requested_marker_configs(&self, configs: Vec<MarkerTrackingConfig>) {
         dbg_server_core!("set_requested_marker_configs");
 
-        self.connection_context
-            .marker_tracking
-            .lock()
-            .set_requested(configs);
+        let ctx = &self.connection_context;
+        let running = {
+            let mut marker_tracking = ctx.marker_tracking.lock();
+            marker_tracking.set_requested(configs);
+            marker_tracking.configs()
+        };
+
+        // The trackers the headset no longer runs see nothing
+        if let Some(running) = running {
+            let mut tracking_manager = ctx.tracking_manager.write();
+            let before = tracking_manager.recentered_marker_streams().len();
+            tracking_manager.retain_marker_streams(&running);
+            if tracking_manager.recentered_marker_streams().len() != before {
+                ctx.events_sender
+                    .send(ServerCoreEvent::Markers {
+                        streams: tracking_manager.recentered_marker_streams(),
+                        origin: tracking_manager.origin_change(),
+                    })
+                    .ok();
+            }
+        }
     }
 
     pub fn get_tracker_pose_time_offset(&self) -> Duration {

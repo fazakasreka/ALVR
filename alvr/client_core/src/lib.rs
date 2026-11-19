@@ -21,7 +21,7 @@ pub mod video_decoder;
 pub use controller_offset::controller_pose_offset;
 
 use alvr_common::{
-    ConnectionState, LifecycleState, ViewParams, dbg_client_core, error,
+    ConnectionState, LifecycleState, Pose, ViewParams, dbg_client_core, error,
     glam::{UVec2, Vec2},
     parking_lot::{Mutex, RwLock},
     warn,
@@ -182,11 +182,18 @@ impl ClientCoreContext {
         }
     }
 
-    pub fn send_playspace(&self, area: Option<Vec2>) {
+    /// After a new or changed STAGE space: `stage_in_previous` is where its new origin is in the
+    /// previous one, `None` if not known or new.
+    pub fn send_playspace(&self, area: Option<Vec2>, stage_in_previous: Option<Pose>) {
         dbg_client_core!("send_playspace");
 
         if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
-            sender.send(&ClientControlPacket::PlayspaceSync(area)).ok();
+            sender
+                .send(&ClientControlPacket::PlayspaceSync {
+                    area,
+                    stage_in_previous,
+                })
+                .ok();
         }
     }
 

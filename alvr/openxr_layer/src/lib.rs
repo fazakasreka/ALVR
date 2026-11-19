@@ -173,7 +173,9 @@ impl Markers {
         for received in self.client.take_received() {
             // Before the snapshot's poses, which are in the new space already
             if let Some(change) = self.origin_change(received.origin) {
-                self.history.move_origin(change.pose_in_previous);
+                if change.moved {
+                    self.history.move_origin(change.pose_in_previous);
+                }
                 self.origin_changes.push(change);
             }
             self.history.add(&received);
@@ -213,6 +215,8 @@ impl Markers {
                 .pose_in_previous
                 .filter(|_| follows)
                 .map(math::from_ipc),
+            // A missed change may have moved it
+            moved: origin.moved || !follows,
         })
     }
 }

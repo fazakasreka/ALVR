@@ -430,7 +430,8 @@ pub extern "C" fn alvr_send_battery(device_id: u64, gauge_value: f32, is_plugged
 #[unsafe(no_mangle)]
 pub extern "C" fn alvr_send_playspace(width: f32, height: f32) {
     if let Some(context) = &*CLIENT_CORE_CONTEXT.lock() {
-        context.send_playspace(Some(Vec2::new(width, height)));
+        // Not known how the space moved
+        context.send_playspace(Some(Vec2::new(width, height)), None);
     }
 }
 

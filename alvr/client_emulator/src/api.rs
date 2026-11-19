@@ -469,6 +469,47 @@ pub struct SharedState {
     pub markers: Mutex<MarkersResponse>,
     /// Markers set by `POST /api/markers`, replacing the current ones on the next frame.
     pub marker_update: Mutex<Option<MarkerSettingsFile>>,
+    /// The emulated headset's STAGE, published by the UI thread for `GET /api/stage`.
+    pub stage: Mutex<StageResponse>,
+    /// Changes queued by `POST /api/stage`.
+    pub stage_changes: Mutex<VecDeque<StageRequest>>,
+}
+
+/// `GET /api/stage`: where the emulated headset's STAGE is in the room, and its size.
+#[derive(Serialize, Default)]
+pub struct StageResponse {
+    pub position: [f32; 3],
+    /// Quaternion, x y z w.
+    pub orientation: [f32; 4],
+    pub area: [f32; 2],
+}
+
+/// `POST /api/stage`: a change of the emulated headset's STAGE, as after a new boundary or a
+/// recenter.
+#[derive(Deserialize, Clone, Copy)]
+pub struct StageRequest {
+    /// The new size of its bounds.
+    #[serde(default)]
+    pub area: Option<[f32; 2]>,
+    /// Where its new origin is in the previous one.
+    #[serde(default)]
+    pub moved: Option<StageMove>,
+    /// Whether the headset runtime tells where it moved. Default true.
+    #[serde(default = "default_true")]
+    pub known: bool,
+}
+
+#[derive(Deserialize, Clone, Copy)]
+pub struct StageMove {
+    #[serde(default)]
+    pub position: [f32; 3],
+    /// About the vertical axis.
+    #[serde(default)]
+    pub yaw_degrees: f32,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// `GET /api/markers`: the codes in the room, as in `markers.json`, with where they are now and
@@ -504,6 +545,8 @@ impl SharedState {
             source: Mutex::new(None),
             markers: Mutex::new(MarkersResponse::default()),
             marker_update: Mutex::new(None),
+            stage: Mutex::new(StageResponse::default()),
+            stage_changes: Mutex::new(VecDeque::new()),
         }
     }
 }
@@ -642,6 +685,35 @@ fn route(shared: &SharedState, request: &mut tiny_http::Request) -> Reply {
                 Ok(parsed) => {
                     *shared.drive.lock() = parsed;
 
+                    Reply::Json("{\"ok\":true}".into())
+                }
+                Err(e) => Reply::Error(400, format!("Invalid JSON: {e}")),
+            }
+        }
+
+        (tiny_http::Method::Get, "/api/stage") => {
+            match serde_json::to_string_pretty(&*shared.stage.lock()) {
+                Ok(json) => Reply::Json(json),
+                Err(e) => Reply::Error(500, format!("Cannot serialise the stage: {e}")),
+            }
+        }
+
+        (tiny_http::Method::Post, "/api/stage") => {
+            let mut body = String::new();
+            if let Err(e) = request.as_reader().read_to_string(&mut body) {
+                return Reply::Error(400, format!("Cannot read request body: {e}"));
+            }
+
+            match serde_json::from_str::<StageRequest>(&body) {
+                Ok(parsed)
+                    if parsed.area.is_some_and(|[w, h]| {
+                        !(w > 0.0 && h > 0.0 && w.is_finite() && h.is_finite())
+                    }) =>
+                {
+                    Reply::Error(400, "The area must be positive".into())
+                }
+                Ok(parsed) => {
+                    shared.stage_changes.lock().push_back(parsed);
                     Reply::Json("{\"ok\":true}".into())
                 }
                 Err(e) => Reply::Error(400, format!("Invalid JSON: {e}")),

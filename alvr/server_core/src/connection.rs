@@ -10,7 +10,7 @@ use crate::{
 use alvr_adb::{WiredConnection, WiredConnectionStatus};
 use alvr_common::{
     AnyhowToCon, BUTTON_INFO, CONTROLLER_PROFILE_INFO, ConResult, ConnectionError, ConnectionState,
-    LifecycleState, QUEST_CONTROLLER_PROFILE_PATH, con_bail, dbg_connection, debug, error,
+    LifecycleState, Pose, QUEST_CONTROLLER_PROFILE_PATH, con_bail, dbg_connection, debug, error,
     glam::{UVec2, Vec2},
     info,
     parking_lot::{Condvar, Mutex, RwLock},
@@ -26,7 +26,7 @@ use alvr_packets::{
 };
 use alvr_session::{
     BodyTrackingSinkConfig, CodecType, ControllersEmulationMode, FrameSize, H264Profile,
-    PassthroughMode, RecenteringMode, Settings, SocketProtocol, SteamvrHmdInitConfig,
+    PassthroughMode, Settings, SocketProtocol, SteamvrHmdInitConfig,
 };
 use alvr_sockets::{
     CONTROL_PORT, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, ProtoControlSocket, SocketConnection,
@@ -1207,17 +1207,13 @@ fn connection_pipeline(
                     .headset
                     .recentering_mode
                     .clone();
-                ctx.marker_tracking
-                    .lock()
-                    .set_recentering(matches!(mode, RecenteringMode::Marker { .. }));
                 let changed = recentering_mode
                     .as_ref()
                     .is_some_and(|last| mem::discriminant(last) != mem::discriminant(&mode));
                 if changed {
                     info!("Recentering mode changed, recentering");
-                    let marker_base = ctx.marker_tracking.lock().base_config();
                     let mut tracking_manager = ctx.tracking_manager.write();
-                    tracking_manager.recenter(&mode, marker_base, true);
+                    tracking_manager.recenter(&mode, Some(Pose::IDENTITY), false);
                     ctx.events_sender
                         .send(ServerCoreEvent::Markers {
                             streams: tracking_manager.recentered_marker_streams(),
@@ -1288,18 +1284,34 @@ fn connection_pipeline(
                 };
 
                 match packet {
-                    ClientControlPacket::PlayspaceSync(packet) => {
+                    ClientControlPacket::PlayspaceSync {
+                        area,
+                        stage_in_previous,
+                    } => {
                         if !initial_settings.headset.tracking_ref_only {
+                            let area = area.unwrap_or(Vec2::new(2.0, 2.0));
+                            let wh = area.x * area.y;
+                            let area = if wh.is_finite() && wh > 0.0 {
+                                info!("Received new playspace with size: {}", area);
+                                area
+                            } else {
+                                warn!("Received invalid playspace size: {}", area);
+                                Vec2::new(2.0, 2.0)
+                            };
+                            ctx.events_sender
+                                .send(ServerCoreEvent::PlayspaceSync(area))
+                                .ok();
+
                             let session_manager_lock = SESSION_MANAGER.read();
                             let config = &session_manager_lock.settings().headset;
-                            let marker_base = ctx.marker_tracking.lock().base_config();
-                            ctx.tracking_manager.write().recenter(
-                                &config.recentering_mode,
-                                marker_base,
-                                false,
-                            );
                             let (streams, origin) = {
-                                let tracking_manager = ctx.tracking_manager.read();
+                                let mut tracking_manager = ctx.tracking_manager.write();
+                                let bounds_changed = tracking_manager.set_stage_area(area);
+                                tracking_manager.recenter(
+                                    &config.recentering_mode,
+                                    stage_in_previous,
+                                    bounds_changed,
+                                );
                                 (
                                     tracking_manager.recentered_marker_streams(),
                                     tracking_manager.origin_change(),
@@ -1308,20 +1320,6 @@ fn connection_pipeline(
                             ctx.events_sender
                                 .send(ServerCoreEvent::Markers { streams, origin })
                                 .ok();
-
-                            let area = packet.unwrap_or(Vec2::new(2.0, 2.0));
-                            let wh = area.x * area.y;
-                            if wh.is_finite() && wh > 0.0 {
-                                info!("Received new playspace with size: {}", area);
-                                ctx.events_sender
-                                    .send(ServerCoreEvent::PlayspaceSync(area))
-                                    .ok();
-                            } else {
-                                warn!("Received invalid playspace size: {}", area);
-                                ctx.events_sender
-                                    .send(ServerCoreEvent::PlayspaceSync(Vec2::new(2.0, 2.0)))
-                                    .ok();
-                            }
                         }
                     }
                     ClientControlPacket::RequestIdr => {
@@ -1431,10 +1429,7 @@ fn connection_pipeline(
                         timestamp,
                         markers,
                     } => {
-                        let (configs, marker_base) = {
-                            let marker_tracking = ctx.marker_tracking.lock();
-                            (marker_tracking.configs(), marker_tracking.base_config())
-                        };
+                        let configs = ctx.marker_tracking.lock().configs();
                         // Not from a tracker the headset was just told to stop
                         if let Some(configs) = configs.filter(|configs| configs.contains(&config)) {
                             let mut tracking_manager = ctx.tracking_manager.write();
@@ -1444,12 +1439,6 @@ fn connection_pipeline(
                                 timestamp,
                                 markers,
                             });
-                            if tracking_manager.update_marker_origin(
-                                &SESSION_MANAGER.read().settings().headset.recentering_mode,
-                                marker_base,
-                            ) {
-                                info!("Origin moved to the QR code");
-                            }
                             ctx.events_sender
                                 .send(ServerCoreEvent::Markers {
                                     streams: tracking_manager.recentered_marker_streams(),

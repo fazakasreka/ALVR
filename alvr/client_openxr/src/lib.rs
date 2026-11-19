@@ -440,8 +440,18 @@ pub fn entry_point() {
 
                         lobby.update_reference_space();
 
+                        // Poses are reported in STAGE: another space changing leaves it as it
+                        // was, and the runtime may say where a changed one went
+                        let stage_in_previous =
+                            if event.reference_space_type() == xr::ReferenceSpaceType::STAGE {
+                                event
+                                    .pose_valid()
+                                    .then(|| from_xr_pose(event.pose_in_previous_space()))
+                            } else {
+                                Some(Pose::IDENTITY)
+                            };
                         if let Some(stream) = &mut stream_context {
-                            stream.update_reference_space();
+                            stream.update_reference_space(stage_in_previous);
                         }
                     }
                     xr::Event::PerfSettingsEXT(event) => {

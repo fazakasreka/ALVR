@@ -1,6 +1,5 @@
-//! Which marker trackers the headset runs: one for marker recentering while that is the
-//! recentering mode, plus one per configuration OpenXR applications ask for, each without the
-//! options the headset does not support.
+//! Which marker trackers the headset runs: one per configuration OpenXR applications ask for,
+//! each without the options the headset does not support.
 
 use alvr_common::parking_lot::Mutex;
 use alvr_packets::{MarkerCapabilities, MarkerData, MarkerTrackingConfig, ServerControlPacket};
@@ -24,20 +23,12 @@ pub struct MarkerTracking {
     capabilities: Option<MarkerCapabilities>,
     /// By OpenXR applications.
     requested: Vec<MarkerTrackingConfig>,
-    /// Marker recentering is the recentering mode, which needs a tracker of its own.
-    recentering: bool,
     /// Last sent to the headset.
     sent: Option<Vec<MarkerTrackingConfig>>,
     control_sender: Option<ControlSender>,
 }
 
 impl MarkerTracking {
-    /// The configuration marker recentering uses, as the headset runs it.
-    pub fn base_config(&self) -> Option<MarkerTrackingConfig> {
-        self.capabilities
-            .map(|capabilities| MarkerTrackingConfig::BASE.supported_by(&capabilities))
-    }
-
     /// The trackers the headset should run, or `None` until it reported its capabilities.
     pub fn configs(&self) -> Option<Vec<MarkerTrackingConfig>> {
         let capabilities = self.capabilities?;
@@ -47,10 +38,8 @@ impl MarkerTracking {
 
         let mut configs = Vec::new();
         for config in self
-            .recentering
-            .then_some(&MarkerTrackingConfig::BASE)
-            .into_iter()
-            .chain(&self.requested)
+            .requested
+            .iter()
             .map(|config| config.supported_by(&capabilities))
         {
             if !configs.contains(&config) {
@@ -84,13 +73,6 @@ impl MarkerTracking {
         self.send_configs();
     }
 
-    /// Whether marker recentering is the recentering mode. Has the headset start or stop its
-    /// tracker when it changed.
-    pub fn set_recentering(&mut self, recentering: bool) {
-        self.recentering = recentering;
-        self.send_configs();
-    }
-
     fn send_configs(&mut self) {
         let (Some(configs), Some(sender)) = (self.configs(), &self.control_sender) else {
             return;
@@ -119,7 +101,7 @@ mod tests {
     };
 
     #[test]
-    fn recentering_needs_its_own_tracker() {
+    fn only_requested_trackers_run() {
         let mut tracking = MarkerTracking::default();
         tracking.set_capabilities(MarkerCapabilities {
             qr_codes: true,
@@ -130,17 +112,11 @@ mod tests {
 
         tracking.set_requested(vec![SIZED]);
         assert_eq!(tracking.configs(), Some(vec![SIZED]));
-        tracking.set_recentering(true);
-        assert_eq!(
-            tracking.configs(),
-            Some(vec![MarkerTrackingConfig::BASE, SIZED])
-        );
     }
 
     #[test]
     fn configs_wait_for_the_capabilities() {
         let mut tracking = MarkerTracking::default();
-        tracking.set_recentering(true);
         tracking.set_requested(vec![SIZED]);
         assert_eq!(tracking.configs(), None);
 
@@ -149,10 +125,7 @@ mod tests {
             fixed_size_markers: true,
             static_markers: true,
         });
-        assert_eq!(
-            tracking.configs(),
-            Some(vec![MarkerTrackingConfig::BASE, SIZED])
-        );
+        assert_eq!(tracking.configs(), Some(vec![SIZED]));
     }
 
     #[test]
@@ -168,10 +141,6 @@ mod tests {
         assert_eq!(
             tracking.configs(),
             Some(vec![MarkerTrackingConfig::default()])
-        );
-        assert_eq!(
-            tracking.base_config(),
-            Some(MarkerTrackingConfig::default())
         );
     }
 

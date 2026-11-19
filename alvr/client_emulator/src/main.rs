@@ -34,7 +34,8 @@ use crate::{
     api::{
         Articulation, CaptureRequestKind, ControllerCommand, ControllerSnapshot,
         ControllersResponse, HandCommand, HandSnapshot, HandsResponse, MarkerStatus,
-        MarkersResponse, NamedSummary, ProfileSummary, SharedState, StateResponse, ViewSource,
+        MarkersResponse, NamedSummary, ProfileSummary, SharedState, StageResponse, StateResponse,
+        ViewSource,
     },
     camera::{Camera, CameraInput, Eye},
     client::{
@@ -57,7 +58,7 @@ use crate::{
 };
 use alvr_common::{
     Pose, error,
-    glam::{Mat4, Quat, Vec3},
+    glam::{Mat4, Quat, Vec2, Vec3},
     info,
     parking_lot::Mutex,
 };
@@ -707,6 +708,28 @@ impl EmulatorApp {
             .write()
             .callback_resources
             .insert(Arc::clone(&created));
+    }
+
+    /// Takes STAGE changes from the API, and publishes the STAGE for `/api/stage`.
+    fn apply_stage_changes(&mut self) {
+        let changes = std::mem::take(&mut *self.shared.stage_changes.lock());
+        for change in changes {
+            self.client.change_stage(client::StageChange {
+                area: change.area.map(Vec2::from_array),
+                moved: change.moved.map(|moved| Pose {
+                    orientation: Quat::from_rotation_y(moved.yaw_degrees.to_radians()),
+                    position: Vec3::from_array(moved.position),
+                }),
+                known: change.known,
+            });
+        }
+
+        let (stage, area) = self.client.stage();
+        *self.shared.stage.lock() = StageResponse {
+            position: stage.position.to_array(),
+            orientation: stage.orientation.to_array(),
+            area: area.to_array(),
+        };
     }
 
     /// Takes marker changes from the API, moves the codes in the room to where they are now, and
@@ -1790,6 +1813,7 @@ impl App for EmulatorApp {
         self.update_camera(&ui_context, delta_seconds);
         let camera = self.camera;
 
+        self.apply_stage_changes();
         self.update_markers(frame);
         self.ensure_controller_models(frame);
         self.ensure_hand_models(frame);

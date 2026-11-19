@@ -86,6 +86,22 @@ pub(crate) struct OriginChange {
     pub changed_ns: i64,
     /// Where the new origin of STAGE is in the previous STAGE, when known.
     pub pose_in_previous: Option<xr::Posef>,
+    /// False when only the bounds of STAGE changed.
+    pub moved: bool,
+}
+
+impl OriginChange {
+    /// This change, then `next`.
+    fn then(self, next: Self) -> Self {
+        Self {
+            changed_ns: next.changed_ns,
+            pose_in_previous: self
+                .pose_in_previous
+                .zip(next.pose_in_previous)
+                .map(|(first, second)| math::compose(first, second)),
+            moved: self.moved || next.moved,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -576,7 +592,11 @@ impl State {
                             .unwrap_or(xr::Posef::IDENTITY),
                     });
                 }
-                let change = data.origin_changes.pop_front()?;
+                // Changes the application has not heard of yet are one change to it
+                let mut change = data.origin_changes.pop_front()?;
+                while let Some(next) = data.origin_changes.pop_front() {
+                    change = change.then(next);
+                }
                 let events = self.space_events(session, change);
                 self.sessions.get_mut(&session)?.space_events.extend(events);
             }
@@ -619,7 +639,11 @@ impl State {
 
         types
             .into_iter()
-            .filter(|&ty| ty != xr::ReferenceSpaceType::VIEW)
+            // Only STAGE has bounds
+            .filter(|&ty| {
+                ty != xr::ReferenceSpaceType::VIEW
+                    && (change.moved || ty == xr::ReferenceSpaceType::STAGE)
+            })
             .map(|ty| {
                 // The spaces of SteamVR keep their poses relative to each other: each moved like
                 // STAGE, seen from its own origin

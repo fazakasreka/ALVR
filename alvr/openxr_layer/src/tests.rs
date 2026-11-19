@@ -1647,6 +1647,7 @@ fn recentering_is_reported() {
         changes: 3,
         changed_ns: now_ns(),
         pose_in_previous: None,
+        moved: true,
     });
     publish(&mut writer, &[]);
     let session = app.create_session();
@@ -1677,6 +1678,7 @@ fn recentering_is_reported() {
         changes: 4,
         changed_ns,
         pose_in_previous: Some(pose(1.0, 0.0, 0.0)),
+        moved: true,
     });
     publish(&mut writer, &[]);
     let mut events = (0..2)
@@ -1705,11 +1707,49 @@ fn recentering_is_reported() {
         changes: 6,
         changed_ns: now_ns(),
         pose_in_previous: Some(pose(1.0, 0.0, 0.0)),
+        moved: true,
     });
     publish(&mut writer, &[]);
     for _ in 0..2 {
         assert_eq!(poll_space_event().unwrap().pose_valid, xr::FALSE);
     }
+    assert!(poll_space_event().is_none());
+
+    // Two moves before the application polls are one to it
+    for (changes, x) in [(7, 1.0), (8, 0.5)] {
+        writer.set_origin(Origin {
+            changes,
+            changed_ns: now_ns(),
+            pose_in_previous: Some(pose(x, 0.0, 0.0)),
+            moved: true,
+        });
+        publish(&mut writer, &[]);
+    }
+    for _ in 0..2 {
+        let event = poll_space_event().unwrap();
+        assert_eq!(event.pose_valid, xr::TRUE);
+        assert!(close(
+            event.pose_in_previous_space.position,
+            [1.5, 0.0, 0.0]
+        ));
+    }
+    assert!(poll_space_event().is_none());
+
+    // Only the bounds changed: STAGE alone, where it was
+    writer.set_origin(Origin {
+        changes: 9,
+        changed_ns: now_ns(),
+        pose_in_previous: Some(pose(0.0, 0.0, 0.0)),
+        moved: false,
+    });
+    publish(&mut writer, &[]);
+    let event = poll_space_event().unwrap();
+    assert_eq!(event.reference_space_type, xr::ReferenceSpaceType::STAGE);
+    assert_eq!(event.pose_valid, xr::TRUE);
+    assert!(close(
+        event.pose_in_previous_space.position,
+        [0.0, 0.0, 0.0]
+    ));
     assert!(poll_space_event().is_none());
 
     let destroy_session: pfn::DestroySession = app.get(c"xrDestroySession");

@@ -261,7 +261,8 @@ impl StreamContext {
             pending_alpha_frame: None,
         };
 
-        this.update_reference_space();
+        // A new STAGE for the server
+        this.update_reference_space(None);
 
         this
     }
@@ -270,7 +271,9 @@ impl StreamContext {
         self.config.passthrough.is_some()
     }
 
-    pub fn update_reference_space(&mut self) {
+    /// `stage_in_previous` is where STAGE's new origin is in the previous one: the identity when
+    /// it did not change, `None` if not known.
+    pub fn update_reference_space(&mut self, stage_in_previous: Option<Pose>) {
         self.input_thread_running.set(false);
 
         self.stage_reference_space = Arc::new(interaction::get_reference_space(
@@ -287,6 +290,7 @@ impl StreamContext {
                 .reference_space_bounds_rect(xr::ReferenceSpaceType::STAGE)
                 .unwrap()
                 .map(|a| Vec2::new(a.width, a.height)),
+            stage_in_previous,
         );
 
         if let Some(running) = self.input_thread.take() {

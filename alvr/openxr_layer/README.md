@@ -19,7 +19,7 @@ app ─▶ OpenXR loader ─▶ this layer ─▶ SteamVR OpenXR runtime
 - **The headset tracks every frame.** It finds codes with a discovery every 500 ms and follows them
   with an update snapshot every frame, at the frame's display time. It runs one tracker per marker
   configuration (static or not, known size or not) that applications ask for, as far as it
-  supports the options, plus one for marker recentering while that is the recentering mode.
+  supports the options.
 - **The driver owns the markers.** It recenters them like the headset pose, converts their time to
   the PC's performance counter the way the headset pose's time is, and serves them on the named
   pipe `\\.\pipe\ALVR_Markers` (see `alvr/marker_ipc`): each connected layer gets the complete
@@ -64,12 +64,18 @@ sends them with the markers, and the layer queues the event for every reference 
 session but `VIEW`, in every application, marker extensions or not:
 
 - `changeTime` is when the driver started submitting poses in the new space.
-- `poseInPreviousSpace` is valid when the headset's own space stayed, so the move is known
-  exactly: ALVR moved the origin to a QR code (the QR code recentering mode), or the recentering
-  mode was changed while streaming. When the headset's space may have changed too (a new
-  connection, or the headset recentering), `poseValid` is false. In the Stage mode, ALVR adds no
-  recentering of its own: only those headset changes are reported.
-- A recentering that leaves the origin where it was is not reported.
+- ALVR moves it when the recentering mode changes while streaming, and when the headset's own
+  STAGE space changes (a new boundary, or a recenter that moves STAGE). The headset reports the
+  change its runtime gives in its own `XrEventDataReferenceSpaceChangePending`, with plain OpenXR,
+  so on any headset. The modes but Stage then recenter on the head, in the headset's new space.
+- `poseInPreviousSpace` is ALVR's move combined with the headset's: valid when both are known. It
+  is not known for a new connection, or when the headset's runtime does not say where STAGE went
+  (`poseValid` false there).
+- A change that leaves the origin where it was is not reported: in the Stage mode, a recenter that
+  only moves the headset's LOCAL space changes nothing for applications.
+- A new size of the play area is reported for `STAGE` alone, with the origin where it was. SteamVR
+  does not report it itself.
+- Changes that come before the application polls are reported as one.
 - Marker poses kept from before the move are moved with it, or forgotten when it is not known.
 
 Sessions created after a move do not get its event.

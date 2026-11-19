@@ -639,6 +639,16 @@ A negative `period_seconds` circles clockwise seen from above.
 `POST /api/markers` replaces the codes while the emulator runs, and `GET /api/markers` shows them;
 see [HTTP API](#http-api).
 
+## STAGE
+
+The emulated headset reports every pose in its STAGE space, as a real one does: by default the
+room's own frame, with a 4 x 4 m play area. Like a headset, it tells the server about its STAGE when
+streaming starts, and again whenever it changes. `POST /api/stage` changes it the ways a headset's
+runtime does: a new play area, or STAGE moving, as after a new boundary or a recenter, either told
+where to (`known`, OpenXR's `poseValid`) or not. The room stays where it is: everything the
+headset reports moves the other way. This is what applications see as ALVR's reference space
+changes; see [`alvr/openxr_layer`](../openxr_layer/README.md).
+
 
 ## HTTP API
 
@@ -733,6 +743,26 @@ Use this rather than repeated `POST /api/move` calls whenever motion smoothness 
 measured. A rate is integrated against the real frame time down the same path the keyboard uses,
 whereas posting individual poses puts the calling script's own scheduling into the tracking signal —
 and no HTTP client paces itself to anywhere near a frame.
+
+### `GET /api/stage`
+
+Where the emulated headset's STAGE is in the room, and the size of its play area:
+
+```json
+{ "position": [1.0, 0.0, 0.0], "orientation": [0.0, 0.707, 0.0, 0.707], "area": [4.0, 4.0] }
+```
+
+### `POST /api/stage`
+
+Changes the emulated headset's STAGE, and tells the server as a headset does. Every field is
+optional; `{}` changes nothing, like a recenter of the headset's LOCAL space alone.
+
+```json
+{ "area": [3.0, 5.0], "moved": { "position": [1.0, 0.0, 0.0], "yaw_degrees": 90.0 }, "known": true }
+```
+
+`moved` is where STAGE's new origin is in its previous one. `known` (default true) is whether the
+headset's runtime says so; false sends the change as not known.
 
 ### `GET /api/markers`
 

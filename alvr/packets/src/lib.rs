@@ -264,12 +264,6 @@ pub struct MarkerTrackingConfig {
 }
 
 impl MarkerTrackingConfig {
-    /// The configuration the headset always tracks with, for marker recentering.
-    pub const BASE: Self = Self {
-        static_markers: true,
-        marker_size: None,
-    };
-
     /// Without the options the headset does not support, which it would ignore.
     pub fn supported_by(self, capabilities: &MarkerCapabilities) -> Self {
         Self {
@@ -291,7 +285,14 @@ pub struct MarkerCapabilities {
 
 #[derive(Serialize, Deserialize)]
 pub enum ClientControlPacket {
-    PlayspaceSync(Option<Vec2>),
+    /// The headset's STAGE space, in which it reports poses, is new or changed.
+    PlayspaceSync {
+        /// The size of STAGE's bounds, if it has any.
+        area: Option<Vec2>,
+        /// Where its new origin is in the previous one: the identity when only another reference
+        /// space changed. `None` when not known, and for a new STAGE.
+        stage_in_previous: Option<Pose>,
+    },
     RequestIdr,
     KeepAlive,
     StreamReady, // This flag notifies the server the client streaming socket is ready listening

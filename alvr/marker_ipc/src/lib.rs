@@ -40,7 +40,7 @@ pub use sys::{now_ns, ns_to_performance_counter, performance_counter_to_ns};
 pub const PIPE_NAME: &str = "ALVR_Markers";
 
 /// Changes whenever the encoding of a message changes. Messages of another version are ignored.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 const SNAPSHOT_MAGIC: u32 = u32::from_le_bytes(*b"ALVM");
 const REQUEST_MAGIC: u32 = u32::from_le_bytes(*b"ALVQ");
 
@@ -196,6 +196,8 @@ pub struct Origin {
     pub changed_ns: i64,
     /// The new origin in the space before the latest change, when known.
     pub pose_in_previous: Option<Pose>,
+    /// False when only the bounds of STAGE changed.
+    pub moved: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -357,6 +359,7 @@ fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
     writer.u64(origin.changes);
     writer.i64(origin.changed_ns);
     writer.u32(origin.pose_in_previous.is_some().into());
+    writer.u32(origin.moved.into());
     let pose = origin.pose_in_previous.unwrap_or_default();
     for &value in pose.orientation.iter().chain(&pose.position) {
         writer.f32(value);
@@ -406,11 +409,13 @@ fn decode_snapshot(message: &[u8]) -> Option<Snapshot> {
     let changes = reader.u64()?;
     let changed_ns = reader.i64()?;
     let has_pose = reader.u32()? != 0;
+    let moved = reader.u32()? != 0;
     let pose = reader.pose()?;
     let origin = Origin {
         changes,
         changed_ns,
         pose_in_previous: has_pose.then_some(pose),
+        moved,
     };
 
     let stream_count = reader.count(MAX_STREAMS)?;
@@ -785,6 +790,7 @@ mod tests {
                 changes: 3,
                 changed_ns: 456,
                 pose_in_previous: Some(pose(0.5)),
+                moved: true,
             },
             streams: vec![
                 stream(STATIC, 123, &[("dog", 1.0)]),
@@ -800,6 +806,7 @@ mod tests {
         let unknown = Snapshot {
             origin: Origin {
                 pose_in_previous: None,
+                moved: false,
                 ..snapshot.origin
             },
             ..snapshot

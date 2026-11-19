@@ -140,6 +140,8 @@ pub fn set_markers(streams: Vec<MarkerStream>, origin: OriginChange) {
                         orientation: pose.orientation.to_array(),
                         position: pose.position.to_array(),
                     }),
+                // Changes missed in between may have moved it
+                moved: origin.moved || !follows,
             });
         }
         state.streams = streams;
