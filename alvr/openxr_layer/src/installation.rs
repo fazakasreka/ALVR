@@ -4,18 +4,20 @@
 //! without its uninstaller or unregistering its driver from SteamVR can leave that registration
 //! behind, and the layer would still load into every application. So the layer checks that its
 //! streamer folder, the one above its own, is among SteamVR's drivers, and otherwise stays out of
-//! the way.
+//! the way. Applications in an app container cannot read SteamVR's driver list, so there the
+//! layer cannot tell and stays on.
 
 use std::path::{Path, PathBuf};
 
-/// Whether the layer's streamer folder is registered as a SteamVR driver.
+/// Whether the layer's streamer folder is registered as a SteamVR driver, or the driver list cannot
+/// be read.
 #[cfg(not(test))]
 pub fn alvr_is_registered() -> bool {
     let Some(streamer) = own_path().and_then(|dll| Some(dll.parent()?.parent()?.to_owned())) else {
         return false;
     };
 
-    registered_drivers().is_some_and(|drivers| drivers.iter().any(|dir| same_dir(dir, &streamer)))
+    registered_drivers().is_none_or(|drivers| drivers.iter().any(|dir| same_dir(dir, &streamer)))
 }
 
 /// The tests drive the layer without an ALVR install.
@@ -24,7 +26,7 @@ pub fn alvr_is_registered() -> bool {
     true
 }
 
-/// The external drivers in SteamVR's `openvrpaths.vrpath`.
+/// The external drivers in SteamVR's `openvrpaths.vrpath`, if it can be read.
 #[cfg_attr(test, allow(dead_code))]
 fn registered_drivers() -> Option<Vec<PathBuf>> {
     let local_app_data = std::env::var_os("LOCALAPPDATA")?;
